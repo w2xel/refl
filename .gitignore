@@ -8,3 +8,6 @@
 
 # editors
 .compile_commands.json
+
+# MkDocs build output
+/docs/site

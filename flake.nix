@@ -35,6 +35,10 @@
 
             # Compile-commands generation for editors / cppcheck.
             pkgs.bear
+
+            # Documentation — MkDocs Material (markdown-based, modern output).
+            pkgs.python3Packages.mkdocs
+            pkgs.python3Packages.mkdocs-material
           ];
 
           # Pin the compiler for meson so it never falls back to a different gcc.

@@ -60,11 +60,8 @@ add_project_arguments(
   language: 'cpp',
 )
 
-exe = executable(
-  'reflection_selfcheck',
-  'src/main.cpp',
-  install: false,
-)
+# Header-only framework: expose include/ to subprojects/tests/samples.
+refl_inc = include_directories('include')
 
-# The self-check returns non-zero on failure, so `test` propagates it.
-test('selfcheck', exe)
+subdir('tests')
+subdir('samples')
