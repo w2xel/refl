@@ -95,6 +95,12 @@ Initial implementation. The API above is working:
 - `Field::get(Object&)` returns the field value as `std::any`.
 - `Field::set(Object&, std::any)` sets the field value.  Returns
   `Error::BadSignature` for read-only (const or bit-field) fields.
+- `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`.
+  `StaticField::get()` returns the value as `std::any`; `StaticField::set(std::any)`
+  writes the static storage (no Object needed).
+- `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`.
+  `StaticFunction::invoke(args...)` calls the function directly (no Object needed)
+  and returns `std::any`.
 - `Object::cast<T>()` returns a non-owning `T*` (fast, unchecked).
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
@@ -106,10 +112,12 @@ Initial implementation. The API above is working:
 
 Limitations (marked with `ponytail:` in the source):
 
-- Constructors and member functions with more than 10 parameters are skipped.
+- Constructors and non-static member functions with more than 10 parameters are skipped.
+- Static member functions with more than 4 parameters are skipped.
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
-- Const data members are read-only (getter only, no setter).
+- Const data members (static and non-static) are read-only (getter only, no setter).
 - Inheritance walk is single-inheritance only — multiple inheritance with
   offset bases would produce wrong pointer adjustments in invokers/getters.
+- Static field/function lookup does not walk base classes.
 - Arguments are passed by address (value types only); reference parameters work
   but the caller must ensure the argument outlives the call.

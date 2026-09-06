@@ -20,11 +20,17 @@ struct Point : Base {
     int x;
     int y;
     const int id = 42;
-    Point(int x, int y) : Base(x), x(x), y(y), id(0) {}
+    static int instance_count;
+    static const int max_instances = 100;
+    Point(int x, int y) : Base(x), x(x), y(y), id(0) { ++instance_count; }
     int sum() const { return x + y; }
     void set(int a, int b) { x = a; y = b; }
     void set(int a) { x = a; }
+    static int get_instance_count() { return instance_count; }
+    static void reset_count() { instance_count = 0; }
 };
+
+int Point::instance_count = 0;
 
 enum Color { Red = 10, Green = 20, Blue = 30 };
 
@@ -161,6 +167,42 @@ int main() {
     auto bad_enum = e.find_enumerator("NoSuchColor");
     CHECK(!bad_enum.has_value(), "find_enumerator for non-existent should fail");
     CHECK(bad_enum.error() == refl::Error::NotFound, "should be NotFound");
+
+    // --- static data members ---
+    const auto& sfields = cls.static_fields();
+    CHECK(sfields.size() == 2, "Point should have 2 static fields");
+
+    auto sf = cls.find_static_field("instance_count");
+    CHECK(sf.has_value(), "find_static_field(\"instance_count\") should succeed");
+    CHECK(sf->name() == "instance_count", "static field name");
+    CHECK(!sf->is_readonly(), "instance_count should not be readonly");
+    // Point(1,3) was constructed once, so instance_count should be 1
+    CHECK(std::any_cast<int>(sf->get()) == 1, "instance_count should be 1");
+
+    (void)sf->set(std::any(42));
+    CHECK(std::any_cast<int>(sf->get()) == 42, "after set, instance_count should be 42");
+
+    // readonly static field (const)
+    auto maxf = cls.find_static_field("max_instances");
+    CHECK(maxf.has_value(), "find_static_field(\"max_instances\") should succeed");
+    CHECK(maxf->is_readonly(), "max_instances should be readonly (const)");
+    CHECK(std::any_cast<int>(maxf->get()) == 100, "max_instances should be 100");
+    auto set_max = maxf->set(std::any(200));
+    CHECK(!set_max.has_value(), "set on readonly static should fail");
+    CHECK(set_max.error() == refl::Error::BadSignature, "should be BadSignature");
+
+    // --- static member functions ---
+    auto sf_count = cls.find_static_function("get_instance_count");
+    CHECK(sf_count.has_value(), "find_static_function(\"get_instance_count\") should succeed");
+    CHECK(sf_count->return_type() == "int", "get_instance_count returns int");
+    std::any sc_ret = sf_count->invoke();
+    CHECK(std::any_cast<int>(sc_ret) == 42, "get_instance_count should be 42");
+
+    auto sf_reset = cls.find_static_function("reset_count");
+    CHECK(sf_reset.has_value(), "find_static_function(\"reset_count\") should succeed");
+    std::any sr_ret = sf_reset->invoke();
+    CHECK(!sr_ret.has_value(), "reset_count returns void, any should be empty");
+    CHECK(Point::instance_count == 0, "after reset_count, instance_count should be 0");
 
     // --- error cases ---
     CHECK(!refl::find_class("NoSuchClass").has_value(), "non-existent class should fail");

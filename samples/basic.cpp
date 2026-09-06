@@ -17,11 +17,15 @@ struct Shape {
 struct Rect : Shape {
     int w;
     int h;
-    Rect(int w, int h) : Shape(w), w(w), h(h) {}
+    static int total_created;
+    Rect(int w, int h) : Shape(w), w(w), h(h) { ++total_created; }
     int area() const { return w * h; }
     void resize(int nw, int nh) { w = nw; h = nh; }
     void resize(int sq) { w = sq; h = sq; }
+    static int get_total() { return total_created; }
 };
+
+int Rect::total_created = 0;
 
 enum ShapeType { Circle = 1, Square = 2, Triangle = 3 };
 
@@ -66,6 +70,14 @@ int main() {
     // Safe cast.
     auto safe = obj.cast_safe<Rect>();
     std::printf("  safe cast: w=%d h=%d\n", safe.value()->w, safe.value()->h);
+
+    // Static data member.
+    auto sf = *cls.find_static_field("total_created");
+    std::printf("  static field total_created = %d\n", std::any_cast<int>(sf.get()));
+
+    // Static member function.
+    auto sfn = *cls.find_static_function("get_total");
+    std::printf("  static fn get_total() = %d\n", std::any_cast<int>(sfn.invoke()));
 
     // Enum reflection.
     auto e = *refl::find_enum("ShapeType");

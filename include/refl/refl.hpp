@@ -61,10 +61,13 @@ inline std::string_view to_string(Error e) {
 // valid for the duration of the call) and the void*[] arg array (borrows
 // of the caller's arguments).
 // ---------------------------------------------------------------------------
-using FactoryFn  = std::shared_ptr<void> (*)(void* args[]);
-using InvokerFn  = std::any (*)(void* obj, void* args[]);
-using GetterFn   = std::any (*)(void* obj);
-using SetterFn   = void  (*)(void* obj, std::any val);
+using FactoryFn       = std::shared_ptr<void> (*)(void* args[]);
+using InvokerFn       = std::any (*)(void* obj, void* args[]);
+using GetterFn        = std::any (*)(void* obj);
+using SetterFn        = void  (*)(void* obj, std::any val);
+using StaticGetterFn  = std::any (*)();
+using StaticSetterFn  = void  (*)(std::any val);
+using StaticInvokerFn = std::any (*)(void* args[]);
 
 struct ConstructorInfo {
     std::vector<std::string> param_types;
@@ -78,6 +81,13 @@ struct FunctionInfo {
     InvokerFn invoker;
 };
 
+struct StaticFunctionInfo {
+    std::string name;
+    std::vector<std::string> param_types;
+    std::string return_type;
+    StaticInvokerFn invoker;
+};
+
 struct FieldInfo {
     std::string name;
     std::string type;
@@ -85,12 +95,21 @@ struct FieldInfo {
     SetterFn setter;  // nullptr for const / bit-field members
 };
 
+struct StaticFieldInfo {
+    std::string name;
+    std::string type;
+    StaticGetterFn getter;
+    StaticSetterFn setter;  // nullptr for const members
+};
+
 struct ClassInfo {
     std::string name;
     std::vector<std::string> base_names;
     std::vector<FieldInfo> fields;
+    std::vector<StaticFieldInfo> static_fields;
     std::vector<ConstructorInfo> constructors;
     std::vector<FunctionInfo> functions;
+    std::vector<StaticFunctionInfo> static_functions;
 };
 
 struct EnumeratorInfo {
@@ -549,6 +568,95 @@ void setter(void* obj, std::any val) {
     target->*ptr = std::any_cast<MemberType>(std::move(val));
 }
 
+// --- Static data member getter/setter ---
+// No obj pointer — static storage is accessed via &[:Member:].
+
+template <typename T, std::meta::info Member>
+std::any static_getter() {
+    auto* ptr = &[:Member:];
+    return std::any(*ptr);
+}
+
+template <typename T, std::meta::info Member>
+void static_setter(std::any val) {
+    auto* ptr = &[:Member:];
+    using MemberType = [:std::meta::type_of(Member):];
+    *ptr = std::any_cast<MemberType>(std::move(val));
+}
+
+// --- Static member function invoker ---
+// No obj pointer — static functions are called directly via &[:Fn:].
+
+template <typename T, std::meta::info Fn>
+std::any static_invoker(void* args[]) {
+    auto fn = &[:Fn:];
+    static constexpr auto params = std::define_static_array(
+        std::meta::parameters_of(Fn));
+    constexpr std::size_t n = params.size();
+    using R = [:std::meta::return_type_of(Fn):];
+
+    if constexpr (n == 0) {
+        if constexpr (std::is_void_v<R>) {
+            fn();
+            return std::any{};
+        } else {
+            return std::any(fn());
+        }
+    } else if constexpr (n == 1) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        if constexpr (std::is_void_v<R>) {
+            fn(*static_cast<std::remove_reference_t<P0>*>(args[0]));
+            return std::any{};
+        } else {
+            return std::any(fn(*static_cast<std::remove_reference_t<P0>*>(args[0])));
+        }
+    } else if constexpr (n == 2) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        if constexpr (std::is_void_v<R>) {
+            fn(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+               *static_cast<std::remove_reference_t<P1>*>(args[1]));
+            return std::any{};
+        } else {
+            return std::any(fn(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                              *static_cast<std::remove_reference_t<P1>*>(args[1])));
+        }
+    } else if constexpr (n == 3) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        if constexpr (std::is_void_v<R>) {
+            fn(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+               *static_cast<std::remove_reference_t<P1>*>(args[1]),
+               *static_cast<std::remove_reference_t<P2>*>(args[2]));
+            return std::any{};
+        } else {
+            return std::any(fn(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                              *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                              *static_cast<std::remove_reference_t<P2>*>(args[2])));
+        }
+    } else if constexpr (n == 4) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        if constexpr (std::is_void_v<R>) {
+            fn(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+               *static_cast<std::remove_reference_t<P1>*>(args[1]),
+               *static_cast<std::remove_reference_t<P2>*>(args[2]),
+               *static_cast<std::remove_reference_t<P3>*>(args[3]));
+            return std::any{};
+        } else {
+            return std::any(fn(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                              *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                              *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                              *static_cast<std::remove_reference_t<P3>*>(args[3])));
+        }
+    }
+    // ponytail: supports static functions with 0-4 parameters. Extend if needed.
+    return std::any{};
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -558,6 +666,8 @@ class Class;
 class Constructor;
 class Function;
 class Field;
+class StaticField;
+class StaticFunction;
 class Object;
 class Enum;
 class Enumerator;
@@ -733,6 +843,26 @@ ClassInfo RegistrarHolder<T>::make_info() {
         }
     }
 
+    // Static data members — generate static getter/setter for each.
+    static constexpr auto static_data = std::define_static_array(
+        std::meta::static_data_members_of(^^T, std::meta::access_context::unchecked()));
+    template for (constexpr auto m : static_data) {
+        StaticFieldInfo fi;
+        fi.name = std::string(std::meta::identifier_of(m));
+        fi.type = std::string(
+            std::meta::display_string_of(std::meta::type_of(m)));
+        fi.getter = &detail::static_getter<T, m>;
+
+        using MemberType = [:std::meta::type_of(m):];
+        if constexpr (std::is_const_v<MemberType>) {
+            fi.setter = nullptr;
+        } else {
+            fi.setter = &detail::static_setter<T, m>;
+        }
+
+        info.static_fields.push_back(std::move(fi));
+    }
+
     // All members — filter for constructors and named functions.
     static constexpr auto all_members = std::define_static_array(
         std::meta::members_of(^^T, std::meta::access_context::unchecked()));
@@ -774,7 +904,22 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 std::meta::parameters_of(m));
             constexpr std::size_t fn = fparams.size();
 
-            if constexpr (fn <= detail::max_arity) {
+            if constexpr (std::meta::is_static_member(m)) {
+                // Static member function — no obj pointer.
+                if constexpr (fn <= 4) {
+                    StaticFunctionInfo fi;
+                    fi.name = std::string(std::meta::identifier_of(m));
+                    fi.return_type = std::string(
+                        std::meta::display_string_of(std::meta::return_type_of(m)));
+                    fi.invoker = &detail::static_invoker<T, m>;
+                    template for (constexpr auto p : fparams) {
+                        fi.param_types.emplace_back(
+                            std::meta::display_string_of(std::meta::type_of(p)));
+                    }
+                    info.static_functions.push_back(std::move(fi));
+                }
+                // ponytail: static functions with >4 params are skipped.
+            } else if constexpr (fn <= detail::max_arity) {
                 FunctionInfo fi;
                 fi.name = std::string(std::meta::identifier_of(m));
                 fi.return_type = std::string(
@@ -786,7 +931,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.functions.push_back(std::move(fi));
             }
-            // ponytail: functions with >max_arity params are skipped.
+            // ponytail: non-static functions with >max_arity params are skipped.
         }
     }
 
@@ -949,6 +1094,74 @@ private:
     std::size_t idx_ = 0;
 };
 
+class StaticField {
+public:
+    StaticField() = default;
+    StaticField(const ClassInfo* owner, std::size_t idx)
+        : owner_(owner), idx_(idx) {}
+
+    const std::string& name() const { return owner_->static_fields[idx_].name; }
+    const std::string& type() const { return owner_->static_fields[idx_].type; }
+    bool is_readonly() const { return owner_->static_fields[idx_].setter == nullptr; }
+
+    std::any get() const {
+        if (!valid()) return std::any{};
+        return owner_->static_fields[idx_].getter();
+    }
+
+    std::expected<void, Error> set(std::any val) const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (is_readonly()) return std::unexpected(Error::BadSignature);
+        owner_->static_fields[idx_].setter(std::move(val));
+        return {};
+    }
+
+    bool valid() const { return owner_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+
+private:
+    const ClassInfo* owner_ = nullptr;
+    std::size_t idx_ = 0;
+};
+
+class StaticFunction {
+public:
+    StaticFunction() = default;
+    StaticFunction(const ClassInfo* owner, std::size_t idx)
+        : owner_(owner), idx_(idx) {}
+
+    const std::string& name() const { return owner_->static_functions[idx_].name; }
+    const std::vector<std::string>& param_types() const {
+        return owner_->static_functions[idx_].param_types;
+    }
+    const std::string& return_type() const {
+        return owner_->static_functions[idx_].return_type;
+    }
+
+    template <typename... Args>
+    std::any invoke(Args&&... args) {
+        if (!valid()) return std::any{};
+        auto arg_tuple = std::forward_as_tuple(args...);
+        std::array<void*, sizeof...(Args)> arg_ptrs{};
+        if constexpr (sizeof...(Args) > 0) {
+            fill_arg_ptrs(arg_ptrs.data(), arg_tuple, std::make_index_sequence<sizeof...(Args)>{});
+        }
+        return owner_->static_functions[idx_].invoker(arg_ptrs.data());
+    }
+
+    bool valid() const { return owner_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+
+private:
+    const ClassInfo* owner_ = nullptr;
+    std::size_t idx_ = 0;
+
+    template <typename Tuple, std::size_t... I>
+    static void fill_arg_ptrs(void* ptrs[], Tuple& t, std::index_sequence<I...>) {
+        ((ptrs[I] = static_cast<void*>(std::addressof(std::get<I>(t)))), ...);
+    }
+};
+
 class Enumerator {
 public:
     Enumerator() = default;
@@ -1010,6 +1223,14 @@ public:
         return info_->fields;
     }
 
+    const std::vector<StaticFieldInfo>& static_fields() const {
+        return info_->static_fields;
+    }
+
+    const std::vector<StaticFunctionInfo>& static_functions() const {
+        return info_->static_functions;
+    }
+
     std::expected<Constructor, Error> find_constructor(
         std::initializer_list<std::string_view> types) const;
 
@@ -1028,6 +1249,12 @@ public:
     std::vector<Function> find_functions(std::string_view name) const;
 
     std::expected<Field, Error> find_field(std::string_view name) const;
+
+    // Find a static data member by name.  Does not walk bases.
+    std::expected<StaticField, Error> find_static_field(std::string_view name) const;
+
+    // Find a static member function by name.  Does not walk bases.
+    std::expected<StaticFunction, Error> find_static_function(std::string_view name) const;
 
     bool valid() const { return info_ != nullptr; }
     explicit operator bool() const { return valid(); }
@@ -1233,6 +1460,28 @@ inline std::expected<Enumerator, Error> Enum::find_enumerator(
     for (std::size_t i = 0; i < info_->enumerators.size(); ++i) {
         if (info_->enumerators[i].value == value)
             return Enumerator(info_, i);
+    }
+    return std::unexpected(Error::NotFound);
+}
+
+inline std::expected<StaticField, Error> Class::find_static_field(
+    std::string_view name) const {
+    if (!valid()) return std::unexpected(Error::NullHandle);
+
+    for (std::size_t i = 0; i < info_->static_fields.size(); ++i) {
+        if (info_->static_fields[i].name == name)
+            return StaticField(info_, i);
+    }
+    return std::unexpected(Error::NotFound);
+}
+
+inline std::expected<StaticFunction, Error> Class::find_static_function(
+    std::string_view name) const {
+    if (!valid()) return std::unexpected(Error::NullHandle);
+
+    for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
+        if (info_->static_functions[i].name == name)
+            return StaticFunction(info_, i);
     }
     return std::unexpected(Error::NotFound);
 }
