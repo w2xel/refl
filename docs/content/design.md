@@ -119,5 +119,5 @@ Limitations (marked with `ponytail:` in the source):
 - Inheritance walk is single-inheritance only — multiple inheritance with
   offset bases would produce wrong pointer adjustments in invokers/getters.
 - Static field/function lookup does not walk base classes.
-- Arguments are passed by address (value types only); reference parameters work
-  but the caller must ensure the argument outlives the call.
+- Arguments are passed as `std::any` — a type mismatch throws
+  `std::bad_any_cast` at the call site rather than being undefined behaviour.
