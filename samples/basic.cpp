@@ -1,57 +1,79 @@
 // Sample: runtime reflection with the refl framework.
 //
-// Demonstrates the type-erased API: register a class, find it by name at
-// runtime, construct an Object without knowing its C++ type, invoke methods
-// on it, get/set fields via reflected handles, and safely cast back.
+// Demonstrates: class registration, type-erased construction, field get/set,
+// function invocation, safe cast, overloaded function resolution, inherited
+// member access, and enum reflection.
 #include <refl/refl.hpp>
 #include <any>
 #include <cstdio>
 
-struct Vec2 {
-    int x;
-    int y;
-    Vec2(int x, int y) : x(x), y(y) {}
-    int dot(const Vec2& other) const { return x * other.x + y * other.y; }
+struct Shape {
+    int id;
+    Shape() : id(0) {}
+    Shape(int id) : id(id) {}
+    int area() const { return 0; }
 };
 
-[[maybe_unused]] static refl::Refl<Vec2> reg_vec2;
+struct Rect : Shape {
+    int w;
+    int h;
+    Rect(int w, int h) : Shape(w), w(w), h(h) {}
+    int area() const { return w * h; }
+    void resize(int nw, int nh) { w = nw; h = nh; }
+    void resize(int sq) { w = sq; h = sq; }
+};
+
+enum ShapeType { Circle = 1, Square = 2, Triangle = 3 };
+
+[[maybe_unused]] static refl::Refl<Shape> reg_shape;
+[[maybe_unused]] static refl::Refl<Rect> reg_rect;
+[[maybe_unused]] static refl::Refl<ShapeType> reg_type;
 
 int main() {
-    auto cls = *refl::find_class("Vec2");
-    std::printf("class: %s\n", cls.name().c_str());
-
-    // Enumerate fields with types.
-    const auto& fields = cls.fields();
-    std::printf("  fields:");
-    for (const auto& f : fields)
-        std::printf(" %s:%s%s", f.name.c_str(), f.type.c_str(),
-                    f.setter ? "" : " (ro)");
+    // List all registered classes.
+    std::printf("registered classes:");
+    for (const auto& n : refl::list_all_classes()) std::printf(" %s", n.c_str());
     std::printf("\n");
 
-    // Construct a type-erased Object.
-    auto ctor = *cls.find_constructor({"int", "int"});
-    auto obj = std::move(*ctor.call(3, 4));
-    std::printf("  object class: %s\n", obj.class_name().c_str());
+    auto cls = *refl::find_class("Rect");
+    std::printf("class: %s\n", cls.name().c_str());
+    std::printf("  bases:");
+    for (const auto& b : cls.base_names()) std::printf(" %s", b.c_str());
+    std::printf("\n");
 
-    // Field get via reflected Field handle.
-    auto x_field = *cls.find_field("x");
-    int xv = std::any_cast<int>(x_field.get(obj));
-    std::printf("  field x = %d\n", xv);
+    // Construct.
+    auto obj = *cls.find_constructor({"int", "int"})->call(3, 4);
+    std::printf("  object: %s\n", obj.class_name().c_str());
 
-    // Field set via reflected Field handle.
-    (void)x_field.set(obj, std::any(10));
-    std::printf("  after set, field x = %d\n", std::any_cast<int>(x_field.get(obj)));
+    // Field get/set.
+    auto wf = *cls.find_field("w");
+    std::printf("  field w = %d\n", std::any_cast<int>(wf.get(obj)));
+    (void)wf.set(obj, std::any(10));
 
-    // Safe cast to read the concrete type.
-    auto safe = obj.cast_safe<Vec2>();
-    auto v = safe.value();
-    std::printf("  concrete: (%d, %d)\n", v->x, v->y);
+    // Overloaded function resolution.
+    auto resize2 = *cls.find_function("resize", {"int", "int"});
+    std::printf("  resize(%zu params)\n", resize2.param_types().size());
+    resize2.invoke(obj, 5, 6);
+    std::printf("  after resize: w=%d h=%d\n", obj.cast<Rect>()->w, obj.cast<Rect>()->h);
 
-    // Invoke a member function.
-    auto fn = *cls.find_function("dot");
-    Vec2 other{2, 5};
-    std::any result = fn.invoke(obj, other);
-    std::printf("  dot((10,4), (2,5)) = %d\n", std::any_cast<int>(result));
+    auto overloads = cls.find_functions("resize");
+    std::printf("  resize overloads: %zu\n", overloads.size());
+
+    // Inherited method from Shape.
+    auto inherited = cls.find_function("area");
+    std::printf("  area() = %d\n", std::any_cast<int>(inherited->invoke(obj)));
+
+    // Safe cast.
+    auto safe = obj.cast_safe<Rect>();
+    std::printf("  safe cast: w=%d h=%d\n", safe.value()->w, safe.value()->h);
+
+    // Enum reflection.
+    auto e = *refl::find_enum("ShapeType");
+    std::printf("enum: %s\n", e.name().c_str());
+    for (const auto& en : e.enumerators())
+        std::printf("  %s = %lld\n", en.name.c_str(), en.value);
+    auto sq = e.find_enumerator("Square");
+    std::printf("  Square = %lld\n", sq->value());
 
     return 0;
 }

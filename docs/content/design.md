@@ -83,8 +83,11 @@ Initial implementation. The API above is working:
 - `Refl<T>` registers T in the global pool on construction.
 - `find_class("Name")` returns `std::expected<Class, Error>`.
 - `Class::find_constructor({"int", "int"})` returns `std::expected<Constructor, Error>`.
-- `Class::find_function("name")` returns `std::expected<Function, Error>`.
-- `Class::find_field("name")` returns `std::expected<Field, Error>`.
+- `Class::find_function("name")` returns `std::expected<Function, Error>` (walks bases).
+- `Class::find_function("name", {"int"})` resolves overloads by param types (walks bases).
+- `Class::find_functions("name")` returns all overloads as `std::vector<Function>`.
+- `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
+- `Class::base_names()` returns the direct base class names.
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
   type-erased, shared-ownership handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on an `Object`
@@ -96,13 +99,17 @@ Initial implementation. The API above is working:
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.
+- `find_enum("Name")` returns `std::expected<Enum, Error>`.
+- `Enum::find_enumerator("name")` and `Enum::find_enumerator(value)` return
+  `std::expected<Enumerator, Error>`.
+- `list_all_classes()` and `list_all_enums()` enumerate registered names.
 
 Limitations (marked with `ponytail:` in the source):
 
-- Constructors with 0 or more than 10 parameters are skipped.
-- Member functions with more than 10 parameters are skipped.
-- Default constructors are skipped.
+- Constructors and member functions with more than 10 parameters are skipped.
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
 - Const data members are read-only (getter only, no setter).
+- Inheritance walk is single-inheritance only — multiple inheritance with
+  offset bases would produce wrong pointer adjustments in invokers/getters.
 - Arguments are passed by address (value types only); reference parameters work
   but the caller must ensure the argument outlives the call.
