@@ -121,8 +121,6 @@ Initial implementation. The API above is working:
 
 Limitations (marked with `ponytail:` in the source):
 
-- Constructors, non-static member functions, and static member functions with
-  more than 10 parameters are skipped.
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
 - Const data members (static and non-static) are read-only (getter only, no setter).
 - Inheritance walk is single-inheritance only — multiple inheritance with

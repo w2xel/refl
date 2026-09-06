@@ -167,9 +167,6 @@ struct EnumRegistrar {
 
 namespace detail {
 
-// Maximum supported arity for constructors and member functions.
-inline constexpr std::size_t max_arity = 10;
-
 // Compile-time type name for safe-cast checks.
 template <typename T>
 consteval std::string_view type_name() {
@@ -182,131 +179,18 @@ std::shared_ptr<void> factory(const std::any* args) {
         std::meta::parameters_of(Ctor));
     constexpr std::size_t n = params.size();
 
-    if constexpr (n == 0) {
-        return std::make_shared<T>();
-    } else if constexpr (n == 1) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]));
-    } else if constexpr (n == 2) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]));
-    } else if constexpr (n == 3) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]));
-    } else if constexpr (n == 4) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]));
-    } else if constexpr (n == 5) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                     std::any_cast<std::remove_reference_t<P4>>(args[4]));
-    } else if constexpr (n == 6) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                     std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                     std::any_cast<std::remove_reference_t<P5>>(args[5]));
-    } else if constexpr (n == 7) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                     std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                     std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                     std::any_cast<std::remove_reference_t<P6>>(args[6]));
-    } else if constexpr (n == 8) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                     std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                     std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                     std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                     std::any_cast<std::remove_reference_t<P7>>(args[7]));
-    } else if constexpr (n == 9) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        using P8 = [:std::meta::type_of(params[8]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                     std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                     std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                     std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                     std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                     std::any_cast<std::remove_reference_t<P8>>(args[8]));
-    } else if constexpr (n == 10) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        using P8 = [:std::meta::type_of(params[8]):];
-        using P9 = [:std::meta::type_of(params[9]):];
-        return std::make_shared<T>(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                     std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                     std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                     std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                     std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                     std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                     std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                     std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                     std::any_cast<std::remove_reference_t<P8>>(args[8]),
-                     std::any_cast<std::remove_reference_t<P9>>(args[9]));
-    }
-    // ponytail: supports constructors with 0-10 parameters. Extend if needed.
-    return nullptr;
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+        using P = [:std::meta::type_of(params[J]):];
+        return std::any_cast<std::remove_reference_t<P>>(args[J]);
+    };
+
+    return [&]<std::size_t... I>(std::index_sequence<I...>) -> std::shared_ptr<void> {
+        if constexpr (n == 0) {
+            return std::make_shared<T>();
+        } else {
+            return std::make_shared<T>(extract(std::integral_constant<std::size_t, I>{})...);
+        }
+    }(std::make_index_sequence<n>{});
 }
 
 template <typename T, std::meta::info Fn>
@@ -318,241 +202,29 @@ std::any invoker(void* obj, const std::any* args) {
     constexpr std::size_t n = params.size();
     using R = [:std::meta::return_type_of(Fn):];
 
-    if constexpr (n == 0) {
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)();
-            return std::any{};
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+        using P = [:std::meta::type_of(params[J]):];
+        return std::any_cast<std::remove_reference_t<P>>(args[J]);
+    };
+
+    return [&]<std::size_t... I>(std::index_sequence<I...>) -> std::any {
+        if constexpr (n == 0) {
+            if constexpr (std::is_void_v<R>) {
+                (target->*mfn)();
+                return std::any{};
+            } else {
+                return std::any((target->*mfn)());
+            }
         } else {
-            return std::any((target->*mfn)());
+            if constexpr (std::is_void_v<R>) {
+                (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
+                return std::any{};
+            } else {
+                return std::any((target->*mfn)(
+                    extract(std::integral_constant<std::size_t, I>{})...));
+            }
         }
-    } else if constexpr (n == 1) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0])));
-        }
-    } else if constexpr (n == 2) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1])));
-        }
-    } else if constexpr (n == 3) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2])));
-        }
-    } else if constexpr (n == 4) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3])));
-        }
-    } else if constexpr (n == 5) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                           std::any_cast<std::remove_reference_t<P4>>(args[4]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                std::any_cast<std::remove_reference_t<P4>>(args[4])));
-        }
-    } else if constexpr (n == 6) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                           std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                           std::any_cast<std::remove_reference_t<P5>>(args[5]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                std::any_cast<std::remove_reference_t<P5>>(args[5])));
-        }
-    } else if constexpr (n == 7) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                           std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                           std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                           std::any_cast<std::remove_reference_t<P6>>(args[6]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                std::any_cast<std::remove_reference_t<P6>>(args[6])));
-        }
-    } else if constexpr (n == 8) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                           std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                           std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                           std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                           std::any_cast<std::remove_reference_t<P7>>(args[7]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                std::any_cast<std::remove_reference_t<P7>>(args[7])));
-        }
-    } else if constexpr (n == 9) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        using P8 = [:std::meta::type_of(params[8]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                           std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                           std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                           std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                           std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                           std::any_cast<std::remove_reference_t<P8>>(args[8]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                std::any_cast<std::remove_reference_t<P8>>(args[8])));
-        }
-    } else if constexpr (n == 10) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        using P8 = [:std::meta::type_of(params[8]):];
-        using P9 = [:std::meta::type_of(params[9]):];
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                           std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                           std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                           std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                           std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                           std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                           std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                           std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                           std::any_cast<std::remove_reference_t<P8>>(args[8]),
-                           std::any_cast<std::remove_reference_t<P9>>(args[9]));
-            return std::any{};
-        } else {
-            return std::any((target->*mfn)(
-                std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                std::any_cast<std::remove_reference_t<P8>>(args[8]),
-                std::any_cast<std::remove_reference_t<P9>>(args[9])));
-        }
-    }
-    // ponytail: supports member functions with 0-10 parameters. Extend if needed.
-    return std::any{};
+    }(std::make_index_sequence<n>{});
 }
 
 template <typename T, std::meta::info Member>
@@ -607,231 +279,28 @@ std::any static_invoker(const std::any* args) {
     constexpr std::size_t n = params.size();
     using R = [:std::meta::return_type_of(Fn):];
 
-    if constexpr (n == 0) {
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+        using P = [:std::meta::type_of(params[J]):];
+        return std::any_cast<std::remove_reference_t<P>>(args[J]);
+    };
+
+    return [&]<std::size_t... I>(std::index_sequence<I...>) -> std::any {
+        if constexpr (n == 0) {
         if constexpr (std::is_void_v<R>) {
             fn();
             return std::any{};
         } else {
             return std::any(fn());
         }
-    } else if constexpr (n == 1) {
-        using P0 = [:std::meta::type_of(params[0]):];
+    } else {
         if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]));
+            fn(extract(std::integral_constant<std::size_t, I>{})...);
             return std::any{};
         } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0])));
-        }
-    } else if constexpr (n == 2) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1])));
-        }
-    } else if constexpr (n == 3) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2])));
-        }
-    } else if constexpr (n == 4) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3])));
-        }
-    } else if constexpr (n == 5) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]),
-               std::any_cast<std::remove_reference_t<P4>>(args[4]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                              std::any_cast<std::remove_reference_t<P4>>(args[4])));
-        }
-    } else if constexpr (n == 6) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]),
-               std::any_cast<std::remove_reference_t<P4>>(args[4]),
-               std::any_cast<std::remove_reference_t<P5>>(args[5]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                              std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                              std::any_cast<std::remove_reference_t<P5>>(args[5])));
-        }
-    } else if constexpr (n == 7) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]),
-               std::any_cast<std::remove_reference_t<P4>>(args[4]),
-               std::any_cast<std::remove_reference_t<P5>>(args[5]),
-               std::any_cast<std::remove_reference_t<P6>>(args[6]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                              std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                              std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                              std::any_cast<std::remove_reference_t<P6>>(args[6])));
-        }
-    } else if constexpr (n == 8) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]),
-               std::any_cast<std::remove_reference_t<P4>>(args[4]),
-               std::any_cast<std::remove_reference_t<P5>>(args[5]),
-               std::any_cast<std::remove_reference_t<P6>>(args[6]),
-               std::any_cast<std::remove_reference_t<P7>>(args[7]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                              std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                              std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                              std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                              std::any_cast<std::remove_reference_t<P7>>(args[7])));
-        }
-    } else if constexpr (n == 9) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        using P8 = [:std::meta::type_of(params[8]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]),
-               std::any_cast<std::remove_reference_t<P4>>(args[4]),
-               std::any_cast<std::remove_reference_t<P5>>(args[5]),
-               std::any_cast<std::remove_reference_t<P6>>(args[6]),
-               std::any_cast<std::remove_reference_t<P7>>(args[7]),
-               std::any_cast<std::remove_reference_t<P8>>(args[8]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                              std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                              std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                              std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                              std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                              std::any_cast<std::remove_reference_t<P8>>(args[8])));
-        }
-    } else if constexpr (n == 10) {
-        using P0 = [:std::meta::type_of(params[0]):];
-        using P1 = [:std::meta::type_of(params[1]):];
-        using P2 = [:std::meta::type_of(params[2]):];
-        using P3 = [:std::meta::type_of(params[3]):];
-        using P4 = [:std::meta::type_of(params[4]):];
-        using P5 = [:std::meta::type_of(params[5]):];
-        using P6 = [:std::meta::type_of(params[6]):];
-        using P7 = [:std::meta::type_of(params[7]):];
-        using P8 = [:std::meta::type_of(params[8]):];
-        using P9 = [:std::meta::type_of(params[9]):];
-        if constexpr (std::is_void_v<R>) {
-            fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-               std::any_cast<std::remove_reference_t<P1>>(args[1]),
-               std::any_cast<std::remove_reference_t<P2>>(args[2]),
-               std::any_cast<std::remove_reference_t<P3>>(args[3]),
-               std::any_cast<std::remove_reference_t<P4>>(args[4]),
-               std::any_cast<std::remove_reference_t<P5>>(args[5]),
-               std::any_cast<std::remove_reference_t<P6>>(args[6]),
-               std::any_cast<std::remove_reference_t<P7>>(args[7]),
-               std::any_cast<std::remove_reference_t<P8>>(args[8]),
-               std::any_cast<std::remove_reference_t<P9>>(args[9]));
-            return std::any{};
-        } else {
-            return std::any(fn(std::any_cast<std::remove_reference_t<P0>>(args[0]),
-                              std::any_cast<std::remove_reference_t<P1>>(args[1]),
-                              std::any_cast<std::remove_reference_t<P2>>(args[2]),
-                              std::any_cast<std::remove_reference_t<P3>>(args[3]),
-                              std::any_cast<std::remove_reference_t<P4>>(args[4]),
-                              std::any_cast<std::remove_reference_t<P5>>(args[5]),
-                              std::any_cast<std::remove_reference_t<P6>>(args[6]),
-                              std::any_cast<std::remove_reference_t<P7>>(args[7]),
-                              std::any_cast<std::remove_reference_t<P8>>(args[8]),
-                              std::any_cast<std::remove_reference_t<P9>>(args[9])));
+            return std::any(fn(extract(std::integral_constant<std::size_t, I>{})...));
         }
     }
-    // ponytail: supports static functions with 0-10 parameters. Extend if needed.
-    return std::any{};
+    }(std::make_index_sequence<n>{});
 }
 
 }  // namespace detail
@@ -1102,7 +571,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                     }
                     info.constructors.push_back(std::move(ci));
                 }
-            } else if constexpr (n >= 2 && n <= detail::max_arity) {
+            } else if constexpr (n >= 2) {
                 ConstructorInfo ci;
                 ci.factory = &detail::factory<T, m>;
                 template for (constexpr auto p : params) {
@@ -1111,28 +580,23 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.constructors.push_back(std::move(ci));
             }
-            // ponytail: n>max_arity constructors are skipped.
         } else if constexpr (std::meta::is_function(m) && std::meta::has_identifier(m)) {
             static constexpr auto fparams = std::define_static_array(
                 std::meta::parameters_of(m));
-            constexpr std::size_t fn = fparams.size();
 
             if constexpr (std::meta::is_static_member(m)) {
                 // Static member function — no obj pointer.
-                if constexpr (fn <= detail::max_arity) {
-                    StaticFunctionInfo fi;
-                    fi.name = std::string(std::meta::identifier_of(m));
-                    fi.return_type = std::string(
-                        std::meta::display_string_of(std::meta::return_type_of(m)));
-                    fi.invoker = &detail::static_invoker<T, m>;
-                    template for (constexpr auto p : fparams) {
-                        fi.param_types.emplace_back(
-                            std::meta::display_string_of(std::meta::type_of(p)));
-                    }
-                    info.static_functions.push_back(std::move(fi));
+                StaticFunctionInfo fi;
+                fi.name = std::string(std::meta::identifier_of(m));
+                fi.return_type = std::string(
+                    std::meta::display_string_of(std::meta::return_type_of(m)));
+                fi.invoker = &detail::static_invoker<T, m>;
+                template for (constexpr auto p : fparams) {
+                    fi.param_types.emplace_back(
+                        std::meta::display_string_of(std::meta::type_of(p)));
                 }
-                // ponytail: static functions with >max_arity params are skipped.
-            } else if constexpr (fn <= detail::max_arity) {
+                info.static_functions.push_back(std::move(fi));
+            } else {
                 FunctionInfo fi;
                 fi.name = std::string(std::meta::identifier_of(m));
                 fi.return_type = std::string(
@@ -1144,7 +608,6 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.functions.push_back(std::move(fi));
             }
-            // ponytail: non-static functions with >max_arity params are skipped.
         }
     }
 
