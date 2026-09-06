@@ -19,11 +19,12 @@ Holding a class handle allows querying functions and constructing it.
 
 ```cpp
 auto construct = *my_class_class.find_constructor("int", "int");
-auto my_obj = std::move(*construct.call(1, 3));
+auto my_obj = *construct.call(1, 3);
 ```
 
-The returned `Object` is a type-erased owning handle — you don't need to know
-the C++ type to construct or invoke methods.  Functions are called on the
+The returned `Object` is a type-erased, shared-ownership handle (backed by
+`std::shared_ptr<void>`) — you don't need to know the C++ type to construct
+or invoke methods.  Copies share ownership.  Functions are called on the
 `Object` directly:
 
 ```cpp
@@ -31,18 +32,19 @@ auto fn = *my_class_class.find_function("some_method");
 std::any result = fn.invoke(my_obj, arg1, arg2);
 ```
 
-When you need the concrete type, cast explicitly:
+When you need the concrete type, cast explicitly.  The fast cast returns
+a non-owning `T*` (valid as long as the Object is alive):
 
 ```cpp
-auto& concrete = my_obj.cast<MyClass>();
+MyClass* ptr = my_obj.cast<MyClass>();
 ```
 
 Or use the safe cast, which checks the class name at runtime and returns
-`std::expected`:
+a `std::shared_ptr<T>` that shares ownership with the Object:
 
 ```cpp
 auto result = my_obj.cast_safe<MyClass>();
-if (result) { auto* ptr = result.value(); /* ... */ }
+if (result) { auto sp = result.value(); /* sp->... */ }
 ```
 
 Fields can be found by name and get/set through type-erased handles:
@@ -84,15 +86,16 @@ Initial implementation. The API above is working:
 - `Class::find_function("name")` returns `std::expected<Function, Error>`.
 - `Class::find_field("name")` returns `std::expected<Field, Error>`.
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
-  type-erased owning handle.  No template parameter needed.
+  type-erased, shared-ownership handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on an `Object`
   (or on a concrete `T&` via `invoke<T>`) and returns `std::any`.
 - `Field::get(Object&)` returns the field value as `std::any`.
 - `Field::set(Object&, std::any)` sets the field value.  Returns
   `Error::BadSignature` for read-only (const or bit-field) fields.
-- `Object::cast<T>()` recovers the concrete type (fast, unchecked).
+- `Object::cast<T>()` returns a non-owning `T*` (fast, unchecked).
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
-  `std::expected<T*, Error>`.
+  `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
+  object alive independently of the Object.
 
 Limitations (marked with `ponytail:` in the source):
 

@@ -57,8 +57,8 @@ int main() {
     CHECK(obj.class_name() == "Point", "object class name should be \"Point\"");
 
     // --- fast cast (unchecked) ---
-    CHECK(obj.cast<Point>().x == 1, "constructed x should be 1");
-    CHECK(obj.cast<Point>().y == 3, "constructed y should be 3");
+    CHECK(obj.cast<Point>()->x == 1, "constructed x should be 1");
+    CHECK(obj.cast<Point>()->y == 3, "constructed y should be 3");
 
     // --- safe cast (checked) ---
     auto safe = obj.cast_safe<Point>();
@@ -87,8 +87,8 @@ int main() {
     auto set_fn = *set_result;
     std::any set_ret = set_fn.invoke(obj, 10, 20);
     CHECK(!set_ret.has_value(), "set returns void, any should be empty");
-    CHECK(obj.cast<Point>().x == 10, "after set, x should be 10");
-    CHECK(obj.cast<Point>().y == 20, "after set, y should be 20");
+    CHECK(obj.cast<Point>()->x == 10, "after set, x should be 10");
+    CHECK(obj.cast<Point>()->y == 20, "after set, y should be 20");
 
     // --- field get/set via reflected Field ---
     auto x_field = cls.find_field("x");
@@ -103,7 +103,7 @@ int main() {
 
     auto set_result2 = xf.set(obj, std::any(77));
     CHECK(set_result2.has_value(), "set x should succeed");
-    CHECK(obj.cast<Point>().x == 77, "after field set, x should be 77");
+    CHECK(obj.cast<Point>()->x == 77, "after field set, x should be 77");
 
     // --- readonly field (const) ---
     auto id_field = cls.find_field("id");

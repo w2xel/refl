@@ -52,11 +52,16 @@ inline std::string_view to_string(Error e) {
 }
 
 // ---------------------------------------------------------------------------
-// Type-erased function pointer signatures for factories, deleters, invokers,
-// getters, and setters.
+// Type-erased function pointer signatures for factories, invokers, getters,
+// and setters.
+//
+// The factory returns a shared_ptr<void> with the deleter baked in, so the
+// result is never a bare owning pointer.  Invokers, getters, and setters
+// take a non-owning void* (a borrow from the Object's internal storage,
+// valid for the duration of the call) and the void*[] arg array (borrows
+// of the caller's arguments).
 // ---------------------------------------------------------------------------
-using FactoryFn  = void* (*)(void* args[]);
-using DeleterFn  = void  (*)(void* obj);
+using FactoryFn  = std::shared_ptr<void> (*)(void* args[]);
 using InvokerFn  = std::any (*)(void* obj, void* args[]);
 using GetterFn   = std::any (*)(void* obj);
 using SetterFn   = void  (*)(void* obj, std::any val);
@@ -64,7 +69,6 @@ using SetterFn   = void  (*)(void* obj, std::any val);
 struct ConstructorInfo {
     std::vector<std::string> param_types;
     FactoryFn factory;
-    DeleterFn deleter;
 };
 
 struct FunctionInfo {
@@ -109,7 +113,7 @@ struct Registrar {
 };
 
 // ---------------------------------------------------------------------------
-// Type-erased factory / deleter / invoker / getter / setter templates.
+// Type-erased factory / invoker / getter / setter templates.
 //
 // Each is parameterised on the target type T and (where relevant) the
 // compile-time meta::info of the specific constructor, member function, or
@@ -129,26 +133,26 @@ consteval std::string_view type_name() {
 }
 
 template <typename T, std::meta::info Ctor>
-void* factory(void* args[]) {
+std::shared_ptr<void> factory(void* args[]) {
     static constexpr auto params = std::define_static_array(
         std::meta::parameters_of(Ctor));
     constexpr std::size_t n = params.size();
 
     if constexpr (n == 0) {
-        return new T();
+        return std::make_shared<T>();
     } else if constexpr (n == 1) {
         using P0 = [:std::meta::type_of(params[0]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]));
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]));
     } else if constexpr (n == 2) {
         using P0 = [:std::meta::type_of(params[0]):];
         using P1 = [:std::meta::type_of(params[1]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]));
     } else if constexpr (n == 3) {
         using P0 = [:std::meta::type_of(params[0]):];
         using P1 = [:std::meta::type_of(params[1]):];
         using P2 = [:std::meta::type_of(params[2]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]));
     } else if constexpr (n == 4) {
@@ -156,7 +160,7 @@ void* factory(void* args[]) {
         using P1 = [:std::meta::type_of(params[1]):];
         using P2 = [:std::meta::type_of(params[2]):];
         using P3 = [:std::meta::type_of(params[3]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]));
@@ -166,7 +170,7 @@ void* factory(void* args[]) {
         using P2 = [:std::meta::type_of(params[2]):];
         using P3 = [:std::meta::type_of(params[3]):];
         using P4 = [:std::meta::type_of(params[4]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]),
@@ -178,7 +182,7 @@ void* factory(void* args[]) {
         using P3 = [:std::meta::type_of(params[3]):];
         using P4 = [:std::meta::type_of(params[4]):];
         using P5 = [:std::meta::type_of(params[5]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]),
@@ -192,7 +196,7 @@ void* factory(void* args[]) {
         using P4 = [:std::meta::type_of(params[4]):];
         using P5 = [:std::meta::type_of(params[5]):];
         using P6 = [:std::meta::type_of(params[6]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]),
@@ -208,7 +212,7 @@ void* factory(void* args[]) {
         using P5 = [:std::meta::type_of(params[5]):];
         using P6 = [:std::meta::type_of(params[6]):];
         using P7 = [:std::meta::type_of(params[7]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]),
@@ -226,7 +230,7 @@ void* factory(void* args[]) {
         using P6 = [:std::meta::type_of(params[6]):];
         using P7 = [:std::meta::type_of(params[7]):];
         using P8 = [:std::meta::type_of(params[8]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]),
@@ -246,7 +250,7 @@ void* factory(void* args[]) {
         using P7 = [:std::meta::type_of(params[7]):];
         using P8 = [:std::meta::type_of(params[8]):];
         using P9 = [:std::meta::type_of(params[9]):];
-        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+        return std::make_shared<T>(*static_cast<std::remove_reference_t<P0>*>(args[0]),
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]),
@@ -259,11 +263,6 @@ void* factory(void* args[]) {
     }
     // ponytail: supports constructors with 0-10 parameters. Extend if needed.
     return nullptr;
-}
-
-template <typename T>
-void deleter(void* obj) {
-    delete static_cast<T*>(obj);
 }
 
 template <typename T, std::meta::info Fn>
@@ -587,90 +586,66 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Object — a type-erased owning handle to a heap-allocated instance.
+// Object — a type-erased, shared-ownership handle to a heap-allocated
+// instance.
 //
-// Returned by Constructor::call.  Holds a void* plus the deleter and class
-// name needed to manage it safely without knowing the C++ type.  Use
-// cast<T>() for the fast unchecked path, or cast_safe<T>() for a runtime
-// name check that returns std::expected.
+// Returned by Constructor::call.  Internally holds a std::shared_ptr<void>
+// with the deleter baked in, plus the class name for runtime type checks.
+// Copyable — copies share ownership.  Use cast<T>() for a fast non-owning
+// borrow (T*), or cast_safe<T>() for a checked std::shared_ptr<T> that
+// keeps the object alive independently.
 // ---------------------------------------------------------------------------
 
 class Object {
 public:
     Object() = default;
 
-    Object(void* ptr, DeleterFn deleter, std::string class_name)
-        : ptr_(ptr), deleter_(deleter), class_name_(std::move(class_name)) {}
+    Object(std::shared_ptr<void> ptr, std::string class_name)
+        : ptr_(std::move(ptr)), class_name_(std::move(class_name)) {}
 
-    ~Object() {
-        if (ptr_ && deleter_) deleter_(ptr_);
-    }
-
-    Object(const Object&) = delete;
-    Object& operator=(const Object&) = delete;
-
-    Object(Object&& o) noexcept
-        : ptr_(o.ptr_), deleter_(o.deleter_), class_name_(std::move(o.class_name_)) {
-        o.ptr_ = nullptr;
-        o.deleter_ = nullptr;
-    }
-
-    Object& operator=(Object&& o) noexcept {
-        if (this != &o) {
-            if (ptr_ && deleter_) deleter_(ptr_);
-            ptr_ = o.ptr_;
-            deleter_ = o.deleter_;
-            class_name_ = std::move(o.class_name_);
-            o.ptr_ = nullptr;
-            o.deleter_ = nullptr;
-        }
-        return *this;
-    }
+    // Shared ownership — copies are fine.
+    Object(const Object&) = default;
+    Object& operator=(const Object&) = default;
+    Object(Object&&) noexcept = default;
+    Object& operator=(Object&&) noexcept = default;
 
     // The class name this object was constructed as (for runtime checks).
     const std::string& class_name() const { return class_name_; }
 
-    // Fast cast: recover the concrete type.  Caller is responsible for
-    // passing the correct T; a mismatch is undefined behaviour.
+    // Fast cast: returns a non-owning pointer.  The pointer is valid as
+    // long as any copy of this Object (or a shared_ptr from cast_safe)
+    // is alive.  Caller is responsible for the correct T; mismatch is UB.
     template <typename T>
-    T& cast() {
-        return *static_cast<T*>(ptr_);
+    T* cast() {
+        return static_cast<T*>(ptr_.get());
     }
 
     template <typename T>
-    const T& cast() const {
-        return *static_cast<const T*>(ptr_);
+    const T* cast() const {
+        return static_cast<const T*>(ptr_.get());
     }
 
-    // Safe cast: checks the class name against T's name at runtime.
-    // Returns a pointer to the object, or Error::TypeError on mismatch,
-    // Error::NullHandle if the Object is invalid.
+    // Safe cast: checks the class name against T's name at runtime and
+    // returns a std::shared_ptr<T> that shares ownership with the Object.
+    // Returns Error::TypeError on mismatch, Error::NullHandle if invalid.
     template <typename T>
-    std::expected<T*, Error> cast_safe() {
+    std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (class_name_ != detail::type_name<T>())
             return std::unexpected(Error::TypeError);
-        return static_cast<T*>(ptr_);
+        return std::static_pointer_cast<T>(ptr_);
     }
-
-    template <typename T>
-    std::expected<const T*, Error> cast_safe() const {
-        if (!valid()) return std::unexpected(Error::NullHandle);
-        if (class_name_ != detail::type_name<T>())
-            return std::unexpected(Error::TypeError);
-        return static_cast<const T*>(ptr_);
-    }
-
-    // Low-level: the raw pointer, for passing to invokers.
-    void* raw() { return ptr_; }
-    const void* raw() const { return ptr_; }
 
     bool valid() const { return ptr_ != nullptr; }
     explicit operator bool() const { return valid(); }
 
 private:
-    void* ptr_ = nullptr;
-    DeleterFn deleter_ = nullptr;
+    // Non-owning borrow of the internal pointer, for passing to invokers
+    // and getters/setters.  Only accessible to friend classes.
+    void* raw() { return ptr_.get(); }
+    const void* raw() const { return ptr_.get(); }
+
+    std::shared_ptr<void> ptr_;
     std::string class_name_;
 
     friend class Function;
@@ -726,7 +701,6 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 if constexpr (!std::is_same_v<std::remove_cvref_t<P0>, T>) {
                     ConstructorInfo ci;
                     ci.factory = &detail::factory<T, m>;
-                    ci.deleter = &detail::deleter<T>;
                     template for (constexpr auto p : params) {
                         ci.param_types.emplace_back(
                             std::meta::display_string_of(std::meta::type_of(p)));
@@ -736,7 +710,6 @@ ClassInfo RegistrarHolder<T>::make_info() {
             } else if constexpr (n >= 2 && n <= detail::max_arity) {
                 ConstructorInfo ci;
                 ci.factory = &detail::factory<T, m>;
-                ci.deleter = &detail::deleter<T>;
                 template for (constexpr auto p : params) {
                     ci.param_types.emplace_back(
                         std::meta::display_string_of(std::meta::type_of(p)));
@@ -793,9 +766,9 @@ public:
         }
 
         const auto& ci = owner_->constructors[idx_];
-        void* result = ci.factory(arg_ptrs.data());
+        std::shared_ptr<void> result = ci.factory(arg_ptrs.data());
         if (!result) return std::unexpected(Error::NullHandle);
-        return Object(result, ci.deleter, owner_->name);
+        return Object(std::move(result), owner_->name);
     }
 
     bool valid() const { return owner_ != nullptr; }

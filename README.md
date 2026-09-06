@@ -22,29 +22,31 @@ Holding an object of this class allows querying functions and construct it.
 
 ```cpp
 auto construct = *my_class_class.find_constructor("int", "int");
-auto my_obj = std::move(*construct.call(1, 3));
+auto my_obj = *construct.call(1, 3);
 ```
 
-The returned `Object` is type-erased — it owns the heap-allocated instance
-without you needing to know its C++ type.  You can invoke methods on it
-directly:
+The returned `Object` is a type-erased, shared-ownership handle — it holds
+a `std::shared_ptr<void>` internally, so copies share ownership.  You can
+invoke methods on it directly:
 
 ```cpp
 auto fn = *my_class_class.find_function("some_method");
 std::any result = fn.invoke(my_obj, arg1, arg2);
 ```
 
-When you do need the concrete type, cast explicitly:
+When you do need the concrete type, cast explicitly.  The fast cast returns
+a non-owning pointer (valid as long as the Object is alive):
 
 ```cpp
-auto& concrete = my_obj.cast<MyClass>();
+MyClass* ptr = my_obj.cast<MyClass>();
 ```
 
-Or use the safe cast, which checks the class name at runtime:
+Or use the safe cast, which checks the class name at runtime and returns
+a `std::shared_ptr<T>` that keeps the object alive independently:
 
 ```cpp
 auto result = my_obj.cast_safe<MyClass>();
-if (result) { auto* ptr = result.value(); /* ... */ }
+if (result) { auto sp = result.value(); /* sp->... */ }
 ```
 
 Fields can be found by name and get/set through type-erased handles:

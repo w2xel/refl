@@ -44,7 +44,7 @@ int main() {
 
     // Safe cast to read the concrete type.
     auto safe = obj.cast_safe<Vec2>();
-    auto* v = safe.value();
+    auto v = safe.value();
     std::printf("  concrete: (%d, %d)\n", v->x, v->y);
 
     // Invoke a member function.
