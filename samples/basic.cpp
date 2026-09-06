@@ -87,5 +87,11 @@ int main() {
     auto sq = e.find_enumerator("Square");
     std::printf("  Square = %lld\n", sq->value());
 
+    // Clone (deep copy through type-erased handle).
+    auto cloned = *obj.clone();
+    std::printf("  clone: %s\n", cloned.to_string().c_str());
+    std::printf("  clone w=%d (independent of original)\n",
+                cloned.cast_safe<Rect>().value()->w);
+
     return 0;
 }

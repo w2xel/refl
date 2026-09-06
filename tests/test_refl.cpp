@@ -235,6 +235,26 @@ int main() {
     CHECK(base_cls2.static_fields().empty(), "Base should have 0 static fields");
     CHECK(base_cls2.static_functions().empty(), "Base should have 0 static functions");
 
+    // --- clone ---
+    auto clone_result = obj.clone();
+    CHECK(clone_result.has_value(), "clone should succeed");
+    auto cloned = std::move(*clone_result);
+    CHECK(cloned.valid(), "cloned object should be valid");
+    CHECK(cloned.class_name() == "Point", "cloned class name should be Point");
+    // cloned should have same field values as original
+    auto cloned_p = cloned.cast_safe<Point>().value();
+    CHECK(cloned_p->x == 77, "cloned x should match original (77)");
+    CHECK(cloned_p->y == 20, "cloned y should match original (20)");
+    // modifying clone should not affect original
+    (void)xf.set(cloned, std::any(999));
+    CHECK(p->x == 77, "original x should still be 77 after modifying clone");
+    CHECK(cloned_p->x == 999, "cloned x should be 999");
+
+    // --- to_string ---
+    std::string ts = obj.to_string();
+    CHECK(ts.substr(0, 14) == "Object(Point @", "to_string should start with Object(Point @");
+    CHECK(ts.find("Point") != std::string::npos, "to_string should contain class name");
+
     // --- error cases ---
     CHECK(!refl::find_class("NoSuchClass").has_value(), "non-existent class should fail");
     CHECK(!cls.find_constructor({"double"}).has_value(), "wrong ctor types should fail");

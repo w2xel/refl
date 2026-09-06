@@ -115,14 +115,21 @@ Initial implementation. The API above is working:
 - `Enum::find_enumerator("name")` and `Enum::find_enumerator(value)` return
   `std::expected<Enumerator, Error>`.
 - `list_all_classes()` and `list_all_enums()` enumerate registered names.
+- `Object::clone()` deep-copies the object through the type-erased handle.
+  Returns `Error::BadSignature` if the class is not copy-constructible.
+- `Object::to_string()` returns a debug string with the class name and address.
 
 Limitations (marked with `ponytail:` in the source):
 
-- Constructors and non-static member functions with more than 10 parameters are skipped.
-- Static member functions with more than 4 parameters are skipped.
+- Constructors, non-static member functions, and static member functions with
+  more than 10 parameters are skipped.
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
 - Const data members (static and non-static) are read-only (getter only, no setter).
 - Inheritance walk is single-inheritance only — multiple inheritance with
   offset bases would produce wrong pointer adjustments in invokers/getters.
+- Clone requires a copy constructor — non-copyable classes return
+  `Error::BadSignature`.
 - Arguments are passed as `std::any` — a type mismatch throws
   `std::bad_any_cast` at the call site rather than being undefined behaviour.
+- Registration is static-init order dependent — `find_class` only works after
+  `Refl<T>` has been instantiated.
