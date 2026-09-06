@@ -1,0 +1,10 @@
+# Build artifacts
+/builddir
+/build
+/result
+
+# direnv
+/.direnv
+
+# editors
+.compile_commands.json
