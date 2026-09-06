@@ -22,3 +22,11 @@ test_skeleton = executable(
   install: false,
 )
 test('skeleton', test_skeleton)
+
+test_refl = executable(
+  'test_refl',
+  'test_refl.cpp',
+  include_directories: inc,
+  install: false,
+)
+test('refl_api', test_refl)
