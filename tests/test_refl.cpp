@@ -1,8 +1,10 @@
 // Full API test: register a class, find it by name, find a constructor,
-// construct an instance, find a function, and invoke it.
+// construct an instance (type-erased Object), find a function, invoke it,
+// and cast back to the concrete type.
 //
 // Returns non-zero (fails meson test) on any assertion failure.
 #include <refl/refl.hpp>
+#include <any>
 #include <cstdio>
 #include <cstdlib>
 
@@ -15,7 +17,6 @@ struct Point {
 };
 
 // Force registration of Point into the global pool.
-// Instantiating Refl<Point> triggers the static registrar.
 [[maybe_unused]] static refl::Refl<Point> reg_point;
 
 #define CHECK(cond, msg) \
@@ -49,12 +50,16 @@ int main() {
     CHECK(ctor.param_types()[0] == "int", "first param should be int");
     CHECK(ctor.param_types()[1] == "int", "second param should be int");
 
-    // --- construct via call ---
-    auto obj_result = ctor.call<Point>(1, 3);
-    CHECK(obj_result.has_value(), "ctor.call<Point>(1, 3) should succeed");
-    auto obj = *obj_result;
-    CHECK(obj.get().x == 1, "constructed x should be 1");
-    CHECK(obj.get().y == 3, "constructed y should be 3");
+    // --- construct via call (type-erased, no <Point> needed) ---
+    auto obj_result = ctor.call(1, 3);
+    CHECK(obj_result.has_value(), "ctor.call(1, 3) should succeed");
+    auto obj = std::move(*obj_result);
+    CHECK(obj.valid(), "object should be valid");
+    CHECK(obj.class_name() == "Point", "object class name should be \"Point\"");
+
+    // --- cast back to concrete type when needed ---
+    CHECK(obj.cast<Point>().x == 1, "constructed x should be 1");
+    CHECK(obj.cast<Point>().y == 3, "constructed y should be 3");
 
     // --- find_function ---
     auto fn_result = cls.find_function("sum");
@@ -64,26 +69,33 @@ int main() {
     CHECK(fn.return_type() == "int", "sum should return int");
     CHECK(fn.param_types().size() == 0, "sum should have 0 params");
 
-    // --- invoke function ---
-    std::any ret = fn.invoke<Point>(obj.get());
+    // --- invoke function on Object (type-erased) ---
+    std::any ret = fn.invoke(obj);
     CHECK(ret.has_value(), "invoke sum should return non-empty any");
     int result = std::any_cast<int>(ret);
     CHECK(result == 4, "sum(1,3) should be 4");
 
-    // --- find and invoke void function ---
+    // --- find and invoke void function on Object ---
     auto set_result = cls.find_function("set");
     CHECK(set_result.has_value(), "find_function(\"set\") should succeed");
     auto set_fn = *set_result;
     CHECK(set_fn.param_types().size() == 2, "set should have 2 params");
 
-    set_fn.invoke<Point>(obj.get(), 10, 20);
-    CHECK(obj.get().x == 10, "after set, x should be 10");
-    CHECK(obj.get().y == 20, "after set, y should be 20");
+    std::any set_ret = set_fn.invoke(obj, 10, 20);
+    CHECK(!set_ret.has_value(), "set returns void, any should be empty");
+    CHECK(obj.cast<Point>().x == 10, "after set, x should be 10");
+    CHECK(obj.cast<Point>().y == 20, "after set, y should be 20");
 
     // re-invoke sum to verify
-    std::any ret2 = fn.invoke<Point>(obj.get());
+    std::any ret2 = fn.invoke(obj);
     int result2 = std::any_cast<int>(ret2);
     CHECK(result2 == 30, "sum(10,20) should be 30");
+
+    // --- invoke on a concrete type (no Object needed) ---
+    Point direct{5, 5};
+    std::any ret3 = fn.invoke<Point>(direct);
+    int result3 = std::any_cast<int>(ret3);
+    CHECK(result3 == 10, "sum(5,5) should be 10");
 
     // --- error cases ---
     auto bad_class = refl::find_class("NoSuchClass");

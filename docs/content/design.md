@@ -19,10 +19,27 @@ Holding a class handle allows querying functions and constructing it.
 
 ```cpp
 auto construct = *my_class_class.find_constructor("int", "int");
-refl::Refl<MyClass> my_obj = construct.call(1, 3);
+auto my_obj = std::move(*construct.call(1, 3));
+```
+
+The returned `Object` is a type-erased owning handle — you don't need to know
+the C++ type to construct or invoke methods.  Functions are called on the
+`Object` directly:
+
+```cpp
+auto fn = *my_class_class.find_function("some_method");
+std::any result = fn.invoke(my_obj, arg1, arg2);
+```
+
+When you need the concrete type, cast explicitly:
+
+```cpp
+auto& concrete = my_obj.cast<MyClass>();
 ```
 
 Note the dereferences — the return values should be `std::expected`.
+Function results are returned as `std::any` — use `std::any_cast<T>` to
+extract (empty for void functions).
 
 ## Mechanism
 
@@ -49,9 +66,11 @@ Initial implementation. The API above is working:
 - `find_class("Name")` returns `std::expected<Class, Error>`.
 - `Class::find_constructor({"int", "int"})` returns `std::expected<Constructor, Error>`.
 - `Class::find_function("name")` returns `std::expected<Function, Error>`.
-- `Constructor::call<T>(args...)` heap-allocates and returns `std::expected<Refl<T>, Error>`.
-- `Function::invoke<T>(obj, args...)` calls the member function and returns the
-  result as `std::any` (use `std::any_cast<R>` to extract; empty for void functions).
+- `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
+  type-erased owning handle.  No template parameter needed.
+- `Function::invoke(obj, args...)` calls the member function on an `Object`
+  (or on a concrete `T&` via `invoke<T>`) and returns `std::any`.
+- `Object::cast<T>()` recovers the concrete type when you need direct access.
 
 Limitations (marked with `ponytail:` in the source):
 

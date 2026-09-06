@@ -1,9 +1,10 @@
 // Sample: runtime reflection with the refl framework.
 //
-// Demonstrates the full API: register a class, find it by name at runtime,
-// query its constructors and member functions, construct objects, and
-// invoke methods through reflected handles.
+// Demonstrates the type-erased API: register a class, find it by name at
+// runtime, construct an Object without knowing its C++ type, invoke methods
+// on it, and cast back to the concrete type only when you need direct access.
 #include <refl/refl.hpp>
+#include <any>
 #include <cstdio>
 
 struct Vec2 {
@@ -34,16 +35,20 @@ int main() {
     for (const auto& p : ctor.param_types()) std::printf(" %s", p.c_str());
     std::printf("\n");
 
-    // Construct an object via the reflected constructor.
-    auto obj = *ctor.call<Vec2>(3, 4);
-    std::printf("  constructed: (%d, %d)\n", obj.get().x, obj.get().y);
+    // Construct a type-erased Object — no template parameter needed.
+    auto obj = std::move(*ctor.call(3, 4));
+    std::printf("  object class: %s\n", obj.class_name().c_str());
 
-    // Find and invoke a member function.
+    // Cast back to the concrete type to read fields.
+    auto& v = obj.cast<Vec2>();
+    std::printf("  constructed: (%d, %d)\n", v.x, v.y);
+
+    // Find and invoke a member function on the Object.
     auto fn = *cls.find_function("dot");
     std::printf("  function: %s -> %s\n", fn.name().c_str(), fn.return_type().c_str());
 
     Vec2 other{2, 5};
-    std::any result = fn.invoke<Vec2>(obj.get(), other);
+    std::any result = fn.invoke(obj, other);
     int dot = std::any_cast<int>(result);
     std::printf("  dot((3,4), (2,5)) = %d\n", dot);
 

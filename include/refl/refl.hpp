@@ -5,6 +5,11 @@
 // constructors and member functions by parameter-type name, then construct
 // objects or invoke functions through the returned handles.
 //
+// The framework is type-erased at the call boundary: Constructor::call
+// returns an Object (an owning, type-erased handle) rather than a typed
+// Refl<T>.  You only need to know the concrete type when you explicitly
+// cast an Object to get at its members directly.
+//
 // Lookups return std::expected<T, Error> — dereference with operator* or
 // check has_value()/error(), as shown in the design docs.
 #pragma once
@@ -32,6 +37,7 @@ enum class Error {
     NotFound,
     BadSignature,
     NullHandle,
+    TypeError,
 };
 
 inline std::string_view to_string(Error e) {
@@ -39,19 +45,23 @@ inline std::string_view to_string(Error e) {
     case Error::NotFound:      return "NotFound";
     case Error::BadSignature:  return "BadSignature";
     case Error::NullHandle:    return "NullHandle";
+    case Error::TypeError:     return "TypeError";
     }
     return "Unknown";
 }
 
 // ---------------------------------------------------------------------------
-// Type-erased function pointer signatures for constructors and invokers.
+// Type-erased function pointer signatures for factories, deleters, and
+// invokers.
 // ---------------------------------------------------------------------------
-using FactoryFn = void* (*)(void* args[]);
-using InvokerFn = std::any (*)(void* obj, void* args[]);
+using FactoryFn  = void* (*)(void* args[]);
+using DeleterFn  = void  (*)(void* obj);
+using InvokerFn  = std::any (*)(void* obj, void* args[]);
 
 struct ConstructorInfo {
     std::vector<std::string> param_types;
     FactoryFn factory;
+    DeleterFn deleter;
 };
 
 struct FunctionInfo {
@@ -90,12 +100,12 @@ struct Registrar {
 };
 
 // ---------------------------------------------------------------------------
-// Type-erased factory / invoker templates.
+// Type-erased factory / deleter / invoker templates.
 //
 // Each is parameterised on the target type T and the compile-time meta::info
 // of the specific constructor or member function.  template-for in make_info
 // instantiates one of these per reflected member, and stores its address as
-// a FactoryFn / InvokerFn in ClassInfo.
+// a FactoryFn / DeleterFn / InvokerFn in ClassInfo.
 // ---------------------------------------------------------------------------
 
 namespace detail {
@@ -135,6 +145,11 @@ void* factory(void* args[]) {
     }
     // ponytail: supports constructors with 0-4 parameters. Extend if needed.
     return nullptr;
+}
+
+template <typename T>
+void deleter(void* obj) {
+    delete static_cast<T*>(obj);
 }
 
 template <typename T, std::meta::info Fn>
@@ -202,16 +217,19 @@ std::any invoker(void* obj, void* args[]) {
 class Class;
 class Constructor;
 class Function;
+class Object;
 
 template <typename T>
 class Refl;
 
 // ---------------------------------------------------------------------------
-// Refl<T> — user-facing container + registration driver.
+// Refl<T> — registration driver.
 //
 // Instantiating Refl<T> as a variable, or calling ensure_registered<T>(),
 // triggers static-initialisation of RegistrarHolder<T>::registrar, which
-// populates the global pool with T's metadata.
+// populates the global pool with T's metadata.  Refl<T> is NOT needed at
+// call sites — once registered, T is found via find_class("T") and
+// constructed/called through type-erased handles.
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -231,7 +249,7 @@ class Refl {
 public:
     using value_type = T;
 
-    Refl() : value_() { ensure_registered<T>(); }
+    Refl() { ensure_registered<T>(); }
     explicit Refl(T v) : value_(std::move(v)) { ensure_registered<T>(); }
 
     Refl(const Refl& o) : value_(o.value_) { ensure_registered<T>(); }
@@ -239,26 +257,88 @@ public:
     Refl& operator=(const Refl&) = default;
     Refl& operator=(Refl&&) = default;
 
-    // Take ownership of a heap-allocated T (from the factory).
-    explicit Refl(std::unique_ptr<T> p) : value_(std::move(*p)) { ensure_registered<T>(); }
-
     T& get() { return *value_; }
     const T& get() const { return *value_; }
     T&& take() { return std::move(*value_); }
 
-    // Access to the registration driver for explicit control.
     static const Registrar& registrar() { return RegistrarHolder<T>::registrar; }
 
 private:
     std::optional<T> value_;
-    friend class Constructor;
+};
+
+// ---------------------------------------------------------------------------
+// Object — a type-erased owning handle to a heap-allocated instance.
+//
+// Returned by Constructor::call.  Holds a void* plus the deleter and class
+// name needed to manage it safely without knowing the C++ type.  Use
+// cast<T>() to recover the concrete type when you need direct access.
+// ---------------------------------------------------------------------------
+
+class Object {
+public:
+    Object() = default;
+
+    Object(void* ptr, DeleterFn deleter, std::string class_name)
+        : ptr_(ptr), deleter_(deleter), class_name_(std::move(class_name)) {}
+
+    ~Object() {
+        if (ptr_ && deleter_) deleter_(ptr_);
+    }
+
+    Object(const Object&) = delete;
+    Object& operator=(const Object&) = delete;
+
+    Object(Object&& o) noexcept
+        : ptr_(o.ptr_), deleter_(o.deleter_), class_name_(std::move(o.class_name_)) {
+        o.ptr_ = nullptr;
+        o.deleter_ = nullptr;
+    }
+
+    Object& operator=(Object&& o) noexcept {
+        if (this != &o) {
+            if (ptr_ && deleter_) deleter_(ptr_);
+            ptr_ = o.ptr_;
+            deleter_ = o.deleter_;
+            class_name_ = std::move(o.class_name_);
+            o.ptr_ = nullptr;
+            o.deleter_ = nullptr;
+        }
+        return *this;
+    }
+
+    // The class name this object was constructed as (for runtime checks).
+    const std::string& class_name() const { return class_name_; }
+
+    // Recover the concrete type.  Caller is responsible for passing the
+    // correct T; a mismatch is undefined behaviour (as with any cast).
+    template <typename T>
+    T& cast() {
+        return *static_cast<T*>(ptr_);
+    }
+
+    template <typename T>
+    const T& cast() const {
+        return *static_cast<const T*>(ptr_);
+    }
+
+    // Low-level: the raw pointer, for passing to invokers.
+    void* raw() { return ptr_; }
+    const void* raw() const { return ptr_; }
+
+    bool valid() const { return ptr_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+
+private:
+    void* ptr_ = nullptr;
+    DeleterFn deleter_ = nullptr;
+    std::string class_name_;
+
+    friend class Function;
 };
 
 // ---------------------------------------------------------------------------
 // make_info — gather all reflection metadata for T at compile time.
-//
-// template-for instantiates a factory/invoker per constructor/function and
-// stores its address (as a type-erased function pointer) in ClassInfo.
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -291,6 +371,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 if constexpr (!std::is_same_v<std::remove_cvref_t<P0>, T>) {
                     ConstructorInfo ci;
                     ci.factory = &detail::factory<T, m>;
+                    ci.deleter = &detail::deleter<T>;
                     template for (constexpr auto p : params) {
                         ci.param_types.emplace_back(
                             std::meta::display_string_of(std::meta::type_of(p)));
@@ -300,6 +381,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             } else if constexpr (n >= 2 && n <= 4) {
                 ConstructorInfo ci;
                 ci.factory = &detail::factory<T, m>;
+                ci.deleter = &detail::deleter<T>;
                 template for (constexpr auto p : params) {
                     ci.param_types.emplace_back(
                         std::meta::display_string_of(std::meta::type_of(p)));
@@ -307,7 +389,6 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 info.constructors.push_back(std::move(ci));
             }
             // ponytail: n==0 (default ctor) and n>4 are skipped.
-            // Default ctor could be added if needed.
         } else if constexpr (std::meta::is_function(m) && std::meta::has_identifier(m)) {
             static constexpr auto fparams = std::define_static_array(
                 std::meta::parameters_of(m));
@@ -346,30 +427,22 @@ public:
         return owner_->constructors[idx_].param_types;
     }
 
-    // Low-level: call the factory with raw void* args.  Returns a heap-allocated
-    // object; the caller owns it and must cast to the correct type.
-    void* call_raw(void* args[]) const {
-        return owner_->constructors[idx_].factory(args);
-    }
-
-    // Typed call: constructs a T on the heap, wraps it in Refl<T>, and returns
-    // it by value.  The template parameter T is the target class type.
-    template <typename T, typename... Args>
-    std::expected<Refl<T>, Error> call(Args&&... args) {
+    // Construct an Object from the given arguments.  The Object owns the
+    // heap-allocated instance and will delete it via the type-erased deleter.
+    template <typename... Args>
+    std::expected<Object, Error> call(Args&&... args) {
         if (!valid()) return std::unexpected(Error::NullHandle);
 
-        // Build void* array from the arguments.
-        // Arguments are captured by reference to avoid slicing; their
-        // addresses are taken for the void* array.
         auto arg_tuple = std::forward_as_tuple(args...);
         std::array<void*, sizeof...(Args)> arg_ptrs{};
         if constexpr (sizeof...(Args) > 0) {
             fill_arg_ptrs(arg_ptrs.data(), arg_tuple, std::make_index_sequence<sizeof...(Args)>{});
         }
 
-        void* result = call_raw(arg_ptrs.data());
-        auto ptr = std::unique_ptr<T>(static_cast<T*>(result));
-        return Refl<T>(std::move(ptr));
+        const auto& ci = owner_->constructors[idx_];
+        void* result = ci.factory(arg_ptrs.data());
+        if (!result) return std::unexpected(Error::NullHandle);
+        return Object(result, ci.deleter, owner_->name);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -399,23 +472,26 @@ public:
         return owner_->functions[idx_].return_type;
     }
 
-    // Low-level: invoke on a raw void* object with raw void* args.
-    // Returns the result wrapped in std::any (empty for void functions).
-    std::any invoke_raw(void* obj, void* args[]) const {
-        return owner_->functions[idx_].invoker(obj, args);
-    }
-
-    // Typed invoke: calls the member function on obj, passing args by address.
-    // Returns the result as std::any; use std::any_cast<R> to extract.
-    // The caller must provide the correct T for obj.
-    template <typename T, typename... Args>
-    std::any invoke(T& obj, Args&&... args) const {
+    // Invoke on an Object — the type-erased owning handle from call().
+    template <typename... Args>
+    std::any invoke(Object& obj, Args&&... args) {
         auto arg_tuple = std::forward_as_tuple(args...);
         std::array<void*, sizeof...(Args)> arg_ptrs{};
         if constexpr (sizeof...(Args) > 0) {
             fill_arg_ptrs(arg_ptrs.data(), arg_tuple, std::make_index_sequence<sizeof...(Args)>{});
         }
-        return invoke_raw(static_cast<void*>(&obj), arg_ptrs.data());
+        return owner_->functions[idx_].invoker(obj.raw(), arg_ptrs.data());
+    }
+
+    // Invoke on a raw pointer — for when you have the concrete type already.
+    template <typename T, typename... Args>
+    std::any invoke(T& obj, Args&&... args) {
+        auto arg_tuple = std::forward_as_tuple(args...);
+        std::array<void*, sizeof...(Args)> arg_ptrs{};
+        if constexpr (sizeof...(Args) > 0) {
+            fill_arg_ptrs(arg_ptrs.data(), arg_tuple, std::make_index_sequence<sizeof...(Args)>{});
+        }
+        return owner_->functions[idx_].invoker(static_cast<void*>(&obj), arg_ptrs.data());
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -445,12 +521,9 @@ public:
         return info_->data_member_types;
     }
 
-    // Find a constructor by parameter type names (e.g. "int", "int").
-    // Matching is case-insensitive and ignores cv-ref qualifiers.
     std::expected<Constructor, Error> find_constructor(
         std::initializer_list<std::string_view> types) const;
 
-    // Find a member function by name.
     std::expected<Function, Error> find_function(std::string_view name) const;
 
     bool valid() const { return info_ != nullptr; }
@@ -472,15 +545,12 @@ inline std::expected<Class, Error> find_class(std::string_view name) {
     return Class(&it->second);
 }
 
-// Helper: normalize a type string for matching — strips whitespace, "const",
-// "&", "&&" so "int" matches "const int&" etc.
 inline std::string normalize_type(std::string_view sv) {
     std::string result;
     for (char c : sv) {
         if (c == ' ' || c == '\t') continue;
         result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    // Strip const, volatile, &, && suffixes.
     auto strip_suffix = [&](std::string_view suffix) {
         if (result.size() >= suffix.size() &&
             result.compare(result.size() - suffix.size(),
@@ -490,11 +560,9 @@ inline std::string normalize_type(std::string_view sv) {
     };
     strip_suffix("&&");
     strip_suffix("&");
-    // Remove trailing "const" (already lowercased).
     while (result.size() >= 5 && result.compare(result.size() - 5, 5, "const") == 0) {
         result.erase(result.size() - 5);
     }
-    // Remove any remaining whitespace.
     std::string clean;
     for (char c : result) {
         if (c != ' ' && c != '\t') clean += c;
@@ -506,7 +574,6 @@ inline std::expected<Constructor, Error> Class::find_constructor(
     std::initializer_list<std::string_view> types) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
 
-    // Build normalized query types.
     std::vector<std::string> query;
     for (auto t : types)
         query.push_back(normalize_type(t));
