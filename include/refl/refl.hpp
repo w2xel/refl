@@ -2,8 +2,9 @@
 //
 // Wrap a class as Refl<MyClass> so it registers in a global pool queryable at
 // runtime via find_class("MyClass").  From a Class handle you can find
-// constructors and member functions by parameter-type name, then construct
-// objects or invoke functions through the returned handles.
+// constructors, member functions, and data fields by name or parameter-type
+// name, then construct objects, invoke functions, and get/set fields through
+// the returned handles.
 //
 // The framework is type-erased at the call boundary: Constructor::call
 // returns an Object (an owning, type-erased handle) rather than a typed
@@ -51,12 +52,14 @@ inline std::string_view to_string(Error e) {
 }
 
 // ---------------------------------------------------------------------------
-// Type-erased function pointer signatures for factories, deleters, and
-// invokers.
+// Type-erased function pointer signatures for factories, deleters, invokers,
+// getters, and setters.
 // ---------------------------------------------------------------------------
 using FactoryFn  = void* (*)(void* args[]);
 using DeleterFn  = void  (*)(void* obj);
 using InvokerFn  = std::any (*)(void* obj, void* args[]);
+using GetterFn   = std::any (*)(void* obj);
+using SetterFn   = void  (*)(void* obj, std::any val);
 
 struct ConstructorInfo {
     std::vector<std::string> param_types;
@@ -71,10 +74,16 @@ struct FunctionInfo {
     InvokerFn invoker;
 };
 
+struct FieldInfo {
+    std::string name;
+    std::string type;
+    GetterFn getter;
+    SetterFn setter;  // nullptr for const / bit-field members
+};
+
 struct ClassInfo {
     std::string name;
-    std::vector<std::string> data_member_names;
-    std::vector<std::string> data_member_types;
+    std::vector<FieldInfo> fields;
     std::vector<ConstructorInfo> constructors;
     std::vector<FunctionInfo> functions;
 };
@@ -100,15 +109,24 @@ struct Registrar {
 };
 
 // ---------------------------------------------------------------------------
-// Type-erased factory / deleter / invoker templates.
+// Type-erased factory / deleter / invoker / getter / setter templates.
 //
-// Each is parameterised on the target type T and the compile-time meta::info
-// of the specific constructor or member function.  template-for in make_info
-// instantiates one of these per reflected member, and stores its address as
-// a FactoryFn / DeleterFn / InvokerFn in ClassInfo.
+// Each is parameterised on the target type T and (where relevant) the
+// compile-time meta::info of the specific constructor, member function, or
+// data member.  template-for in make_info instantiates one of these per
+// reflected member, and stores its address in ClassInfo.
 // ---------------------------------------------------------------------------
 
 namespace detail {
+
+// Maximum supported arity for constructors and member functions.
+inline constexpr std::size_t max_arity = 10;
+
+// Compile-time type name for safe-cast checks.
+template <typename T>
+consteval std::string_view type_name() {
+    return std::meta::identifier_of(^^T);
+}
 
 template <typename T, std::meta::info Ctor>
 void* factory(void* args[]) {
@@ -142,8 +160,104 @@ void* factory(void* args[]) {
                      *static_cast<std::remove_reference_t<P1>*>(args[1]),
                      *static_cast<std::remove_reference_t<P2>*>(args[2]),
                      *static_cast<std::remove_reference_t<P3>*>(args[3]));
+    } else if constexpr (n == 5) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                     *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                     *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                     *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                     *static_cast<std::remove_reference_t<P4>*>(args[4]));
+    } else if constexpr (n == 6) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                     *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                     *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                     *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                     *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                     *static_cast<std::remove_reference_t<P5>*>(args[5]));
+    } else if constexpr (n == 7) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                     *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                     *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                     *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                     *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                     *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                     *static_cast<std::remove_reference_t<P6>*>(args[6]));
+    } else if constexpr (n == 8) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        using P7 = [:std::meta::type_of(params[7]):];
+        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                     *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                     *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                     *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                     *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                     *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                     *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                     *static_cast<std::remove_reference_t<P7>*>(args[7]));
+    } else if constexpr (n == 9) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        using P7 = [:std::meta::type_of(params[7]):];
+        using P8 = [:std::meta::type_of(params[8]):];
+        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                     *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                     *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                     *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                     *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                     *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                     *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                     *static_cast<std::remove_reference_t<P7>*>(args[7]),
+                     *static_cast<std::remove_reference_t<P8>*>(args[8]));
+    } else if constexpr (n == 10) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        using P7 = [:std::meta::type_of(params[7]):];
+        using P8 = [:std::meta::type_of(params[8]):];
+        using P9 = [:std::meta::type_of(params[9]):];
+        return new T(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                     *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                     *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                     *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                     *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                     *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                     *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                     *static_cast<std::remove_reference_t<P7>*>(args[7]),
+                     *static_cast<std::remove_reference_t<P8>*>(args[8]),
+                     *static_cast<std::remove_reference_t<P9>*>(args[9]));
     }
-    // ponytail: supports constructors with 0-4 parameters. Extend if needed.
+    // ponytail: supports constructors with 0-10 parameters. Extend if needed.
     return nullptr;
 }
 
@@ -204,9 +318,213 @@ std::any invoker(void* obj, void* args[]) {
                 *static_cast<std::remove_reference_t<P1>*>(args[1]),
                 *static_cast<std::remove_reference_t<P2>*>(args[2])));
         }
+    } else if constexpr (n == 4) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3])));
+        }
+    } else if constexpr (n == 5) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                           *static_cast<std::remove_reference_t<P4>*>(args[4]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                *static_cast<std::remove_reference_t<P4>*>(args[4])));
+        }
+    } else if constexpr (n == 6) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                           *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                           *static_cast<std::remove_reference_t<P5>*>(args[5]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                *static_cast<std::remove_reference_t<P5>*>(args[5])));
+        }
+    } else if constexpr (n == 7) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                           *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                           *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                           *static_cast<std::remove_reference_t<P6>*>(args[6]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                *static_cast<std::remove_reference_t<P6>*>(args[6])));
+        }
+    } else if constexpr (n == 8) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        using P7 = [:std::meta::type_of(params[7]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                           *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                           *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                           *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                           *static_cast<std::remove_reference_t<P7>*>(args[7]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                *static_cast<std::remove_reference_t<P7>*>(args[7])));
+        }
+    } else if constexpr (n == 9) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        using P7 = [:std::meta::type_of(params[7]):];
+        using P8 = [:std::meta::type_of(params[8]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                           *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                           *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                           *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                           *static_cast<std::remove_reference_t<P7>*>(args[7]),
+                           *static_cast<std::remove_reference_t<P8>*>(args[8]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                *static_cast<std::remove_reference_t<P7>*>(args[7]),
+                *static_cast<std::remove_reference_t<P8>*>(args[8])));
+        }
+    } else if constexpr (n == 10) {
+        using P0 = [:std::meta::type_of(params[0]):];
+        using P1 = [:std::meta::type_of(params[1]):];
+        using P2 = [:std::meta::type_of(params[2]):];
+        using P3 = [:std::meta::type_of(params[3]):];
+        using P4 = [:std::meta::type_of(params[4]):];
+        using P5 = [:std::meta::type_of(params[5]):];
+        using P6 = [:std::meta::type_of(params[6]):];
+        using P7 = [:std::meta::type_of(params[7]):];
+        using P8 = [:std::meta::type_of(params[8]):];
+        using P9 = [:std::meta::type_of(params[9]):];
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(*static_cast<std::remove_reference_t<P0>*>(args[0]),
+                           *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                           *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                           *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                           *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                           *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                           *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                           *static_cast<std::remove_reference_t<P7>*>(args[7]),
+                           *static_cast<std::remove_reference_t<P8>*>(args[8]),
+                           *static_cast<std::remove_reference_t<P9>*>(args[9]));
+            return std::any{};
+        } else {
+            return std::any((target->*mfn)(
+                *static_cast<std::remove_reference_t<P0>*>(args[0]),
+                *static_cast<std::remove_reference_t<P1>*>(args[1]),
+                *static_cast<std::remove_reference_t<P2>*>(args[2]),
+                *static_cast<std::remove_reference_t<P3>*>(args[3]),
+                *static_cast<std::remove_reference_t<P4>*>(args[4]),
+                *static_cast<std::remove_reference_t<P5>*>(args[5]),
+                *static_cast<std::remove_reference_t<P6>*>(args[6]),
+                *static_cast<std::remove_reference_t<P7>*>(args[7]),
+                *static_cast<std::remove_reference_t<P8>*>(args[8]),
+                *static_cast<std::remove_reference_t<P9>*>(args[9])));
+        }
     }
-    // ponytail: supports member functions with 0-3 parameters. Extend if needed.
+    // ponytail: supports member functions with 0-10 parameters. Extend if needed.
     return std::any{};
+}
+
+template <typename T, std::meta::info Member>
+std::any getter(void* obj) {
+    auto* target = static_cast<T*>(obj);
+    auto ptr = &[:Member:];
+    return std::any(target->*ptr);
+}
+
+template <typename T, std::meta::info Member>
+void setter(void* obj, std::any val) {
+    auto* target = static_cast<T*>(obj);
+    auto ptr = &[:Member:];
+    using MemberType = [:std::meta::type_of(Member):];
+    target->*ptr = std::any_cast<MemberType>(std::move(val));
 }
 
 }  // namespace detail
@@ -217,6 +535,7 @@ std::any invoker(void* obj, void* args[]) {
 class Class;
 class Constructor;
 class Function;
+class Field;
 class Object;
 
 template <typename T>
@@ -272,7 +591,8 @@ private:
 //
 // Returned by Constructor::call.  Holds a void* plus the deleter and class
 // name needed to manage it safely without knowing the C++ type.  Use
-// cast<T>() to recover the concrete type when you need direct access.
+// cast<T>() for the fast unchecked path, or cast_safe<T>() for a runtime
+// name check that returns std::expected.
 // ---------------------------------------------------------------------------
 
 class Object {
@@ -310,8 +630,8 @@ public:
     // The class name this object was constructed as (for runtime checks).
     const std::string& class_name() const { return class_name_; }
 
-    // Recover the concrete type.  Caller is responsible for passing the
-    // correct T; a mismatch is undefined behaviour (as with any cast).
+    // Fast cast: recover the concrete type.  Caller is responsible for
+    // passing the correct T; a mismatch is undefined behaviour.
     template <typename T>
     T& cast() {
         return *static_cast<T*>(ptr_);
@@ -320,6 +640,25 @@ public:
     template <typename T>
     const T& cast() const {
         return *static_cast<const T*>(ptr_);
+    }
+
+    // Safe cast: checks the class name against T's name at runtime.
+    // Returns a pointer to the object, or Error::TypeError on mismatch,
+    // Error::NullHandle if the Object is invalid.
+    template <typename T>
+    std::expected<T*, Error> cast_safe() {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (class_name_ != detail::type_name<T>())
+            return std::unexpected(Error::TypeError);
+        return static_cast<T*>(ptr_);
+    }
+
+    template <typename T>
+    std::expected<const T*, Error> cast_safe() const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (class_name_ != detail::type_name<T>())
+            return std::unexpected(Error::TypeError);
+        return static_cast<const T*>(ptr_);
     }
 
     // Low-level: the raw pointer, for passing to invokers.
@@ -335,6 +674,7 @@ private:
     std::string class_name_;
 
     friend class Function;
+    friend class Field;
 };
 
 // ---------------------------------------------------------------------------
@@ -346,13 +686,28 @@ ClassInfo RegistrarHolder<T>::make_info() {
     ClassInfo info;
     info.name = std::string(std::meta::identifier_of(^^T));
 
-    // Data members.
+    // Data members — generate getter/setter for each.
     static constexpr auto data_members = std::define_static_array(
         std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto m : data_members) {
-        info.data_member_names.emplace_back(std::meta::identifier_of(m));
-        info.data_member_types.emplace_back(
-            std::meta::display_string_of(std::meta::type_of(m)));
+        // Skip bit-fields — pointer-to-member is not valid for them.
+        if constexpr (!std::meta::is_bit_field(m)) {
+            FieldInfo fi;
+            fi.name = std::string(std::meta::identifier_of(m));
+            fi.type = std::string(
+                std::meta::display_string_of(std::meta::type_of(m)));
+            fi.getter = &detail::getter<T, m>;
+
+            // No setter for const members.
+            using MemberType = [:std::meta::type_of(m):];
+            if constexpr (std::is_const_v<MemberType>) {
+                fi.setter = nullptr;
+            } else {
+                fi.setter = &detail::setter<T, m>;
+            }
+
+            info.fields.push_back(std::move(fi));
+        }
     }
 
     // All members — filter for constructors and named functions.
@@ -378,7 +733,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                     }
                     info.constructors.push_back(std::move(ci));
                 }
-            } else if constexpr (n >= 2 && n <= 4) {
+            } else if constexpr (n >= 2 && n <= detail::max_arity) {
                 ConstructorInfo ci;
                 ci.factory = &detail::factory<T, m>;
                 ci.deleter = &detail::deleter<T>;
@@ -388,13 +743,13 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.constructors.push_back(std::move(ci));
             }
-            // ponytail: n==0 (default ctor) and n>4 are skipped.
+            // ponytail: n==0 (default ctor) and n>max_arity are skipped.
         } else if constexpr (std::meta::is_function(m) && std::meta::has_identifier(m)) {
             static constexpr auto fparams = std::define_static_array(
                 std::meta::parameters_of(m));
             constexpr std::size_t fn = fparams.size();
 
-            if constexpr (fn <= 3) {
+            if constexpr (fn <= detail::max_arity) {
                 FunctionInfo fi;
                 fi.name = std::string(std::meta::identifier_of(m));
                 fi.return_type = std::string(
@@ -406,7 +761,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.functions.push_back(std::move(fi));
             }
-            // ponytail: functions with >3 params are skipped.
+            // ponytail: functions with >max_arity params are skipped.
         }
     }
 
@@ -414,7 +769,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime handles — Class, Constructor, Function.
+// Runtime handles — Class, Constructor, Function, Field.
 // ---------------------------------------------------------------------------
 
 class Constructor {
@@ -427,8 +782,6 @@ public:
         return owner_->constructors[idx_].param_types;
     }
 
-    // Construct an Object from the given arguments.  The Object owns the
-    // heap-allocated instance and will delete it via the type-erased deleter.
     template <typename... Args>
     std::expected<Object, Error> call(Args&&... args) {
         if (!valid()) return std::unexpected(Error::NullHandle);
@@ -483,7 +836,7 @@ public:
         return owner_->functions[idx_].invoker(obj.raw(), arg_ptrs.data());
     }
 
-    // Invoke on a raw pointer — for when you have the concrete type already.
+    // Invoke on a concrete type — for when you have the real object already.
     template <typename T, typename... Args>
     std::any invoke(T& obj, Args&&... args) {
         auto arg_tuple = std::forward_as_tuple(args...);
@@ -507,6 +860,41 @@ private:
     }
 };
 
+class Field {
+public:
+    Field() = default;
+    Field(const ClassInfo* owner, std::size_t idx)
+        : owner_(owner), idx_(idx) {}
+
+    const std::string& name() const { return owner_->fields[idx_].name; }
+    const std::string& type() const { return owner_->fields[idx_].type; }
+    bool is_readonly() const { return owner_->fields[idx_].setter == nullptr; }
+
+    // Get the field value from an Object.
+    std::any get(Object& obj) const {
+        return owner_->fields[idx_].getter(obj.raw());
+    }
+
+    std::any get(const Object& obj) const {
+        return owner_->fields[idx_].getter(const_cast<Object&>(obj).raw());
+    }
+
+    // Set the field value on an Object.  Returns Error::BadSignature if
+    // the field is read-only (const or bit-field).
+    std::expected<void, Error> set(Object& obj, std::any val) const {
+        if (is_readonly()) return std::unexpected(Error::BadSignature);
+        owner_->fields[idx_].setter(obj.raw(), std::move(val));
+        return {};
+    }
+
+    bool valid() const { return owner_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+
+private:
+    const ClassInfo* owner_ = nullptr;
+    std::size_t idx_ = 0;
+};
+
 class Class {
 public:
     Class() = default;
@@ -514,17 +902,16 @@ public:
 
     const std::string& name() const { return info_->name; }
 
-    const std::vector<std::string>& data_members() const {
-        return info_->data_member_names;
-    }
-    const std::vector<std::string>& data_member_types() const {
-        return info_->data_member_types;
+    const std::vector<FieldInfo>& fields() const {
+        return info_->fields;
     }
 
     std::expected<Constructor, Error> find_constructor(
         std::initializer_list<std::string_view> types) const;
 
     std::expected<Function, Error> find_function(std::string_view name) const;
+
+    std::expected<Field, Error> find_field(std::string_view name) const;
 
     bool valid() const { return info_ != nullptr; }
     explicit operator bool() const { return valid(); }
@@ -602,6 +989,17 @@ inline std::expected<Function, Error> Class::find_function(
     for (std::size_t i = 0; i < info_->functions.size(); ++i) {
         if (info_->functions[i].name == name)
             return Function(info_, i);
+    }
+    return std::unexpected(Error::NotFound);
+}
+
+inline std::expected<Field, Error> Class::find_field(
+    std::string_view name) const {
+    if (!valid()) return std::unexpected(Error::NullHandle);
+
+    for (std::size_t i = 0; i < info_->fields.size(); ++i) {
+        if (info_->fields[i].name == name)
+            return Field(info_, i);
     }
     return std::unexpected(Error::NotFound);
 }

@@ -37,6 +37,22 @@ When you need the concrete type, cast explicitly:
 auto& concrete = my_obj.cast<MyClass>();
 ```
 
+Or use the safe cast, which checks the class name at runtime and returns
+`std::expected`:
+
+```cpp
+auto result = my_obj.cast_safe<MyClass>();
+if (result) { auto* ptr = result.value(); /* ... */ }
+```
+
+Fields can be found by name and get/set through type-erased handles:
+
+```cpp
+auto field = *my_class_class.find_field("x");
+std::any old = field.get(my_obj);
+field.set(my_obj, std::any(42));
+```
+
 Note the dereferences — the return values should be `std::expected`.
 Function results are returned as `std::any` — use `std::any_cast<T>` to
 extract (empty for void functions).
@@ -66,16 +82,24 @@ Initial implementation. The API above is working:
 - `find_class("Name")` returns `std::expected<Class, Error>`.
 - `Class::find_constructor({"int", "int"})` returns `std::expected<Constructor, Error>`.
 - `Class::find_function("name")` returns `std::expected<Function, Error>`.
+- `Class::find_field("name")` returns `std::expected<Field, Error>`.
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
   type-erased owning handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on an `Object`
   (or on a concrete `T&` via `invoke<T>`) and returns `std::any`.
-- `Object::cast<T>()` recovers the concrete type when you need direct access.
+- `Field::get(Object&)` returns the field value as `std::any`.
+- `Field::set(Object&, std::any)` sets the field value.  Returns
+  `Error::BadSignature` for read-only (const or bit-field) fields.
+- `Object::cast<T>()` recovers the concrete type (fast, unchecked).
+- `Object::cast_safe<T>()` checks the class name at runtime and returns
+  `std::expected<T*, Error>`.
 
 Limitations (marked with `ponytail:` in the source):
 
-- Constructors with 0 or more than 4 parameters are skipped.
-- Member functions with more than 3 parameters are skipped.
+- Constructors with 0 or more than 10 parameters are skipped.
+- Member functions with more than 10 parameters are skipped.
 - Default constructors are skipped.
+- Bit-field data members are skipped (pointer-to-member is not valid for them).
+- Const data members are read-only (getter only, no setter).
 - Arguments are passed by address (value types only); reference parameters work
   but the caller must ensure the argument outlives the call.

@@ -40,6 +40,21 @@ When you do need the concrete type, cast explicitly:
 auto& concrete = my_obj.cast<MyClass>();
 ```
 
+Or use the safe cast, which checks the class name at runtime:
+
+```cpp
+auto result = my_obj.cast_safe<MyClass>();
+if (result) { auto* ptr = result.value(); /* ... */ }
+```
+
+Fields can be found by name and get/set through type-erased handles:
+
+```cpp
+auto field = *my_class_class.find_field("x");
+std::any old = field.get(my_obj);
+field.set(my_obj, std::any(42));
+```
+
 Note the dereferences, the return values should be std::expected.  Function
 results are returned as `std::any` — use `std::any_cast<T>` to extract.
 
