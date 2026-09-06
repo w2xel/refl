@@ -156,6 +156,10 @@ struct EnumRegistrar {
     }
 };
 
+// Forward declaration — defined later, used by walk_bases.
+class Class;
+std::expected<Class, Error> find_class(std::string_view name);
+
 // ---------------------------------------------------------------------------
 // Type-erased factory / invoker / getter / setter templates.
 //
@@ -166,6 +170,56 @@ struct EnumRegistrar {
 // ---------------------------------------------------------------------------
 
 namespace detail {
+
+// Normalize a type string: lowercase, strip whitespace, const, ref qualifiers.
+// Applied at storage time so lookups compare raw strings.
+inline std::string normalize_type(std::string_view sv) {
+    std::string result;
+    for (char c : sv) {
+        if (c == ' ' || c == '\t') continue;
+        result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    auto strip_suffix = [&](std::string_view suffix) {
+        if (result.size() >= suffix.size() &&
+            result.compare(result.size() - suffix.size(),
+                           suffix.size(), suffix) == 0) {
+            result.erase(result.size() - suffix.size());
+        }
+    };
+    strip_suffix("&&");
+    strip_suffix("&");
+    while (result.size() >= 5 && result.compare(result.size() - 5, 5, "const") == 0) {
+        result.erase(result.size() - 5);
+    }
+    std::string clean;
+    for (char c : result) {
+        if (c != ' ' && c != '\t') clean += c;
+    }
+    return clean;
+}
+
+// Match a query (already-normalized type names) against a candidate's
+// param_types (also pre-normalized at storage time).  Returns true if
+// the param counts and types match.
+inline bool match_signature(
+    const std::vector<std::string>& candidate_types,
+    const std::vector<std::string>& query) {
+    if (candidate_types.size() != query.size()) return false;
+    for (std::size_t j = 0; j < query.size(); ++j) {
+        if (candidate_types[j] != query[j]) return false;
+    }
+    return true;
+}
+
+// Build an std::any array from forwarded arguments.  The caller
+// checks `.empty()` on the returned array to get the pointer.
+template <typename... Args>
+std::array<std::any, sizeof...(Args)>
+make_arg_anys(Args&&... args) {
+    return std::array<std::any, sizeof...(Args)>{
+        std::any(std::forward<Args>(args))...
+    };
+}
 
 // Compile-time type name for safe-cast checks.
 template <typename T>
@@ -317,9 +371,6 @@ class StaticFunction;
 class Object;
 class Enum;
 class Enumerator;
-
-// Forward declaration — defined later, used by Class::find_base.
-std::expected<Class, Error> find_class(std::string_view name);
 
 // Unlocked helper — caller must hold pool_mutex.
 inline bool is_base_of_unlocked(std::string_view derived_name, std::string_view base_name) {
@@ -567,7 +618,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
                     ci.factory = &detail::factory<T, m>;
                     template for (constexpr auto p : params) {
                         ci.param_types.emplace_back(
-                            std::meta::display_string_of(std::meta::type_of(p)));
+                            detail::normalize_type(
+                            std::meta::display_string_of(std::meta::type_of(p))));
                     }
                     info.constructors.push_back(std::move(ci));
                 }
@@ -576,7 +628,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 ci.factory = &detail::factory<T, m>;
                 template for (constexpr auto p : params) {
                     ci.param_types.emplace_back(
-                        std::meta::display_string_of(std::meta::type_of(p)));
+                            detail::normalize_type(
+                            std::meta::display_string_of(std::meta::type_of(p))));
                 }
                 info.constructors.push_back(std::move(ci));
             }
@@ -593,7 +646,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 fi.invoker = &detail::static_invoker<T, m>;
                 template for (constexpr auto p : fparams) {
                     fi.param_types.emplace_back(
-                        std::meta::display_string_of(std::meta::type_of(p)));
+                        detail::normalize_type(
+                        std::meta::display_string_of(std::meta::type_of(p))));
                 }
                 info.static_functions.push_back(std::move(fi));
             } else {
@@ -604,7 +658,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 fi.invoker = &detail::invoker<T, m>;
                 template for (constexpr auto p : fparams) {
                     fi.param_types.emplace_back(
-                        std::meta::display_string_of(std::meta::type_of(p)));
+                        detail::normalize_type(
+                        std::meta::display_string_of(std::meta::type_of(p))));
                 }
                 info.functions.push_back(std::move(fi));
             }
@@ -657,12 +712,11 @@ public:
     std::expected<Object, Error> call(Args&&... args) {
         if (!valid()) return std::unexpected(Error::NullHandle);
 
-        std::array<std::any, sizeof...(Args)> arg_anys{
-            std::any(std::forward<Args>(args))...
-        };
+        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
+        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
 
         const auto& ci = owner_->constructors[idx_];
-        std::shared_ptr<void> result = ci.factory(arg_anys.empty() ? nullptr : arg_anys.data());
+        std::shared_ptr<void> result = ci.factory(args_ptr);
         if (!result) return std::unexpected(Error::NullHandle);
         return Object(std::move(result), owner_->name);
     }
@@ -693,22 +747,18 @@ public:
     template <typename... Args>
     std::any invoke(Object& obj, Args&&... args) {
         if (!valid()) return std::any{};
-        std::array<std::any, sizeof...(Args)> arg_anys{
-            std::any(std::forward<Args>(args))...
-        };
-        return owner_->functions[idx_].invoker(obj.raw(),
-            arg_anys.empty() ? nullptr : arg_anys.data());
+        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
+        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
+        return owner_->functions[idx_].invoker(obj.raw(), args_ptr);
     }
 
     // Invoke on a concrete type — for when you have the real object already.
     template <typename T, typename... Args>
     std::any invoke(T& obj, Args&&... args) {
         if (!valid()) return std::any{};
-        std::array<std::any, sizeof...(Args)> arg_anys{
-            std::any(std::forward<Args>(args))...
-        };
-        return owner_->functions[idx_].invoker(static_cast<void*>(&obj),
-            arg_anys.empty() ? nullptr : arg_anys.data());
+        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
+        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
+        return owner_->functions[idx_].invoker(static_cast<void*>(&obj), args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -805,11 +855,9 @@ public:
     template <typename... Args>
     std::any invoke(Args&&... args) {
         if (!valid()) return std::any{};
-        std::array<std::any, sizeof...(Args)> arg_anys{
-            std::any(std::forward<Args>(args))...
-        };
-        return owner_->static_functions[idx_].invoker(
-            arg_anys.empty() ? nullptr : arg_anys.data());
+        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
+        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
+        return owner_->static_functions[idx_].invoker(args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -975,29 +1023,20 @@ inline std::vector<std::string> list_all_enums() {
     return names;
 }
 
-inline std::string normalize_type(std::string_view sv) {
-    std::string result;
-    for (char c : sv) {
-        if (c == ' ' || c == '\t') continue;
-        result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    auto strip_suffix = [&](std::string_view suffix) {
-        if (result.size() >= suffix.size() &&
-            result.compare(result.size() - suffix.size(),
-                           suffix.size(), suffix) == 0) {
-            result.erase(result.size() - suffix.size());
+// Walk the base-class hierarchy, calling `finder(base_class)` on each
+// base until one returns a value.  Returns the first hit or Error::NotFound.
+template <typename R, typename Finder>
+std::expected<R, Error> walk_bases(
+    const std::vector<std::string>& base_names,
+    Finder&& finder) {
+    for (const auto& bn : base_names) {
+        auto base = find_class(bn);
+        if (base) {
+            auto result = finder(*base);
+            if (result) return result;
         }
-    };
-    strip_suffix("&&");
-    strip_suffix("&");
-    while (result.size() >= 5 && result.compare(result.size() - 5, 5, "const") == 0) {
-        result.erase(result.size() - 5);
     }
-    std::string clean;
-    for (char c : result) {
-        if (c != ' ' && c != '\t') clean += c;
-    }
-    return clean;
+    return std::unexpected(Error::NotFound);
 }
 
 inline std::expected<Constructor, Error> Class::find_constructor(
@@ -1006,20 +1045,10 @@ inline std::expected<Constructor, Error> Class::find_constructor(
 
     std::vector<std::string> query;
     for (auto t : types)
-        query.push_back(normalize_type(t));
+        query.push_back(detail::normalize_type(t));
 
     for (std::size_t i = 0; i < info_->constructors.size(); ++i) {
-        const auto& ctor = info_->constructors[i];
-        if (ctor.param_types.size() != query.size()) continue;
-
-        bool match = true;
-        for (std::size_t j = 0; j < query.size(); ++j) {
-            if (normalize_type(ctor.param_types[j]) != query[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match)
+        if (detail::match_signature(info_->constructors[i].param_types, query))
             return Constructor(info_, i);
     }
     return std::unexpected(Error::BadSignature);
@@ -1033,17 +1062,10 @@ inline std::expected<Function, Error> Class::find_function(
         if (info_->functions[i].name == name)
             return Function(info_, i);
     }
-    // Walk up the hierarchy.
     // ponytail: single inheritance only — multiple inheritance with offset
     // bases would produce wrong pointer adjustments in the invoker.
-    for (const auto& bn : info_->base_names) {
-        auto base = find_class(bn);
-        if (base) {
-            auto fn = base->find_function(name);
-            if (fn) return fn;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+    return walk_bases<Function>(info_->base_names,
+        [name](const Class& b) { return b.find_function(name); });
 }
 
 inline std::expected<Field, Error> Class::find_field(
@@ -1054,16 +1076,8 @@ inline std::expected<Field, Error> Class::find_field(
         if (info_->fields[i].name == name)
             return Field(info_, i);
     }
-    // Walk up the hierarchy.
-    // ponytail: single inheritance only — see find_function for rationale.
-    for (const auto& bn : info_->base_names) {
-        auto base = find_class(bn);
-        if (base) {
-            auto field = base->find_field(name);
-            if (field) return field;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+    return walk_bases<Field>(info_->base_names,
+        [name](const Class& b) { return b.find_field(name); });
 }
 
 inline std::expected<Function, Error> Class::find_function(
@@ -1073,32 +1087,15 @@ inline std::expected<Function, Error> Class::find_function(
 
     std::vector<std::string> query;
     for (auto t : types)
-        query.push_back(normalize_type(t));
+        query.push_back(detail::normalize_type(t));
 
     for (std::size_t i = 0; i < info_->functions.size(); ++i) {
         const auto& fn = info_->functions[i];
-        if (fn.name != name) continue;
-        if (fn.param_types.size() != query.size()) continue;
-
-        bool match = true;
-        for (std::size_t j = 0; j < query.size(); ++j) {
-            if (normalize_type(fn.param_types[j]) != query[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match)
+        if (fn.name == name && detail::match_signature(fn.param_types, query))
             return Function(info_, i);
     }
-    // Walk up the hierarchy.
-    for (const auto& bn : info_->base_names) {
-        auto base = find_class(bn);
-        if (base) {
-            auto fn = base->find_function(name, types);
-            if (fn) return fn;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+    return walk_bases<Function>(info_->base_names,
+        [name, types](const Class& b) { return b.find_function(name, types); });
 }
 
 inline std::vector<Function> Class::find_functions(
@@ -1143,15 +1140,8 @@ inline std::expected<StaticField, Error> Class::find_static_field(
         if (info_->static_fields[i].name == name)
             return StaticField(info_, i);
     }
-    // Walk up the hierarchy.
-    for (const auto& bn : info_->base_names) {
-        auto base = find_class(bn);
-        if (base) {
-            auto sf = base->find_static_field(name);
-            if (sf) return sf;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+    return walk_bases<StaticField>(info_->base_names,
+        [name](const Class& b) { return b.find_static_field(name); });
 }
 
 inline std::expected<StaticFunction, Error> Class::find_static_function(
@@ -1162,15 +1152,8 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
         if (info_->static_functions[i].name == name)
             return StaticFunction(info_, i);
     }
-    // Walk up the hierarchy.
-    for (const auto& bn : info_->base_names) {
-        auto base = find_class(bn);
-        if (base) {
-            auto sf = base->find_static_function(name);
-            if (sf) return sf;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+    return walk_bases<StaticFunction>(info_->base_names,
+        [name](const Class& b) { return b.find_static_function(name); });
 }
 
 inline std::expected<StaticFunction, Error> Class::find_static_function(
@@ -1180,32 +1163,15 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
 
     std::vector<std::string> query;
     for (auto t : types)
-        query.push_back(normalize_type(t));
+        query.push_back(detail::normalize_type(t));
 
     for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
         const auto& sf = info_->static_functions[i];
-        if (sf.name != name) continue;
-        if (sf.param_types.size() != query.size()) continue;
-
-        bool match = true;
-        for (std::size_t j = 0; j < query.size(); ++j) {
-            if (normalize_type(sf.param_types[j]) != query[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match)
+        if (sf.name == name && detail::match_signature(sf.param_types, query))
             return StaticFunction(info_, i);
     }
-    // Walk up the hierarchy.
-    for (const auto& bn : info_->base_names) {
-        auto base = find_class(bn);
-        if (base) {
-            auto sf = base->find_static_function(name, types);
-            if (sf) return sf;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+    return walk_bases<StaticFunction>(info_->base_names,
+        [name, types](const Class& b) { return b.find_static_function(name, types); });
 }
 
 inline std::vector<StaticFunction> Class::find_static_functions(
