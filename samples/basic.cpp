@@ -58,7 +58,8 @@ int main() {
     auto resize2 = *cls.find_function("resize", {"int", "int"});
     std::printf("  resize(%zu params)\n", resize2.param_types().size());
     resize2.invoke(obj, 5, 6);
-    std::printf("  after resize: w=%d h=%d\n", obj.cast<Rect>()->w, obj.cast<Rect>()->h);
+    auto rect = obj.cast_safe<Rect>().value();
+    std::printf("  after resize: w=%d h=%d\n", rect->w, rect->h);
 
     auto overloads = cls.find_functions("resize");
     std::printf("  resize overloads: %zu\n", overloads.size());
@@ -68,8 +69,7 @@ int main() {
     std::printf("  area() = %d\n", std::any_cast<int>(inherited->invoke(obj)));
 
     // Safe cast.
-    auto safe = obj.cast_safe<Rect>();
-    std::printf("  safe cast: w=%d h=%d\n", safe.value()->w, safe.value()->h);
+    std::printf("  safe cast: w=%d h=%d\n", rect->w, rect->h);
 
     // Static data member.
     auto sf = *cls.find_static_field("total_created");

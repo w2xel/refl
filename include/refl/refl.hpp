@@ -674,6 +674,25 @@ class Enumerator;
 // Forward declaration — defined later, used by Class::find_base.
 std::expected<Class, Error> find_class(std::string_view name);
 
+// Unlocked helper — caller must hold pool_mutex.
+inline bool is_base_of_unlocked(std::string_view derived_name, std::string_view base_name) {
+    auto it = class_pool().find(std::string(derived_name));
+    if (it == class_pool().end()) return false;
+    for (const auto& bn : it->second.base_names) {
+        if (bn == base_name) return true;
+        if (is_base_of_unlocked(bn, base_name)) return true;
+    }
+    return false;
+}
+
+// Check whether `base_name` is a base class of `derived_name` by walking
+// the registered base_names hierarchy.  Used by Object::is_class and
+// cast_safe for runtime upcast checks.
+inline bool is_base_of(std::string_view derived_name, std::string_view base_name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    return is_base_of_unlocked(derived_name, base_name);
+}
+
 template <typename T>
 class Refl;
 
@@ -740,9 +759,10 @@ private:
 //
 // Returned by Constructor::call.  Internally holds a std::shared_ptr<void>
 // with the deleter baked in, plus the class name for runtime type checks.
-// Copyable — copies share ownership.  Use cast<T>() for a fast non-owning
-// borrow (T*), or cast_safe<T>() for a checked std::shared_ptr<T> that
-// keeps the object alive independently.
+// Copyable — copies share ownership.  Use cast_safe<T>() for a checked
+// std::shared_ptr<T> that keeps the object alive independently.  The cast
+// checks not only the exact class but also walks the base-class hierarchy,
+// so casting a derived Object to a base type succeeds.
 // ---------------------------------------------------------------------------
 
 class Object {
@@ -761,26 +781,22 @@ public:
     // The class name this object was constructed as (for runtime checks).
     const std::string& class_name() const { return class_name_; }
 
-    // Fast cast: returns a non-owning pointer.  The pointer is valid as
-    // long as any copy of this Object (or a shared_ptr from cast_safe)
-    // is alive.  Caller is responsible for the correct T; mismatch is UB.
-    template <typename T>
-    T* cast() {
-        return static_cast<T*>(ptr_.get());
-    }
-
-    template <typename T>
-    const T* cast() const {
-        return static_cast<const T*>(ptr_.get());
+    // Check whether this object is of the given class or a class derived
+    // from it.  Walks the base-class hierarchy at runtime.
+    bool is_class(std::string_view name) const {
+        if (!valid()) return false;
+        if (class_name_ == name) return true;
+        return is_base_of(class_name_, name);
     }
 
     // Safe cast: checks the class name against T's name at runtime and
     // returns a std::shared_ptr<T> that shares ownership with the Object.
+    // Succeeds if T matches the object's class or any of its bases.
     // Returns Error::TypeError on mismatch, Error::NullHandle if invalid.
     template <typename T>
     std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (class_name_ != detail::type_name<T>())
+        if (!is_class(detail::type_name<T>()))
             return std::unexpected(Error::TypeError);
         return std::static_pointer_cast<T>(ptr_);
     }
@@ -1210,6 +1226,10 @@ public:
         return info_->static_functions;
     }
 
+    const std::vector<ConstructorInfo>& constructors() const {
+        return info_->constructors;
+    }
+
     std::expected<Constructor, Error> find_constructor(
         std::initializer_list<std::string_view> types) const;
 
@@ -1229,11 +1249,20 @@ public:
 
     std::expected<Field, Error> find_field(std::string_view name) const;
 
-    // Find a static data member by name.  Does not walk bases.
+    // Find a static data member by name.  Walks base classes.
     std::expected<StaticField, Error> find_static_field(std::string_view name) const;
 
-    // Find a static member function by name.  Does not walk bases.
+    // Find a static member function by name.  Walks base classes.
     std::expected<StaticFunction, Error> find_static_function(std::string_view name) const;
+
+    // Find a static member function by name and parameter type names.
+    // Disambiguates overloads.  Walks base classes.
+    std::expected<StaticFunction, Error> find_static_function(
+        std::string_view name,
+        std::initializer_list<std::string_view> types) const;
+
+    // Find all overloads of a static function by name.  Does not walk bases.
+    std::vector<StaticFunction> find_static_functions(std::string_view name) const;
 
     bool valid() const { return info_ != nullptr; }
     explicit operator bool() const { return valid(); }
@@ -1451,6 +1480,14 @@ inline std::expected<StaticField, Error> Class::find_static_field(
         if (info_->static_fields[i].name == name)
             return StaticField(info_, i);
     }
+    // Walk up the hierarchy.
+    for (const auto& bn : info_->base_names) {
+        auto base = find_class(bn);
+        if (base) {
+            auto sf = base->find_static_field(name);
+            if (sf) return sf;
+        }
+    }
     return std::unexpected(Error::NotFound);
 }
 
@@ -1462,7 +1499,62 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
         if (info_->static_functions[i].name == name)
             return StaticFunction(info_, i);
     }
+    // Walk up the hierarchy.
+    for (const auto& bn : info_->base_names) {
+        auto base = find_class(bn);
+        if (base) {
+            auto sf = base->find_static_function(name);
+            if (sf) return sf;
+        }
+    }
     return std::unexpected(Error::NotFound);
+}
+
+inline std::expected<StaticFunction, Error> Class::find_static_function(
+    std::string_view name,
+    std::initializer_list<std::string_view> types) const {
+    if (!valid()) return std::unexpected(Error::NullHandle);
+
+    std::vector<std::string> query;
+    for (auto t : types)
+        query.push_back(normalize_type(t));
+
+    for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
+        const auto& sf = info_->static_functions[i];
+        if (sf.name != name) continue;
+        if (sf.param_types.size() != query.size()) continue;
+
+        bool match = true;
+        for (std::size_t j = 0; j < query.size(); ++j) {
+            if (normalize_type(sf.param_types[j]) != query[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return StaticFunction(info_, i);
+    }
+    // Walk up the hierarchy.
+    for (const auto& bn : info_->base_names) {
+        auto base = find_class(bn);
+        if (base) {
+            auto sf = base->find_static_function(name, types);
+            if (sf) return sf;
+        }
+    }
+    return std::unexpected(Error::NotFound);
+}
+
+inline std::vector<StaticFunction> Class::find_static_functions(
+    std::string_view name) const {
+    std::vector<StaticFunction> results;
+    if (!valid()) return results;
+
+    for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
+        if (info_->static_functions[i].name == name)
+            results.push_back(StaticFunction(info_, i));
+    }
+    return results;
 }
 
 }  // namespace refl

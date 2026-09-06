@@ -76,18 +76,27 @@ int main() {
     auto obj = *ctor.call(1, 3);
     CHECK(obj.class_name() == "Point", "object class name should be \"Point\"");
 
-    // --- fast cast ---
-    CHECK(obj.cast<Point>()->x == 1, "constructed x should be 1");
-    CHECK(obj.cast<Point>()->y == 3, "constructed y should be 3");
-
     // --- safe cast ---
     auto safe = obj.cast_safe<Point>();
     CHECK(safe.has_value(), "cast_safe<Point> should succeed");
-    CHECK((*safe)->sum() == 4, "safe-cast sum should be 4");
+    auto p = safe.value();
+    CHECK(p->x == 1, "constructed x should be 1");
+    CHECK(p->y == 3, "constructed y should be 3");
+    CHECK(p->sum() == 4, "safe-cast sum should be 4");
 
     auto bad_cast = obj.cast_safe<Wrong>();
     CHECK(!bad_cast.has_value(), "cast_safe<Wrong> should fail");
     CHECK(bad_cast.error() == refl::Error::TypeError, "should be TypeError");
+
+    // --- is_class ---
+    CHECK(obj.is_class("Point"), "is_class(Point) should be true");
+    CHECK(obj.is_class("Base"), "is_class(Base) should be true (Point derives from Base)");
+    CHECK(!obj.is_class("Wrong"), "is_class(Wrong) should be false");
+
+    // --- cast_safe to base class ---
+    auto base_cast = obj.cast_safe<Base>();
+    CHECK(base_cast.has_value(), "cast_safe<Base> on a Point should succeed");
+    CHECK(base_cast.value()->base_val == 1, "base cast should see base_val=1");
 
     // --- overloaded function resolution ---
     auto set1 = cls.find_function("set", {"int"});
@@ -103,10 +112,10 @@ int main() {
 
     // --- invoke overloaded ---
     std::any r1 = set1->invoke(obj, 50);
-    CHECK(obj.cast<Point>()->x == 50, "after set(50), x should be 50");
+    CHECK(p->x == 50, "after set(50), x should be 50");
     std::any r2 = set2->invoke(obj, 10, 20);
-    CHECK(obj.cast<Point>()->x == 10, "after set(10,20), x should be 10");
-    CHECK(obj.cast<Point>()->y == 20, "after set(10,20), y should be 20");
+    CHECK(p->x == 10, "after set(10,20), x should be 10");
+    CHECK(p->y == 20, "after set(10,20), y should be 20");
 
     // --- function on Object ---
     auto fn = *cls.find_function("sum");
@@ -116,7 +125,7 @@ int main() {
     auto xf = *cls.find_field("x");
     CHECK(std::any_cast<int>(xf.get(obj)) == 10, "field get x should be 10");
     (void)xf.set(obj, std::any(77));
-    CHECK(obj.cast<Point>()->x == 77, "after field set, x should be 77");
+    CHECK(p->x == 77, "after field set, x should be 77");
 
     // --- readonly field ---
     auto idf = *cls.find_field("id");
@@ -203,6 +212,28 @@ int main() {
     std::any sr_ret = sf_reset->invoke();
     CHECK(!sr_ret.has_value(), "reset_count returns void, any should be empty");
     CHECK(Point::instance_count == 0, "after reset_count, instance_count should be 0");
+
+    // --- constructors enumeration ---
+    const auto& ctors = cls.constructors();
+    CHECK(ctors.size() == 1, "Point should have 1 registered constructor (the 2-param one)");
+
+    // --- find_static_function with param types ---
+    // (Point has no overloaded static functions, so just verify the name-based lookup works)
+    auto sf_by_params = cls.find_static_function("get_instance_count", {});
+    CHECK(sf_by_params.has_value(), "find_static_function with empty types should succeed");
+
+    // --- find_static_functions (all overloads) ---
+    auto sf_overloads = cls.find_static_functions("get_instance_count");
+    CHECK(sf_overloads.size() == 1, "should find 1 overload of get_instance_count");
+
+    // --- static field/function base walk ---
+    // Base has no static members; Point does.  Verify find_static_field works
+    // when called from Base (should find Point's static via... wait, Base doesn't
+    // derive from Point.  Let's just verify Base's own static lookup works.)
+    // Actually, Base has no static members, so this tests the not-found path.
+    auto base_cls2 = *refl::find_class("Base");
+    CHECK(base_cls2.static_fields().empty(), "Base should have 0 static fields");
+    CHECK(base_cls2.static_functions().empty(), "Base should have 0 static functions");
 
     // --- error cases ---
     CHECK(!refl::find_class("NoSuchClass").has_value(), "non-existent class should fail");

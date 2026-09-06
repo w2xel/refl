@@ -95,16 +95,22 @@ Initial implementation. The API above is working:
 - `Field::get(Object&)` returns the field value as `std::any`.
 - `Field::set(Object&, std::any)` sets the field value.  Returns
   `Error::BadSignature` for read-only (const or bit-field) fields.
-- `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`.
+- `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
+  (walks bases).
   `StaticField::get()` returns the value as `std::any`; `StaticField::set(std::any)`
   writes the static storage (no Object needed).
-- `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`.
+- `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`
+  (walks bases). `find_static_function("name", {"int"})` resolves overloads by param
+  types. `find_static_functions("name")` returns all overloads.
   `StaticFunction::invoke(args...)` calls the function directly (no Object needed)
   and returns `std::any`.
-- `Object::cast<T>()` returns a non-owning `T*` (fast, unchecked).
+- `Class::constructors()` enumerates all registered constructors.
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
-  object alive independently of the Object.
+  object alive independently of the Object.  Succeeds if T matches the
+  object's class or any of its bases (upcast).
+- `Object::is_class("Name")` checks whether the object is of the given class
+  or a class derived from it.
 - `find_enum("Name")` returns `std::expected<Enum, Error>`.
 - `Enum::find_enumerator("name")` and `Enum::find_enumerator(value)` return
   `std::expected<Enumerator, Error>`.
@@ -118,6 +124,5 @@ Limitations (marked with `ponytail:` in the source):
 - Const data members (static and non-static) are read-only (getter only, no setter).
 - Inheritance walk is single-inheritance only — multiple inheritance with
   offset bases would produce wrong pointer adjustments in invokers/getters.
-- Static field/function lookup does not walk base classes.
 - Arguments are passed as `std::any` — a type mismatch throws
   `std::bad_any_cast` at the call site rather than being undefined behaviour.

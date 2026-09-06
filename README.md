@@ -34,20 +34,17 @@ auto fn = *my_class_class.find_function("some_method");
 std::any result = fn.invoke(my_obj, arg1, arg2);
 ```
 
-When you do need the concrete type, cast explicitly.  The fast cast returns
-a non-owning pointer (valid as long as the Object is alive):
-
-```cpp
-MyClass* ptr = my_obj.cast<MyClass>();
-```
-
-Or use the safe cast, which checks the class name at runtime and returns
-a `std::shared_ptr<T>` that keeps the object alive independently:
+When you do need the concrete type, use the safe cast, which checks the
+class name at runtime and returns a `std::shared_ptr<T>` that keeps the
+object alive independently:
 
 ```cpp
 auto result = my_obj.cast_safe<MyClass>();
 if (result) { auto sp = result.value(); /* sp->... */ }
 ```
+
+The cast also succeeds for base classes — `cast_safe<Base>()` on a derived
+Object works.  Use `is_class("Name")` to check the type without casting.
 
 Fields can be found by name and get/set through type-erased handles:
 
