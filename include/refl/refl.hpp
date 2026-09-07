@@ -30,7 +30,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <variant>
 #include <vector>
 
 namespace refl {
@@ -436,73 +435,73 @@ inline void ensure_registered() {
 }
 
 // ---------------------------------------------------------------------------
-// TypedMethod<R> — callable returning the real type R, not std::any.
+// TypedMethod<Sigs...> — variadic callable, one template arg per overload
+// signature.  Each Sigs is a function type R(Args...).  operator() uses a
+// concept to pick the matching Sig at compile time and returns that Sig's
+// return type — no std::variant, no std::any at the call site.
 //
-// One field per function name in the dispatch struct.  Overloads are
-// resolved by arity at the call site.  If all overloads of a name share
-// a return type, R is that type.  If they differ, R is
-// std::variant<R1, R2, ...> and operator() tries each alternative.
+//   TypedMethod<int(), void(int), void(int,int)>
+//     p->sum()       → int
+//     p->set(42)     → void
+//     p->set(1, 2)   → void
 //
-// The invoker returns std::any internally; the cast to R happens inside
-// operator() — the caller never sees std::any.  No std::function, no heap.
+// Mixed return types are fine: TypedMethod<int(int), double(double)>
+//     p->compute(3)    → int
+//     p->compute(3.0)   → double
+//
+// The invoker returns std::any internally; the cast to the real return
+// type happens inside operator() — the caller never sees std::any.
+// No std::function, no heap, no variant.
 // ---------------------------------------------------------------------------
+
+// Extract R and Args... from a function type R(Args...).
+template <typename Sig> struct sig_traits;
+template <typename R, typename... Args>
+struct sig_traits<R(Args...)> {
+    using return_type = R;
+    using args_type = std::tuple<std::remove_cvref_t<Args>...>;
+};
+
+// Concept: do the call's argument types match this signature?
+template <typename Sig, typename... CallArgs>
+concept matches_sig = std::same_as<
+    typename sig_traits<Sig>::args_type,
+    std::tuple<std::remove_cvref_t<CallArgs>...>>;
+
+// Helper alias for building function types via substitute.
+template <typename R, typename... Args> using fn_type = R(Args...);
+
 namespace detail {
 
-template <typename> struct is_variant : std::false_type {};
-template <typename... Ts> struct is_variant<std::variant<Ts...>> : std::true_type {};
-template <typename T> inline constexpr bool is_variant_v = is_variant<T>::value;
-
-// Cast std::any to the matching variant alternative by RTTI check.
-template <typename Variant, std::size_t I = 0>
-Variant any_to_variant(const std::any& a) {
-    if constexpr (I < std::variant_size_v<Variant>) {
-        using Alt = std::variant_alternative_t<I, Variant>;
-        if (a.type() == typeid(Alt)) return std::any_cast<Alt>(a);
-        if constexpr (I + 1 < std::variant_size_v<Variant>)
-            return any_to_variant<Variant, I + 1>(a);
-    }
-    throw std::bad_any_cast{};
+// consteval: build a function-type reflection R(Args...) from a member.
+consteval std::meta::info make_fn_sig(std::meta::info m) {
+    auto rt = std::meta::return_type_of(m);
+    auto params = std::meta::parameters_of(m);
+    std::vector<std::meta::info> args = {rt};
+    for (auto p : params)
+        args.push_back(std::meta::type_of(p));
+    return std::meta::substitute(^^fn_type, args);
 }
 
-// consteval: collect unique return types of overloads for a function name.
+// consteval: collect all overload signatures for a function name.
 consteval std::vector<std::meta::info>
-collect_return_types(std::meta::info type, std::string_view name) {
+collect_sigs(std::meta::info type, std::string_view name) {
     std::vector<std::meta::info> result;
     for (auto m : std::meta::members_of(type,
             std::meta::access_context::unchecked())) {
         if (std::meta::is_function(m) && std::meta::has_identifier(m)
             && !std::meta::is_static_member(m)
-            && std::meta::identifier_of(m) == name) {
-            auto rt = std::meta::return_type_of(m);
-            bool dup = false;
-            for (auto e : result) if (e == rt) { dup = true; break; }
-            if (!dup) result.push_back(rt);
-        }
+            && std::meta::identifier_of(m) == name)
+            result.push_back(make_fn_sig(m));
     }
     return result;
 }
 
-// consteval: find a member function by name and arity.
-consteval std::meta::info find_member(std::meta::info type,
-                                       std::string_view name,
-                                       std::size_t arity) {
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_function(m) && std::meta::has_identifier(m)
-            && !std::meta::is_static_member(m)
-            && std::meta::identifier_of(m) == name
-            && std::meta::parameters_of(m).size() == arity)
-            return m;
-    }
-    return std::meta::info{};
-}
-
 }  // namespace detail
 
-template <typename R>
+template <typename... Sigs>
 struct TypedMethod {
     struct OverloadEntry {
-        std::size_t arity;
         InvokerFn invoker;
     };
     const OverloadEntry* overloads = nullptr;
@@ -513,27 +512,28 @@ struct TypedMethod {
     void* hook_ctx = nullptr;
 
     template <typename... Args>
-    R operator()(Args&&... args) {
-        if (!obj || !overloads) {
+    auto operator()(Args&&... args) {
+        return call_dispatch<0, Args...>(std::forward<Args>(args)...);
+    }
+
+    template <std::size_t I, typename... Args>
+    auto call_dispatch(Args&&... args) {
+        using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
+        if constexpr (matches_sig<Sig, Args...>) {
+            using R = typename sig_traits<Sig>::return_type;
+            auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
+            const std::any* args_ptr =
+                arg_anys.empty() ? nullptr : arg_anys.data();
+            std::any result = overloads[I].invoker(obj, args_ptr);
+            if (after_call) after_call(hook_ctx, result);
             if constexpr (std::is_void_v<R>) return;
-            else throw std::bad_any_cast{};
+            else return std::any_cast<R>(result);
+        } else {
+            if constexpr (I + 1 < sizeof...(Sigs))
+                return call_dispatch<I + 1, Args...>(std::forward<Args>(args)...);
+            else
+                static_assert(sizeof...(Args) == 0, "no matching overload");
         }
-        constexpr std::size_t n = sizeof...(Args);
-        for (std::size_t i = 0; i < num; ++i) {
-            if (overloads[i].arity == n) {
-                auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-                const std::any* args_ptr =
-                    arg_anys.empty() ? nullptr : arg_anys.data();
-                std::any result = overloads[i].invoker(obj, args_ptr);
-                if (after_call) after_call(hook_ctx, result);
-                if constexpr (std::is_void_v<R>) return;
-                else if constexpr (detail::is_variant_v<R>)
-                    return detail::any_to_variant<R>(result);
-                else return std::any_cast<R>(result);
-            }
-        }
-        if constexpr (std::is_void_v<R>) return;
-        else throw std::bad_any_cast{};
     }
 };
 
@@ -576,20 +576,15 @@ namespace detail {
 
 // Check if a dispatch field type is a TypedMethod specialization.
 template <typename T> struct is_typed_method : std::false_type {};
-template <typename R> struct is_typed_method<TypedMethod<R>> : std::true_type {};
-template <typename T> inline constexpr bool is_typed_method_v = is_typed_method<T>::value;
+template <typename... Sigs> struct is_typed_method<TypedMethod<Sigs...>>
+    : std::true_type {};
+template <typename T> inline constexpr bool is_typed_method_v =
+    is_typed_method<T>::value;
 
-// consteval: build the TypedMethod field type for a function name.
-// Single return type → TypedMethod<R>.  Mixed → TypedMethod<variant<R...>>.
-consteval std::meta::info make_method_field_type(std::meta::info type,
+// consteval: build the TypedMethod<Sigs...> type for a function name.
+consteval std::meta::info make_typed_method_type(std::meta::info type,
                                                     std::string_view name) {
-    auto rts = collect_return_types(type, name);
-    if (rts.size() == 1)
-        return std::meta::substitute(^^TypedMethod,
-            std::initializer_list<std::meta::info>{rts[0]});
-    auto variant_type = std::meta::substitute(^^std::variant, rts);
-    return std::meta::substitute(^^TypedMethod,
-        std::initializer_list<std::meta::info>{variant_type});
+    return std::meta::substitute(^^TypedMethod, collect_sigs(type, name));
 }
 
 // consteval: build the TypedProperty field type for a data member name.
@@ -614,41 +609,30 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
 // ---------------------------------------------------------------------------
 // Refl<T> — typed proxy with compile-time-synthesized dispatch struct.
 //
-// Instantiating Refl<T> as a variable registers T in the global class pool
-// (via ensure_registered<T>), exactly as before.  Constructing with
-// arguments builds an object and populates a dispatch struct whose named
-// fields are callable via operator->:
-//
 //   Refl<Point> p(1, 2);
-//   p->set(10, 20);          // TypedMethod<void> — overloads by arity
-//   int s = p->sum();         // TypedMethod<int> — real return type!
-//   int x = p->x.get();       // TypedProperty<int> — real type!
-//   p->x.set(42);             // TypedProperty<int> — typed set
+//   p->set(10, 20);           // TypedMethod<void(int), void(int,int)>
+//   int s = p->sum();          // TypedMethod<int()> — real return type!
+//   int x = p->x.get();        // TypedProperty<int> — real type!
+//   p->x.set(42);             // typed set
 //
-// If overloads of a name return different types, the field is
-// TypedMethod<std::variant<R1, R2, ...>> and operator() returns the variant.
+// Mixed return types: TypedMethod<int(int), double(double)>
+//   int  i = p->compute(3);    // returns int
+//   double d = p->compute(3.0); // returns double
 //
 // Hooks (Qt-style, after-only):
-//   p.connect("sum", [](std::any& r) { ... });   // fires after sum()
-//   p.on_change("x", [](std::any& v) { ... });   // fires after x.set(...)
+//   p.connect("sum", [](std::any& r) { ... });
+//   p.on_change("x", [](std::any& v) { ... });
 //
-// Refl<T> is non-copyable, non-movable: TypedMethod/TypedProperty fields
-// store pointers into the dispatch_ member, pinned to the Refl's address.
+// Refl<T> is non-copyable, non-movable.
 // ---------------------------------------------------------------------------
 template <typename T>
 class Refl {
-    // --- Dispatch struct: synthesized at compile time via define_aggregate.
-    //     For non-class types (enums), Dispatch is empty.
     struct Dispatch;
     consteval {
         if constexpr (std::is_class_v<T>) {
             static constexpr auto members = std::define_static_array(
                 std::meta::members_of(^^T,
                     std::meta::access_context::unchecked()));
-            // Collect unique function names (first occurrence).
-            // Build specs inside a template-for where the name is available
-            // as a string_view from identifier_of (static storage), not from
-            // a heap-allocated std::string.
             std::vector<std::meta::info> specs;
             std::vector<std::string> seen_fns;
             template for (constexpr auto m : members) {
@@ -663,13 +647,12 @@ class Refl {
                     if (!dup) {
                         seen_fns.push_back(nm_str);
                         constexpr auto field_type =
-                            detail::make_method_field_type(^^T, nm);
+                            detail::make_typed_method_type(^^T, nm);
                         specs.push_back(std::meta::data_member_spec(
                             field_type, {.name=nm_str}));
                     }
                 }
             }
-            // Collect unique data member names and build TypedProperty specs.
             static constexpr auto data_members = std::define_static_array(
                 std::meta::nonstatic_data_members_of(^^T,
                     std::meta::access_context::unchecked()));
@@ -701,10 +684,6 @@ class Refl {
 
     Dispatch dispatch_;
 
-    // --- Populate: bind each TypedMethod/TypedProperty field.
-    //     For TypedMethod: build a per-name static OverloadEntry array using
-    //     find_member to resolve each overload by name+arity.
-    //     For TypedProperty: bind getter/setter/obj.
     void populate() {
         if constexpr (std::is_class_v<T>) {
             static constexpr auto dm = std::define_static_array(
@@ -716,31 +695,22 @@ class Refl {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // TypedMethod<R> field — bind overloads by name+arity.
                         dispatch_.[:field:].obj = &*dispatch_.obj;
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        // Collect all (name, arity) pairs from T's members.
-                        static constexpr auto tmembers = std::define_static_array(
-                            std::meta::members_of(^^T,
-                                std::meta::access_context::unchecked()));
-                        // Build a static OverloadEntry array for this name.
-                        // We use define_static_array on a consteval-built vector.
-                        // The invoker for each overload is resolved via find_member.
                         constexpr auto entries = []() consteval {
-                            using OE = typename std::remove_cv_t<FieldType>::OverloadEntry;
+                            using OE = typename
+                                std::remove_cv_t<FieldType>::OverloadEntry;
                             std::vector<OE> v;
-                            static constexpr auto tmembers = std::define_static_array(
-                                std::meta::members_of(^^T,
-                                    std::meta::access_context::unchecked()));
+                            static constexpr auto tmembers =
+                                std::define_static_array(
+                                    std::meta::members_of(^^T,
+                                        std::meta::access_context::unchecked()));
                             template for (constexpr auto m : tmembers) {
                                 if constexpr (std::meta::is_function(m)
                                     && std::meta::has_identifier(m)
                                     && !std::meta::is_static_member(m)
                                     && std::meta::identifier_of(m) == nm_sv) {
-                                    constexpr auto params = std::define_static_array(
-                                        std::meta::parameters_of(m));
-                                    v.push_back(OE{params.size(),
-                                        &detail::invoker<T, m>});
+                                    v.push_back(OE{&detail::invoker<T, m>});
                                 }
                             }
                             return std::define_static_array(v);
@@ -748,7 +718,6 @@ class Refl {
                         dispatch_.[:field:].overloads = entries.data();
                         dispatch_.[:field:].num = entries.size();
                     } else {
-                        // TypedProperty<T> field — bind getter/setter/obj.
                         dispatch_.[:field:].obj = &*dispatch_.obj;
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         static constexpr auto tdm = std::define_static_array(
@@ -757,12 +726,15 @@ class Refl {
                         template for (constexpr auto m : tdm) {
                             if constexpr (!std::meta::is_bit_field(m)
                                           && std::meta::has_identifier(m)
-                                          && std::meta::identifier_of(m) == nm_sv) {
+                                          && std::meta::identifier_of(m)
+                                              == nm_sv) {
                                 using MemberType = [:std::meta::type_of(m):];
                                 if constexpr (!std::is_const_v<MemberType>) {
-                                    dispatch_.[:field:].setter = &detail::setter<T, m>;
+                                    dispatch_.[:field:].setter =
+                                        &detail::setter<T, m>;
                                 }
-                                dispatch_.[:field:].getter = &detail::getter<T, m>;
+                                dispatch_.[:field:].getter =
+                                    &detail::getter<T, m>;
                             }
                         }
                     }
@@ -771,8 +743,6 @@ class Refl {
         }
     }
 
-    // --- Runtime name lookup for hook registration (returns void* — the
-    //     field type varies, so the hook machinery works generically).
     void* find_field(std::string_view name) {
         if constexpr (std::is_class_v<T>) {
             static constexpr auto dm = std::define_static_array(
@@ -791,17 +761,14 @@ class Refl {
         return nullptr;
     }
 
-    // --- Hook storage (node-based std::map for stable references).
     std::map<std::string, std::function<void(std::any&)>> invoke_hooks_;
     std::map<std::string, std::function<void(std::any&)>> change_hooks_;
 
 public:
     using value_type = T;
 
-    // Default: registration only.
     Refl() { ensure_registered<T>(); }
 
-    // Construct with args: build object + populate dispatch struct.
     template <typename... Args>
     explicit Refl(Args&&... args) {
         ensure_registered<T>();
@@ -811,32 +778,23 @@ public:
         }
     }
 
-    // Non-copyable, non-movable.
     Refl(const Refl&) = delete;
     Refl& operator=(const Refl&) = delete;
     Refl(Refl&&) = delete;
     Refl& operator=(Refl&&) = delete;
 
-    // Arrow access: p->set(42), p->sum(), p->x.get(), p->x.set(...).
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }
 
-    // Typed escape hatch.
     T& get() requires std::is_class_v<T> { return *dispatch_.obj; }
     const T& get() const requires std::is_class_v<T> { return *dispatch_.obj; }
 
-    // Qt-style per-name connect: cb called after invoking "name".
-    // The hook sees std::any& (type-agnostic) — the typed return is
-    // produced before the hook fires; the hook observes the raw any.
     void connect(std::string_view name,
                   std::function<void(std::any&)> cb) {
         auto key = std::string(name);
         invoke_hooks_[key] = std::move(cb);
         void* field = find_field(name);
         if (!field) return;
-        // Set the hook on the field.  TypedMethod<R> has after_call+hook_ctx.
-        // We set them via a type-erased lambda since we don't know R here.
-        // The after_call trampoline is the same for all TypedMethod<R>.
         static constexpr auto dm = std::define_static_array(
             std::meta::nonstatic_data_members_of(^^Dispatch,
                 std::meta::access_context::unchecked()));
@@ -859,7 +817,6 @@ public:
         }
     }
 
-    // Qt-style NOTIFY: cb called after setting property "name".
     void on_change(std::string_view name,
                     std::function<void(std::any&)> cb) {
         auto key = std::string(name);

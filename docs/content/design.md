@@ -140,32 +140,40 @@ callable fields for each member function and data member:
 
 ```cpp
 refl::Refl<Point> p(1, 2);
-p->set(10, 20);           // overloaded — resolved by arity
-int s = p->sum();          // TypedMethod<int> — real return type!
+p->set(10, 20);           // overloaded — resolved by argument type
+int s = p->sum();          // TypedMethod<int()> — real return type!
 int x = p->x.get();        // TypedProperty<int> — real type!
 p->x.set(42);             // typed set
 p.get().x                  // typed escape hatch (int&)
 ```
 
 The dispatch struct is synthesized at compile time: `define_aggregate`
-creates one `TypedMethod<R>` field per function name and one
+creates one `TypedMethod<Sigs...>` field per function name and one
 `TypedProperty<T>` field per data member name, plus an `std::optional<T>`
 holding the object.  The field types are built via `substitute` from
 `return_type_of` / `type_of` — `p->sum()` returns `int`, not `std::any`.
 
-`TypedMethod<R>` is a hand-written callable with a template `operator()`
-that dispatches by `sizeof...(Args)` — one field handles all overloads of
-a name.  `TypedProperty<T>` provides `get()` / `set()` with read-only
-detection (const members return `Error::BadSignature` on set).
+`TypedMethod<Sigs...>` is a variadic template, one template argument per
+overload signature (a function type `R(Args...)`).  `operator()` uses a
+concept (`matches_sig`) to pick the matching signature at compile time
+and returns that signature's return type — no `std::variant`, no
+`std::any` at the call site, no heap.
 
-### Variant returns for mixed-return-type overloads
+### Mixed return types — no variant needed
 
-If overloads of a function name return different types (e.g. `compute(int)`
-returns `int` but `compute(double)` returns `double`), the field type is
-`TypedMethod<std::variant<int, double>>` and `operator()` returns the
-variant.  The `any_to_variant` helper matches the RTTI of the internal
-`std::any` result to the correct alternative.  When all overloads share a
-return type (the common case), the field is simply `TypedMethod<R>`.
+If overloads of a function name return different types (e.g.
+`compute(int)` returns `int` but `compute(double)` returns `double`),
+the field is `TypedMethod<int(int), double(double)>`:
+
+```cpp
+int  i = p->compute(3);     // matches int(int) → returns int
+double d = p->compute(3.0); // matches double(double) → returns double
+```
+
+The `matches_sig` concept compares the call's argument types (after
+`remove_cvref_t`) to each overload's parameter types, picking the right
+signature at compile time.  The return type follows from the signature —
+no runtime dispatch, no variant unpacking.
 
 ### Hooks (Qt-style, after-only)
 
@@ -190,11 +198,10 @@ any.  The design is extensible to before-call hooks if needed later.
 - `Refl<T>` is non-copyable, non-movable: `TypedMethod` / `TypedProperty`
   fields store pointers into the `optional<T>` member, which is pinned
   to the `Refl`'s address.
-- Overloads are resolved by arity only — two overloads with the same
-  parameter count but different types will dispatch to the first match.
-  The `std::any_cast` at the invoker boundary catches type mismatches at
-  runtime.  For same-arity different-type overloads, only the first
-  overload's invoker is stored (the variant return handles the type
-  difference, not the dispatch).
+- Overloads are resolved by argument type match (via the `matches_sig`
+  concept), not just arity — `compute(int)` and `compute(double)` dispatch
+  to the correct overload and return the correct type.  However,
+  same-arity same-type overloads (e.g. two overloads both taking `int`)
+  are ambiguous and will match the first declared.
 - For compile-time-checked calls with the real return type via the
   type-erased path, use `find_class` + `Function::invoke`.

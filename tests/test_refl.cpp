@@ -8,7 +8,6 @@
 #include <any>
 #include <cstdio>
 #include <cstdlib>
-#include <variant>
 
 struct Base {
     int base_val;
@@ -333,12 +332,13 @@ int main() {
     // (reg_base, reg_point, reg_color were default-constructed above)
     CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
 
-    // === variant return path: Mixed::compute(int) returns int, compute(double) returns double ===
+    // === typed overload dispatch: Mixed::compute(int) returns int, compute(double) returns double ===
+    // No variant — the return type is picked by argument type at compile time.
     refl::Refl<Mixed> rm(5);
-    auto cr = rm->compute(3);  // returns std::variant<int, double>
-    bool is_int = std::holds_alternative<int>(cr);
-    CHECK(is_int, "compute(3) should return int alternative");
-    CHECK(std::get<int>(cr) == 15, "compute(3) should be 15 (5*3)");
+    int ci = rm->compute(3);
+    CHECK(ci == 15, "compute(3) should be 15 (5*3)");
+    double cd = rm->compute(3.0);
+    CHECK(cd == 15.0, "compute(3.0) should be 15.0 (5*3.0)");
 
     std::printf("refl API test ok\n");
     return 0;
