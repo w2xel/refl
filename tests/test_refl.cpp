@@ -392,10 +392,10 @@ int main() {
     // Refl<IShape> with an abstract T — no object constructed, methods
     // implemented via runtime callables.
     refl::Refl<IShape> ishape;
-    ishape.implement<^^IShape::area>([](int scale) {
+    ishape.implement<^^IShape::area>([](refl::Refl<IShape>&, int scale) {
         return scale * 100;
     });
-    ishape.implement<^^IShape::set_color>([](int) {
+    ishape.implement<^^IShape::set_color>([](refl::Refl<IShape>&, int) {
         // no-op for test
     });
 
@@ -405,7 +405,7 @@ int main() {
     CHECK(true, "set_color called successfully");
 
     // Re-implement at runtime
-    ishape.implement<^^IShape::area>([](int scale) {
+    ishape.implement<^^IShape::area>([](refl::Refl<IShape>&, int scale) {
         return scale * 200;
     });
     int ar2 = ishape->area(5);
@@ -418,7 +418,7 @@ int main() {
     CHECK(rp2->sum() == 7, "real sum() should be 7 (3+4)");
 
     // Per-method override: keep real object, override just sum().
-    rp2.implement<^^Point::sum>([]() { return 999; });
+    rp2.implement<^^Point::sum>([](refl::Refl<Point>&) { return 999; });
     CHECK(!rp2.is_dynamic(), "rp2 should NOT be in full dynamic mode (partial override)");
     CHECK(rp2->sum() == 999, "overridden sum() should be 999");
     rp2->set(10, 20);
@@ -432,10 +432,10 @@ int main() {
     // Full dynamic mode: make_dynamic() then implement everything.
     rp2.make_dynamic();
     CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after make_dynamic");
-    rp2.implement<^^Point::sum>([]() { return 42; });
+    rp2.implement<^^Point::sum>([](refl::Refl<Point>&) { return 42; });
     CHECK(rp2->sum() == 42, "mocked sum() should be 42");
     // Note: ^^Point::set can't be used — it's an overload set.
-    rp2.implement<^^Point::sum>([]() { return 84; });
+    rp2.implement<^^Point::sum>([](refl::Refl<Point>&) { return 84; });
     CHECK(rp2->sum() == 84, "re-implemented sum() should be 84");
 
     // Switch back to real mode.
@@ -444,10 +444,18 @@ int main() {
     CHECK(rp2->sum() == 3, "real sum() should be 3 (1+2)");
 
     // String-based implement (no ^^ syntax, compile-time checked).
-    rp2.implement<"sum">([]() { return 777; });
+    rp2.implement<"sum">([](refl::Refl<Point>&) { return 777; });
     CHECK(rp2->sum() == 777, "string-based implement sum() should be 777");
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 3, "restored sum() should be 3 again");
+
+    // Verify the self reference can access the real object.
+    rp2.implement<"sum">([](refl::Refl<Point>& self) {
+        return self.get().x + self.get().y + 100;
+    });
+    CHECK(rp2->sum() == 103, "self-ref sum() should be 103 (1+2+100)");
+    rp2.restore<^^Point::sum>();
+    CHECK(rp2->sum() == 3, "restored sum() should be 3 after self-ref test");
 
     std::printf("refl API test ok\n");
     return 0;
