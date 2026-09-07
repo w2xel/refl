@@ -141,23 +141,31 @@ callable fields for each member function and data member:
 ```cpp
 refl::Refl<Point> p(1, 2);
 p->set(10, 20);           // overloaded — resolved by arity
-p->sum()                  // returns std::any
-p->x.get()                // property get (returns std::any)
-p->x.set(std::any(42));  // property set
-p.get().x                 // typed escape hatch (returns int&)
+int s = p->sum();          // TypedMethod<int> — real return type!
+int x = p->x.get();        // TypedProperty<int> — real type!
+p->x.set(42);             // typed set
+p.get().x                  // typed escape hatch (int&)
 ```
 
 The dispatch struct is synthesized at compile time: `define_aggregate`
-creates one `Method` field per function name and one `Property` field per
-data member name, plus an `std::optional<T>` holding the object.  The
-overload and field tables are built `consteval` and persisted to static
-storage via `define_static_array` — no `std::function`, no heap per
-instance, no static-init side effects.
+creates one `TypedMethod<R>` field per function name and one
+`TypedProperty<T>` field per data member name, plus an `std::optional<T>`
+holding the object.  The field types are built via `substitute` from
+`return_type_of` / `type_of` — `p->sum()` returns `int`, not `std::any`.
 
-`Method` is a hand-written callable with a template `operator()` that
-dispatches by `sizeof...(Args)` — one field handles all overloads of a
-name.  `Property` provides `get()` / `set()` with read-only detection
-(const members return `Error::BadSignature` on set).
+`TypedMethod<R>` is a hand-written callable with a template `operator()`
+that dispatches by `sizeof...(Args)` — one field handles all overloads of
+a name.  `TypedProperty<T>` provides `get()` / `set()` with read-only
+detection (const members return `Error::BadSignature` on set).
+
+### Variant returns for mixed-return-type overloads
+
+If overloads of a function name return different types (e.g. `compute(int)`
+returns `int` but `compute(double)` returns `double`), the field type is
+`TypedMethod<std::variant<int, double>>` and `operator()` returns the
+variant.  The `any_to_variant` helper matches the RTTI of the internal
+`std::any` result to the correct alternative.  When all overloads share a
+return type (the common case), the field is simply `TypedMethod<R>`.
 
 ### Hooks (Qt-style, after-only)
 
@@ -170,20 +178,23 @@ p.on_change("x", [](std::any& newval) { ... });   // fires after x.set(...)
 (Qt-style per-signal connect).  `on_change` registers a per-property
 callback fired after a property set (Qt-style NOTIFY).  Both are
 after-only observers — they see the result/value but cannot veto or
-modify.  The design is extensible to before-call hooks if needed later.
+modify.  The hook callback receives `std::any&` (type-agnostic) — the
+typed return is produced before the hook fires; the hook observes the raw
+any.  The design is extensible to before-call hooks if needed later.
 
 ### Limitations of the dispatch struct
 
 - Inherited members are not in the dispatch struct — `members_of` returns
   direct members only.  Use the `find_class` / `Function` path for
   inherited methods.
-- `Refl<T>` is non-copyable, non-movable: `Method` / `Property` fields
-  store pointers into the `optional<T>` member, which is pinned to the
-  `Refl`'s address.
-- Method return values are `std::any` — use `std::any_cast<T>` to extract.
-  For compile-time-checked calls with the real return type, use the
-  `find_class` + `Function::invoke` path.
+- `Refl<T>` is non-copyable, non-movable: `TypedMethod` / `TypedProperty`
+  fields store pointers into the `optional<T>` member, which is pinned
+  to the `Refl`'s address.
 - Overloads are resolved by arity only — two overloads with the same
   parameter count but different types will dispatch to the first match.
   The `std::any_cast` at the invoker boundary catches type mismatches at
-  runtime.
+  runtime.  For same-arity different-type overloads, only the first
+  overload's invoker is stored (the variant return handles the type
+  difference, not the dispatch).
+- For compile-time-checked calls with the real return type via the
+  type-erased path, use `find_class` + `Function::invoke`.

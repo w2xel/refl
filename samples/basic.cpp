@@ -42,8 +42,8 @@ int main() {
     // Refl<T> dispatch struct: construct with args, access via ->
     refl::Refl<Shape> shape_value(7);
     std::printf("  shape via ->: id=%d area=%d\n",
-                std::any_cast<int>(shape_value->id.get()),
-                std::any_cast<int>(shape_value->area()));
+                shape_value->id.get(),
+                shape_value->area());
 
     auto cls = *refl::find_class("Rect");
     std::printf("class: %s\n", cls.name().c_str());
@@ -109,7 +109,7 @@ int main() {
     });
     r->resize(5, 6);
     std::printf("  after resize: w=%d h=%d\n", r.get().w, r.get().h);
-    (void)r->w.set(std::any(10));
+    (void)r->w.set(10);
     std::printf("  after w.set(10): w=%d\n", r.get().w);
 
     return 0;

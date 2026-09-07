@@ -8,6 +8,7 @@
 #include <any>
 #include <cstdio>
 #include <cstdlib>
+#include <variant>
 
 struct Base {
     int base_val;
@@ -34,9 +35,17 @@ int Point::instance_count = 0;
 
 enum Color { Red = 10, Green = 20, Blue = 30 };
 
+struct Mixed {
+    int v;
+    Mixed(int v) : v(v) {}
+    int compute(int f) const { return v * f; }
+    double compute(double f) const { return v * f; }
+};
+
 [[maybe_unused]] static refl::Refl<Base> reg_base;
 [[maybe_unused]] static refl::Refl<Point> reg_point;
 [[maybe_unused]] static refl::Refl<Color> reg_color;
+[[maybe_unused]] static refl::Refl<Mixed> reg_mixed;
 
 struct Wrong {};
 
@@ -280,9 +289,9 @@ int main() {
     CHECK(rp.get().x == 1, "Refl<Point> get().x should be 1");
     CHECK(rp.get().y == 2, "Refl<Point> get().y should be 2");
 
-    // --- method call via -> ---
-    std::any sum_result = rp->sum();
-    CHECK(std::any_cast<int>(sum_result) == 3, "rp->sum() should be 3");
+    // --- typed method call via -> (real return type, no any_cast!) ---
+    int sum_result = rp->sum();
+    CHECK(sum_result == 3, "rp->sum() should be 3");
 
     // --- overloaded methods via -> ---
     rp->set(50);
@@ -291,15 +300,15 @@ int main() {
     CHECK(rp.get().x == 10, "after rp->set(10,20), x should be 10");
     CHECK(rp.get().y == 20, "after rp->set(10,20), y should be 20");
 
-    // --- property get/set via -> ---
-    std::any xval = rp->x.get();
-    CHECK(std::any_cast<int>(xval) == 10, "rp->x.get() should be 10");
-    (void)rp->x.set(std::any(99));
+    // --- typed property get/set via -> ---
+    int xval = rp->x.get();
+    CHECK(xval == 10, "rp->x.get() should be 10");
+    (void)rp->x.set(99);
     CHECK(rp.get().x == 99, "after rp->x.set(99), x should be 99");
 
     // --- readonly property ---
     CHECK(rp->id.is_readonly(), "id property should be readonly");
-    auto id_set = rp->id.set(std::any(100));
+    auto id_set = rp->id.set(100);
     CHECK(!id_set.has_value(), "set on readonly property should fail");
     CHECK(id_set.error() == refl::Error::BadSignature, "should be BadSignature");
 
@@ -316,13 +325,20 @@ int main() {
     rp.on_change("x", [&change_result](std::any& v) {
         change_result = std::any_cast<int>(v);
     });
-    (void)rp->x.set(std::any(42));
+    (void)rp->x.set(42);
     CHECK(change_result == 42, "on_change hook should fire with new value 42");
     CHECK(rp.get().x == 42, "after on_change set, x should be 42");
 
     // --- registration still works via default constructor ---
     // (reg_base, reg_point, reg_color were default-constructed above)
     CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
+
+    // === variant return path: Mixed::compute(int) returns int, compute(double) returns double ===
+    refl::Refl<Mixed> rm(5);
+    auto cr = rm->compute(3);  // returns std::variant<int, double>
+    bool is_int = std::holds_alternative<int>(cr);
+    CHECK(is_int, "compute(3) should return int alternative");
+    CHECK(std::get<int>(cr) == 15, "compute(3) should be 15 (5*3)");
 
     std::printf("refl API test ok\n");
     return 0;
