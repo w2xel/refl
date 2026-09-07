@@ -946,8 +946,13 @@ class Refl {
         return nullptr;
     }
 
-    std::map<std::string, std::function<void(std::any&)>> invoke_hooks_;
-    std::map<std::string, std::function<void(std::any&)>> change_hooks_;
+    // Hook storage: multi-listener (vector of callbacks per name).
+    // std::map nodes are stable — pointers to the vectors don't move.
+    std::map<std::string, std::vector<std::function<void(std::any&)>>> invoke_hooks_;
+    std::map<std::string, std::vector<std::function<void(std::any&)>>> change_hooks_;
+
+    // Dynamic properties (runtime-added, not reflected from T).
+    std::map<std::string, std::any> dynamic_props_;
 
     // --- Dynamic mode: runtime callable storage + trampolines.
     //     When T is abstract, no object is constructed; instead, implement()
@@ -1198,10 +1203,16 @@ public:
     // Check if this Refl is in dynamic (runtime-implemented) mode.
     bool is_dynamic() const { return dynamic_mode_; }
 
+    // Connect a callback to a method (multi-listener).  Multiple connect()
+    // calls on the same method name accumulate — all callbacks fire.
+    //
+    //   p.connect("sum", [](std::any& r) { ... });
+    //   p.connect("sum", [](std::any& r) { ... });  // also fires
     void connect(std::string_view name,
                   std::function<void(std::any&)> cb) {
         auto key = std::string(name);
-        invoke_hooks_[key] = std::move(cb);
+        auto& vec = invoke_hooks_[key];
+        vec.push_back(std::move(cb));
         void* field = find_field(name);
         if (!field) return;
         static constexpr auto dm = std::define_static_array(
@@ -1216,9 +1227,12 @@ public:
                     constexpr auto nm = std::define_static_string(nm_sv);
                     if (name == std::string_view(nm)) {
                         auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
-                        tm->hook_ctx = &invoke_hooks_[key];
+                        tm->hook_ctx = &vec;
                         tm->after_call = +[](void* ctx, std::any& r) {
-                            (*static_cast<std::function<void(std::any&)>*>(ctx))(r);
+                            auto* v = static_cast<
+                                std::vector<std::function<void(std::any&)>>*>(
+                                    ctx);
+                            for (auto& cb : *v) cb(r);
                         };
                     }
                 }
@@ -1226,10 +1240,12 @@ public:
         }
     }
 
+    // on_change: connect a callback to a property change (multi-listener).
     void on_change(std::string_view name,
                     std::function<void(std::any&)> cb) {
         auto key = std::string(name);
-        change_hooks_[key] = std::move(cb);
+        auto& vec = change_hooks_[key];
+        vec.push_back(std::move(cb));
         void* field = find_field(name);
         if (!field) return;
         static constexpr auto dm = std::define_static_array(
@@ -1246,9 +1262,81 @@ public:
                     constexpr auto nm = std::define_static_string(nm_sv);
                     if (name == std::string_view(nm)) {
                         auto* tp = static_cast<std::remove_cv_t<FT>*>(field);
-                        tp->hook_ctx = &change_hooks_[key];
+                        tp->hook_ctx = &vec;
                         tp->after_set = +[](void* ctx, std::any& v) {
-                            (*static_cast<std::function<void(std::any&)>*>(ctx))(v);
+                            auto* vct = static_cast<
+                                std::vector<std::function<void(std::any&)>>*>(
+                                    ctx);
+                            for (auto& cb : *vct) cb(v);
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    // Explicitly emit a signal — fire all connected callbacks for a name.
+    // The std::any is passed to each callback.  Useful for custom signals
+    // that don't map to a specific method.
+    void emit(std::string_view name, std::any value = {}) {
+        auto key = std::string(name);
+        auto it = invoke_hooks_.find(key);
+        if (it != invoke_hooks_.end())
+            for (auto& cb : it->second) cb(value);
+    }
+
+    // Set a dynamic property (runtime-added, not reflected from T).
+    // Fires on_change hooks for that name if any are connected.
+    void set_property(std::string_view name, std::any val) {
+        auto key = std::string(name);
+        dynamic_props_[key] = std::move(val);
+        auto it = change_hooks_.find(key);
+        if (it != change_hooks_.end())
+            for (auto& cb : it->second) cb(dynamic_props_[key]);
+    }
+
+    // Get a dynamic property (runtime-added).
+    std::any get_property(std::string_view name) const {
+        auto key = std::string(name);
+        auto it = dynamic_props_.find(key);
+        if (it != dynamic_props_.end()) return it->second;
+        return {};
+    }
+
+    // Connect a method on this object to a method on another Refl<T>.
+    // When this->name fires, it calls other->slot_name via operator->.
+    // Both Refl<T> instances must be kept alive (raw pointers — Refl is
+    // non-movable so addresses are stable, like Qt's connect).
+    void connect(std::string_view name, Refl* other,
+                  std::string_view slot_name) {
+        auto key = std::string(name);
+        auto slot = std::string(slot_name);
+        auto* other_ptr = other;
+        invoke_hooks_[key].push_back([other_ptr, slot](std::any& r) {
+            // Forward the result to the other object's slot hooks.
+            other_ptr->emit(slot, r);
+        });
+        // Re-wire the field to fire the vector (same as connect above).
+        void* field = find_field(name);
+        if (!field) return;
+        static constexpr auto dm = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch,
+                std::meta::access_context::unchecked()));
+        template for (constexpr auto f : dm) {
+            if constexpr (std::meta::has_identifier(f)
+                          && std::meta::identifier_of(f) != "obj") {
+                using FT = [:std::meta::type_of(f):];
+                if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
+                    constexpr auto nm_sv = std::meta::identifier_of(f);
+                    constexpr auto nm = std::define_static_string(nm_sv);
+                    if (name == std::string_view(nm)) {
+                        auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
+                        tm->hook_ctx = &invoke_hooks_[key];
+                        tm->after_call = +[](void* ctx, std::any& r) {
+                            auto* v = static_cast<
+                                std::vector<std::function<void(std::any&)>>*>(
+                                    ctx);
+                            for (auto& cb : *v) cb(r);
                         };
                     }
                 }

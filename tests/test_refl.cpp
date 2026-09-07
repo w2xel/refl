@@ -457,6 +457,52 @@ int main() {
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 3, "restored sum() should be 3 after self-ref test");
 
+    // === multi-listener hooks ===
+    int hook_a = 0, hook_b = 0;
+    rp2.connect("sum", [&hook_a](std::any& r) {
+        hook_a = std::any_cast<int>(r);
+    });
+    rp2.connect("sum", [&hook_b](std::any& r) {
+        hook_b = std::any_cast<int>(r);
+    });
+    (void)rp2->sum();
+    CHECK(hook_a == 3, "multi-listener hook A should fire with 3");
+    CHECK(hook_b == 3, "multi-listener hook B should fire with 3");
+
+    // === explicit emit ===
+    int emit_result = 0;
+    rp2.connect("custom_signal", [&emit_result](std::any& v) {
+        emit_result = std::any_cast<int>(v);
+    });
+    rp2.emit("custom_signal", std::any(42));
+    CHECK(emit_result == 42, "emit should fire connected callbacks");
+
+    // === dynamic properties ===
+    rp2.set_property("dynamic_val", std::any(123));
+    int dp_val = std::any_cast<int>(rp2.get_property("dynamic_val"));
+    CHECK(dp_val == 123, "dynamic property should be 123");
+
+    // dynamic property with on_change
+    int dyn_change = 0;
+    rp2.on_change("dynamic_val", [&dyn_change](std::any& v) {
+        dyn_change = std::any_cast<int>(v);
+    });
+    rp2.set_property("dynamic_val", std::any(456));
+    CHECK(dyn_change == 456, "on_change should fire on dynamic property set");
+
+    // === cross-object connect ===
+    refl::Refl<Point> rp3(10, 20);
+    int cross_result = 0;
+    rp3.connect("sum", [&cross_result](std::any& r) {
+        cross_result = std::any_cast<int>(r);
+    });
+    // Connect rp2's "sum" to rp3's "sum" — when rp2->sum() fires,
+    // rp3's hooks receive rp2's result (forwarded via emit).
+    rp2.connect("sum", &rp3, "sum");
+    (void)rp2->sum();
+    // rp2->sum() returns 3 (1+2), forwarded to rp3's hook.
+    CHECK(cross_result == 3, "cross-object connect: rp3 hook should receive rp2's result (3)");
+
     std::printf("refl API test ok\n");
     return 0;
 }
