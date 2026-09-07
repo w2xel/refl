@@ -39,9 +39,11 @@ int main() {
     for (const auto& n : refl::list_all_classes()) std::printf(" %s", n.c_str());
     std::printf("\n");
 
-    // Refl<T> doubles as a value container: hold a concrete instance, get/take it.
-    refl::Refl<Shape> shape_value{Shape{7}};
-    std::printf("  wrapped shape id = %d\n", shape_value.get().id);
+    // Refl<T> dispatch struct: construct with args, access via ->
+    refl::Refl<Shape> shape_value(7);
+    std::printf("  shape via ->: id=%d area=%d\n",
+                std::any_cast<int>(shape_value->id.get()),
+                std::any_cast<int>(shape_value->area()));
 
     auto cls = *refl::find_class("Rect");
     std::printf("class: %s\n", cls.name().c_str());
@@ -96,6 +98,19 @@ int main() {
     std::printf("  clone: %s\n", cloned.to_string().c_str());
     std::printf("  clone w=%d (independent of original)\n",
                 cloned.cast_safe<Rect>().value()->w);
+
+    // Refl<Rect> dispatch struct with hooks.
+    refl::Refl<Rect> r(3, 4);
+    r.connect("resize", [](std::any&) {
+        std::printf("  hook: resize() was called\n");
+    });
+    r.on_change("w", [](std::any& v) {
+        std::printf("  hook: w changed to %d\n", std::any_cast<int>(v));
+    });
+    r->resize(5, 6);
+    std::printf("  after resize: w=%d h=%d\n", r.get().w, r.get().h);
+    (void)r->w.set(std::any(10));
+    std::printf("  after w.set(10): w=%d\n", r.get().w);
 
     return 0;
 }

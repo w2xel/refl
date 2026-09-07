@@ -130,3 +130,60 @@ Limitations (marked with `ponytail:` in the source):
   `std::bad_any_cast` at the call site rather than being undefined behaviour.
 - Registration is static-init order dependent — `find_class` only works after
   `Refl<T>` has been instantiated.
+
+## Refl<T> dispatch struct
+
+In addition to the type-erased `Object` / `find_class` path, `Refl<T>` can
+be constructed with arguments to build a **dispatch struct** — a
+compile-time-synthesized struct (via `define_aggregate`) with named
+callable fields for each member function and data member:
+
+```cpp
+refl::Refl<Point> p(1, 2);
+p->set(10, 20);           // overloaded — resolved by arity
+p->sum()                  // returns std::any
+p->x.get()                // property get (returns std::any)
+p->x.set(std::any(42));  // property set
+p.get().x                 // typed escape hatch (returns int&)
+```
+
+The dispatch struct is synthesized at compile time: `define_aggregate`
+creates one `Method` field per function name and one `Property` field per
+data member name, plus an `std::optional<T>` holding the object.  The
+overload and field tables are built `consteval` and persisted to static
+storage via `define_static_array` — no `std::function`, no heap per
+instance, no static-init side effects.
+
+`Method` is a hand-written callable with a template `operator()` that
+dispatches by `sizeof...(Args)` — one field handles all overloads of a
+name.  `Property` provides `get()` / `set()` with read-only detection
+(const members return `Error::BadSignature` on set).
+
+### Hooks (Qt-style, after-only)
+
+```cpp
+p.connect("sum", [](std::any& result) { ... });   // fires after sum()
+p.on_change("x", [](std::any& newval) { ... });   // fires after x.set(...)
+```
+
+`connect` registers a per-name callback fired after the method returns
+(Qt-style per-signal connect).  `on_change` registers a per-property
+callback fired after a property set (Qt-style NOTIFY).  Both are
+after-only observers — they see the result/value but cannot veto or
+modify.  The design is extensible to before-call hooks if needed later.
+
+### Limitations of the dispatch struct
+
+- Inherited members are not in the dispatch struct — `members_of` returns
+  direct members only.  Use the `find_class` / `Function` path for
+  inherited methods.
+- `Refl<T>` is non-copyable, non-movable: `Method` / `Property` fields
+  store pointers into the `optional<T>` member, which is pinned to the
+  `Refl`'s address.
+- Method return values are `std::any` — use `std::any_cast<T>` to extract.
+  For compile-time-checked calls with the real return type, use the
+  `find_class` + `Function::invoke` path.
+- Overloads are resolved by arity only — two overloads with the same
+  parameter count but different types will dispatch to the first match.
+  The `std::any_cast` at the invoker boundary catches type mismatches at
+  runtime.

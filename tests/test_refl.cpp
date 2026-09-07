@@ -273,6 +273,57 @@ int main() {
     CHECK(!cls.find_function("no_such_function").has_value(), "non-existent function should fail");
     CHECK(!cls.find_field("no_such_field").has_value(), "non-existent field should fail");
 
+    // === Refl<T> dispatch-struct tests ===
+
+    // --- construct via Refl<T> args constructor ---
+    refl::Refl<Point> rp(1, 2);
+    CHECK(rp.get().x == 1, "Refl<Point> get().x should be 1");
+    CHECK(rp.get().y == 2, "Refl<Point> get().y should be 2");
+
+    // --- method call via -> ---
+    std::any sum_result = rp->sum();
+    CHECK(std::any_cast<int>(sum_result) == 3, "rp->sum() should be 3");
+
+    // --- overloaded methods via -> ---
+    rp->set(50);
+    CHECK(rp.get().x == 50, "after rp->set(50), x should be 50");
+    rp->set(10, 20);
+    CHECK(rp.get().x == 10, "after rp->set(10,20), x should be 10");
+    CHECK(rp.get().y == 20, "after rp->set(10,20), y should be 20");
+
+    // --- property get/set via -> ---
+    std::any xval = rp->x.get();
+    CHECK(std::any_cast<int>(xval) == 10, "rp->x.get() should be 10");
+    (void)rp->x.set(std::any(99));
+    CHECK(rp.get().x == 99, "after rp->x.set(99), x should be 99");
+
+    // --- readonly property ---
+    CHECK(rp->id.is_readonly(), "id property should be readonly");
+    auto id_set = rp->id.set(std::any(100));
+    CHECK(!id_set.has_value(), "set on readonly property should fail");
+    CHECK(id_set.error() == refl::Error::BadSignature, "should be BadSignature");
+
+    // --- connect (function call hook) ---
+    int hook_result = 0;
+    rp.connect("sum", [&hook_result](std::any& r) {
+        hook_result = std::any_cast<int>(r);
+    });
+    (void)rp->sum();
+    CHECK(hook_result == 119, "connect hook should fire after sum() with result 119 (99+20)");
+
+    // --- on_change (property change hook) ---
+    int change_result = 0;
+    rp.on_change("x", [&change_result](std::any& v) {
+        change_result = std::any_cast<int>(v);
+    });
+    (void)rp->x.set(std::any(42));
+    CHECK(change_result == 42, "on_change hook should fire with new value 42");
+    CHECK(rp.get().x == 42, "after on_change set, x should be 42");
+
+    // --- registration still works via default constructor ---
+    // (reg_base, reg_point, reg_color were default-constructed above)
+    CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
+
     std::printf("refl API test ok\n");
     return 0;
 }
