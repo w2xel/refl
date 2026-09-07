@@ -690,6 +690,20 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
 
 }  // namespace detail
 
+// Structural fixed-size string for use as a non-type template parameter.
+// Enables implement<"method_name">(...) without exposing ^^ syntax.
+template <std::size_t N>
+struct FixedString {
+    char data[N] = {};
+    static constexpr std::size_t size = N;
+    constexpr FixedString(const char (&str)[N]) {
+        for (std::size_t i = 0; i < N; ++i) data[i] = str[i];
+    }
+    constexpr std::string_view sv() const {
+        return std::string_view(data, N - 1);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Refl<T> — typed proxy with compile-time-synthesized dispatch struct.
 //
@@ -1143,7 +1157,45 @@ public:
         }
     }
 
-    Refl(const Refl&) = delete;
+    // Implement a method by name (string literal) — no ^^ syntax needed.
+    //   refl::Refl<IShape> s;
+    //   s.implement("area", [](int scale) { return scale * 100; });
+    //   int a = s->area(5);
+    //
+    // Only non-overloaded methods can be implemented by name (the string
+    // matches the first member with that identifier).  For overloaded
+    // methods, use the ^^-based implement<^^T::method>().
+    //
+    // The name is carried as a structural NTTP (FixedString) so it's
+    // usable in constexpr comparisons inside a template-for.
+    template <FixedString Name, typename F>
+    void implement(F fn) {
+        if constexpr (std::is_class_v<T>) {
+            static constexpr auto members = std::define_static_array(
+                std::meta::members_of(^^T,
+                    std::meta::access_context::unchecked()));
+            constexpr bool found = []() consteval {
+                for (auto m : std::meta::members_of(^^T,
+                        std::meta::access_context::unchecked())) {
+                    if (std::meta::is_function(m)
+                        && std::meta::has_identifier(m)
+                        && !std::meta::is_static_member(m)
+                        && std::meta::identifier_of(m) == Name.sv())
+                        return true;
+                }
+                return false;
+            }();
+            static_assert(found, "implement: method not found on T");
+            template for (constexpr auto m : members) {
+                if constexpr (std::meta::is_function(m)
+                              && std::meta::has_identifier(m)
+                              && !std::meta::is_static_member(m)
+                              && std::meta::identifier_of(m) == Name.sv()) {
+                    implement<m>(std::move(fn));
+                }
+            }
+        }
+    }
     Refl& operator=(const Refl&) = delete;
     Refl(Refl&&) = delete;
     Refl& operator=(Refl&&) = delete;

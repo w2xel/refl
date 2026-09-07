@@ -443,6 +443,12 @@ int main() {
     CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
     CHECK(rp2->sum() == 3, "real sum() should be 3 (1+2)");
 
+    // String-based implement (no ^^ syntax, compile-time checked).
+    rp2.implement<"sum">([]() { return 777; });
+    CHECK(rp2->sum() == 777, "string-based implement sum() should be 777");
+    rp2.restore<^^Point::sum>();
+    CHECK(rp2->sum() == 3, "restored sum() should be 3 again");
+
     std::printf("refl API test ok\n");
     return 0;
 }
