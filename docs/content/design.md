@@ -144,25 +144,39 @@ p->set(10, 20);           // overloaded — resolved by argument type
 int s = p->sum();          // TypedMethod<int()> — real return type!
 int x = p->x;              // TypedProperty<int> — implicit conversion (read)
 p->x = 42;                 // TypedProperty<int> — assignment (write)
+p->coords[0] = 99;         // TypedProperty<array<int,3>> — operator[]
+p->instance_count = 5;    // TypedStaticProperty<int> — static member
+int gi = p->get_instance_count(); // TypedStaticMethod<int> — static method
+p.reset(100, 200);         // swap the underlying object
 p.get().x                  // typed escape hatch (int&)
 ```
 
-`TypedProperty<T, bool Readonly>` mimics a public data member: implicit
-conversion to `T` for reading, `operator=(T)` for writing.  Const members
-get `Readonly=true`, which deletes `operator=` via a `requires` constraint —
-assigning to a const member is a **compile error**, not a silent no-op.
-
 The dispatch struct is synthesized at compile time: `define_aggregate`
-creates one `TypedMethod<Sigs...>` field per function name and one
-`TypedProperty<T>` field per data member name, plus an `std::optional<T>`
-holding the object.  The field types are built via `substitute` from
-`return_type_of` / `type_of` — `p->sum()` returns `int`, not `std::any`.
+creates one `TypedMethod<Sigs...>` field per function name, one
+`TypedProperty<T>` field per non-static data member, one
+`TypedStaticProperty<T>` field per static data member, one
+`TypedStaticMethod<R>` field per static member function, plus a
+`std::shared_ptr<T>` holding the object.  Field types are built via
+`substitute` from `return_type_of` / `type_of`.
 
-`TypedMethod<Sigs...>` is a variadic template, one template argument per
-overload signature (a function type `R(Args...)`).  `operator()` uses a
-concept (`matches_sig`) to pick the matching signature at compile time
-and returns that signature's return type — no `std::variant`, no
-`std::any` at the call site, no heap.
+`TypedMethod<Sigs...>` uses a concept (`matches_sig`) to pick the
+matching signature at compile time and returns that signature's return
+type — no `std::variant`, no `std::any` at the call site.
+
+`TypedProperty<T, bool Readonly>` mimics a public data member: implicit
+conversion to `T` for reading, `operator=(T)` for writing, and
+`operator[]` for subscriptable types (arrays, vectors).  Const members
+get `Readonly=true` (compile-time error on assignment).  `operator[]`
+uses the member's byte offset (`offset_of`) to access the element
+directly in the object, returning a reference.
+
+`TypedStaticProperty` and `TypedStaticMethod` access static storage
+without an `obj` pointer — they use `StaticGetterFn` / `StaticSetterFn`
+/ `StaticInvokerFn` directly.
+
+The underlying object is stored in a `std::shared_ptr<T>`, enabling
+`reset(args...)` to swap the object at runtime.  All fields are
+re-populated after a swap.
 
 ### Mixed return types — no variant needed
 

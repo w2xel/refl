@@ -6,6 +6,7 @@
 // Returns non-zero (fails meson test) on any assertion failure.
 #include <refl/refl.hpp>
 #include <any>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 
@@ -19,6 +20,7 @@ struct Base {
 struct Point : Base {
     int x;
     int y;
+    std::array<int, 3> coords = {0, 0, 0};
     const int id = 42;
     static int instance_count;
     static const int max_instances = 100;
@@ -68,7 +70,7 @@ int main() {
 
     // --- fields ---
     const auto& fields = cls.fields();
-    CHECK(fields.size() == 3, "Point should have 3 fields (x, y, id)");
+    CHECK(fields.size() == 4, "Point should have 4 fields (x, y, coords, id)");
 
     // --- find_constructor ---
     auto ctor = *cls.find_constructor({"int", "int"});
@@ -334,6 +336,43 @@ int main() {
     // --- registration still works via default constructor ---
     // (reg_base, reg_point, reg_color were default-constructed above)
     CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
+
+    // === operator[] on array members ===
+    rp->coords[0] = 10;
+    rp->coords[1] = 20;
+    rp->coords[2] = 30;
+    CHECK(rp.get().coords[0] == 10, "coords[0] should be 10");
+    CHECK(rp.get().coords[1] == 20, "coords[1] should be 20");
+    CHECK(rp.get().coords[2] == 30, "coords[2] should be 30");
+    int c1 = rp->coords[1];
+    CHECK(c1 == 20, "coords[1] read via operator[] should be 20");
+
+    // === static members in the dispatch struct ===
+    int ic = rp->instance_count;
+    CHECK(ic >= 1, "instance_count via dispatch should be >= 1");
+    rp->instance_count = 50;
+    CHECK(Point::instance_count == 50, "after instance_count=50, static should be 50");
+
+    int max = rp->max_instances;
+    CHECK(max == 100, "max_instances should be 100");
+    // rp->max_instances = 200;  // COMPILE ERROR — readonly
+    static_assert(decltype(rp->max_instances)::is_readonly(), "max must be readonly");
+    static_assert(!decltype(rp->instance_count)::is_readonly(), "instance_count must be writable");
+
+    int gi = rp->get_instance_count();
+    CHECK(gi == 50, "get_instance_count() via dispatch should be 50");
+
+    rp->reset_count();
+    CHECK(Point::instance_count == 0, "after reset_count(), instance_count should be 0");
+
+    // === swap via reset() ===
+    rp.reset(100, 200);
+    CHECK(rp.get().x == 100, "after reset(100,200), x should be 100");
+    CHECK(rp.get().y == 200, "after reset(100,200), y should be 200");
+    rp->set(5, 6);
+    CHECK(rp.get().x == 5, "after set(5,6) on swapped object, x should be 5");
+    rp->coords[0] = 999;
+    CHECK(rp.get().coords[0] == 999, "coords[0] on swapped object should be 999");
 
     // === typed overload dispatch: Mixed::compute(int) returns int, compute(double) returns double ===
     // No variant — the return type is picked by argument type at compile time.
