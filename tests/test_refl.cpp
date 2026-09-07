@@ -411,6 +411,32 @@ int main() {
     int ar2 = ishape->area(5);
     CHECK(ar2 == 1000, "dynamic area(5) after re-implement should be 1000");
 
+    // === real-to-dynamic-to-real switching ===
+    // Start with a real Point, switch to dynamic (mock), then back.
+    refl::Refl<Point> rp2(3, 4);
+    CHECK(!rp2.is_dynamic(), "rp2 should start in real mode");
+    CHECK(rp2->sum() == 7, "real sum() should be 7 (3+4)");
+
+    // Switch to dynamic mode — implement sum as a mock.
+    rp2.implement<^^Point::sum>([]() { return 999; });
+    CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after implement");
+    CHECK(rp2->sum() == 999, "mocked sum() should be 999");
+
+    // Switch back to real mode.
+    rp2.reset(10, 20);
+    CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
+    CHECK(rp2->sum() == 30, "real sum() should be 30 (10+20)");
+
+    // Use make_dynamic() then implement multiple methods.
+    rp2.make_dynamic();
+    CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after make_dynamic");
+    rp2.implement<^^Point::sum>([]() { return 42; });
+    CHECK(rp2->sum() == 42, "mocked sum() should be 42");
+    // Note: ^^Point::set can't be used — it's an overload set.
+    // Only non-overloaded methods can be used with implement<^^>().
+    rp2.implement<^^Point::sum>([]() { return 84; });
+    CHECK(rp2->sum() == 84, "re-implemented sum() should be 84");
+
     std::printf("refl API test ok\n");
     return 0;
 }
