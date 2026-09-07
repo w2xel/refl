@@ -142,10 +142,15 @@ callable fields for each member function and data member:
 refl::Refl<Point> p(1, 2);
 p->set(10, 20);           // overloaded — resolved by argument type
 int s = p->sum();          // TypedMethod<int()> — real return type!
-int x = p->x.get();        // TypedProperty<int> — real type!
-p->x.set(42);             // typed set
+int x = p->x;              // TypedProperty<int> — implicit conversion (read)
+p->x = 42;                 // TypedProperty<int> — assignment (write)
 p.get().x                  // typed escape hatch (int&)
 ```
+
+`TypedProperty<T, bool Readonly>` mimics a public data member: implicit
+conversion to `T` for reading, `operator=(T)` for writing.  Const members
+get `Readonly=true`, which deletes `operator=` via a `requires` constraint —
+assigning to a const member is a **compile error**, not a silent no-op.
 
 The dispatch struct is synthesized at compile time: `define_aggregate`
 creates one `TypedMethod<Sigs...>` field per function name and one

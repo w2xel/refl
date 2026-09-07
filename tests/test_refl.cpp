@@ -299,17 +299,20 @@ int main() {
     CHECK(rp.get().x == 10, "after rp->set(10,20), x should be 10");
     CHECK(rp.get().y == 20, "after rp->set(10,20), y should be 20");
 
-    // --- typed property get/set via -> ---
-    int xval = rp->x.get();
-    CHECK(xval == 10, "rp->x.get() should be 10");
-    (void)rp->x.set(99);
-    CHECK(rp.get().x == 99, "after rp->x.set(99), x should be 99");
+    // --- property get/set via -> (member-like syntax) ---
+    int xval = rp->x;
+    CHECK(xval == 10, "rp->x should be 10 (implicit conversion)");
+    rp->x = 99;
+    CHECK(rp.get().x == 99, "after rp->x = 99, x should be 99");
 
-    // --- readonly property ---
+    // --- readonly property (compile-time rejected assignment) ---
     CHECK(rp->id.is_readonly(), "id property should be readonly");
-    auto id_set = rp->id.set(100);
-    CHECK(!id_set.has_value(), "set on readonly property should fail");
-    CHECK(id_set.error() == refl::Error::BadSignature, "should be BadSignature");
+    int id_val = rp->id;
+    CHECK(id_val == 0, "rp->id should be 0 (Point ctor sets id=0)");
+    // rp->id = 100;  // COMPILE ERROR: operator= deleted for Readonly=true
+    // Verify the readonly constraint at compile time:
+    static_assert(decltype(rp->id)::is_readonly(), "id must be Readonly=true");
+    static_assert(!decltype(rp->x)::is_readonly(), "x must be Readonly=false");
 
     // --- connect (function call hook) ---
     int hook_result = 0;
@@ -324,7 +327,7 @@ int main() {
     rp.on_change("x", [&change_result](std::any& v) {
         change_result = std::any_cast<int>(v);
     });
-    (void)rp->x.set(42);
+    rp->x = 42;
     CHECK(change_result == 42, "on_change hook should fire with new value 42");
     CHECK(rp.get().x == 42, "after on_change set, x should be 42");
 

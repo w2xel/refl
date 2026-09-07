@@ -538,34 +538,36 @@ struct TypedMethod {
 };
 
 // ---------------------------------------------------------------------------
-// TypedProperty<T> — get/set for data members returning the real type T.
+// TypedProperty<T, Readonly> — mimics a public data member via operator=
+// and implicit conversion.  p->x = 42 writes; int v = p->x reads.
+// Const members use Readonly=true, which deletes operator= at compile time.
 // ---------------------------------------------------------------------------
-template <typename T>
+template <typename T, bool Readonly = false>
 struct TypedProperty {
     GetterFn getter = nullptr;
-    SetterFn setter = nullptr;  // nullptr for const members
+    SetterFn setter = nullptr;  // always nullptr when Readonly=true
     void* obj = nullptr;
 
     void (*after_set)(void* ctx, std::any& val) = nullptr;
     void* hook_ctx = nullptr;
 
-    T get() const {
+    // Implicit conversion to T (read).
+    operator T() const {
         if (!getter || !obj) throw std::bad_any_cast{};
-        std::any result = getter(obj);
-        return std::any_cast<T>(result);
+        return std::any_cast<T>(getter(obj));
     }
 
-    std::expected<void, Error> set(T val) {
-        if (!setter || !obj) return std::unexpected(Error::BadSignature);
+    // Assignment from T (write).  Compile error when Readonly=true.
+    void operator=(T val) requires (!Readonly) {
+        if (!setter || !obj) return;
         setter(obj, std::any(std::move(val)));
         if (after_set) {
             std::any current = getter(obj);
             after_set(hook_ctx, current);
         }
-        return {};
     }
 
-    bool is_readonly() const { return !setter; }
+    static constexpr bool is_readonly() { return Readonly; }
 };
 
 // ---------------------------------------------------------------------------
@@ -588,6 +590,7 @@ consteval std::meta::info make_typed_method_type(std::meta::info type,
 }
 
 // consteval: build the TypedProperty field type for a data member name.
+// Passes Readonly=true for const members (deletes operator= at compile time).
 consteval std::meta::info make_property_field_type(std::meta::info type,
                                                        std::string_view name) {
     for (auto m : std::meta::nonstatic_data_members_of(type,
@@ -595,10 +598,11 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
         if (!std::meta::is_bit_field(m) && std::meta::has_identifier(m)
             && std::meta::identifier_of(m) == name) {
             auto mt = std::meta::type_of(m);
+            bool is_const = std::meta::is_const_type(mt);
+            auto clean_mt = std::meta::substitute(^^std::remove_cv_t,
+                std::initializer_list<std::meta::info>{mt});
             return std::meta::substitute(^^TypedProperty,
-                std::initializer_list<std::meta::info>{
-                    std::meta::substitute(^^std::remove_cv_t,
-                        std::initializer_list<std::meta::info>{mt})});
+                {clean_mt, std::meta::reflect_constant(is_const)});
         }
     }
     return std::meta::info{};
