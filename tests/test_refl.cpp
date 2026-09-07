@@ -93,10 +93,22 @@ int main() {
     CHECK(obj.is_class("Base"), "is_class(Base) should be true (Point derives from Base)");
     CHECK(!obj.is_class("Wrong"), "is_class(Wrong) should be false");
 
-    // --- cast_safe to base class ---
+    // --- base cast to base class ---
     auto base_cast = obj.cast_safe<Base>();
     CHECK(base_cast.has_value(), "cast_safe<Base> on a Point should succeed");
     CHECK(base_cast.value()->base_val == 1, "base cast should see base_val=1");
+
+    // --- type-checked invoke/get/set on a wrong-class Object ---
+    auto base_obj = *def_ctor->call();
+    auto wrong_invoke = cls.find_function("sum")->invoke(base_obj);
+    CHECK(!wrong_invoke.has_value(), "invoke on wrong-class object should fail");
+    CHECK(wrong_invoke.error() == refl::Error::TypeError, "should be TypeError");
+    auto wrong_get = cls.find_field("x")->get(base_obj);
+    CHECK(!wrong_get.has_value(), "get on wrong-class object should fail");
+    CHECK(wrong_get.error() == refl::Error::TypeError, "should be TypeError");
+    auto wrong_set = cls.find_field("x")->set(base_obj, std::any(1));
+    CHECK(!wrong_set.has_value(), "set on wrong-class object should fail");
+    CHECK(wrong_set.error() == refl::Error::TypeError, "should be TypeError");
 
     // --- overloaded function resolution ---
     auto set1 = cls.find_function("set", {"int"});
@@ -111,19 +123,19 @@ int main() {
     CHECK(overloads.size() == 2, "should find 2 overloads of set");
 
     // --- invoke overloaded ---
-    std::any r1 = set1->invoke(obj, 50);
+    std::any r1 = *set1->invoke(obj, 50);
     CHECK(p->x == 50, "after set(50), x should be 50");
-    std::any r2 = set2->invoke(obj, 10, 20);
+    std::any r2 = *set2->invoke(obj, 10, 20);
     CHECK(p->x == 10, "after set(10,20), x should be 10");
     CHECK(p->y == 20, "after set(10,20), y should be 20");
 
     // --- function on Object ---
     auto fn = *cls.find_function("sum");
-    CHECK(std::any_cast<int>(fn.invoke(obj)) == 30, "sum(10,20) should be 30");
+    CHECK(std::any_cast<int>(*fn.invoke(obj)) == 30, "sum(10,20) should be 30");
 
     // --- field get/set ---
     auto xf = *cls.find_field("x");
-    CHECK(std::any_cast<int>(xf.get(obj)) == 10, "field get x should be 10");
+    CHECK(std::any_cast<int>(*xf.get(obj)) == 10, "field get x should be 10");
     (void)xf.set(obj, std::any(77));
     CHECK(p->x == 77, "after field set, x should be 77");
 
@@ -146,7 +158,7 @@ int main() {
     // inherited method from Base
     auto base_fn = cls.find_function("base_method");
     CHECK(base_fn.has_value(), "find_function should find inherited base_method");
-    std::any base_ret = base_fn->invoke(obj);
+    std::any base_ret = *base_fn->invoke(obj);
     CHECK(std::any_cast<int>(base_ret) == 2, "base_method on Point(77) should be 154... wait");
 
     // base_method returns base_val * 2, and Base was constructed with x=1 in Point(1,3)

@@ -40,6 +40,10 @@ enum class Error {
     NullHandle,
     TypeError,
 };
+// ponytail: BadSignature is overloaded for two distinct failure modes —
+// write to a read-only (const or bit-field) field, and clone of a
+// non-copy-constructible class. Split into separate enumerators if a caller
+// ever needs to distinguish them.
 
 inline std::string_view to_string(Error e) {
     switch (e) {
@@ -191,11 +195,7 @@ inline std::string normalize_type(std::string_view sv) {
     while (result.size() >= 5 && result.compare(result.size() - 5, 5, "const") == 0) {
         result.erase(result.size() - 5);
     }
-    std::string clean;
-    for (char c : result) {
-        if (c != ' ' && c != '\t') clean += c;
-    }
-    return clean;
+    return result;
 }
 
 // Match a query (already-normalized type names) against a candidate's
@@ -222,6 +222,9 @@ make_arg_anys(Args&&... args) {
 }
 
 // Compile-time type name for safe-cast checks.
+// ponytail: identifier_of yields the unqualified name, so two classes with
+// the same name in different namespaces collide in the pool and in cast_safe.
+// Use a qualified/mangled name if cross-namespace registration is needed.
 template <typename T>
 consteval std::string_view type_name() {
     return std::meta::identifier_of(^^T);
@@ -717,7 +720,6 @@ public:
 
         const auto& ci = owner_->constructors[idx_];
         std::shared_ptr<void> result = ci.factory(args_ptr);
-        if (!result) return std::unexpected(Error::NullHandle);
         return Object(std::move(result), owner_->name);
     }
 
@@ -744,18 +746,27 @@ public:
     }
 
     // Invoke on an Object — the type-erased owning handle from call().
+    // Returns Error::TypeError if obj is not the function's class (or a
+    // derived class), Error::NullHandle if the handle is invalid.
     template <typename... Args>
-    std::any invoke(Object& obj, Args&&... args) {
-        if (!valid()) return std::any{};
+    std::expected<std::any, Error> invoke(Object& obj, Args&&... args) {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!obj.is_class(owner_->name))
+            return std::unexpected(Error::TypeError);
         auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
         const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
         return owner_->functions[idx_].invoker(obj.raw(), args_ptr);
     }
 
     // Invoke on a concrete type — for when you have the real object already.
+    // Returns Error::TypeError if T is not the function's class or a class
+    // derived from it, Error::NullHandle if the handle is invalid.
     template <typename T, typename... Args>
-    std::any invoke(T& obj, Args&&... args) {
-        if (!valid()) return std::any{};
+    std::expected<std::any, Error> invoke(T& obj, Args&&... args) {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        constexpr auto tname = detail::type_name<T>();
+        if (owner_->name != tname && !is_base_of(tname, owner_->name))
+            return std::unexpected(Error::TypeError);
         auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
         const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
         return owner_->functions[idx_].invoker(static_cast<void*>(&obj), args_ptr);
@@ -779,22 +790,31 @@ public:
     const std::string& type() const { return owner_->fields[idx_].type; }
     bool is_readonly() const { return owner_->fields[idx_].setter == nullptr; }
 
-    // Get the field value from an Object.
-    std::any get(Object& obj) const {
-        if (!valid()) return std::any{};
+    // Get the field value from an Object.  Returns Error::TypeError if obj
+    // is not the field's class (or a derived class), Error::NullHandle if
+    // the handle is invalid.
+    std::expected<std::any, Error> get(Object& obj) const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!obj.is_class(owner_->name))
+            return std::unexpected(Error::TypeError);
         return owner_->fields[idx_].getter(obj.raw());
     }
 
-    std::any get(const Object& obj) const {
-        if (!valid()) return std::any{};
+    std::expected<std::any, Error> get(const Object& obj) const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!obj.is_class(owner_->name))
+            return std::unexpected(Error::TypeError);
         return owner_->fields[idx_].getter(const_cast<Object&>(obj).raw());
     }
 
     // Set the field value on an Object.  Returns Error::BadSignature if
-    // the field is read-only (const or bit-field), Error::NullHandle if
+    // the field is read-only (const or bit-field), Error::TypeError if obj
+    // is not the field's class (or a derived class), Error::NullHandle if
     // the Field handle is invalid.
     std::expected<void, Error> set(Object& obj, std::any val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!obj.is_class(owner_->name))
+            return std::unexpected(Error::TypeError);
         if (is_readonly()) return std::unexpected(Error::BadSignature);
         owner_->fields[idx_].setter(obj.raw(), std::move(val));
         return {};
@@ -915,14 +935,6 @@ public:
 
     const std::vector<std::string>& base_names() const {
         return info_->base_names;
-    }
-
-    // Resolve a base class by name.  Returns Error::NotFound if not a base.
-    std::expected<Class, Error> find_base(std::string_view name) const {
-        for (const auto& bn : info_->base_names) {
-            if (bn == name) return find_class(bn);
-        }
-        return std::unexpected(Error::NotFound);
     }
 
     const std::vector<FieldInfo>& fields() const {
@@ -1051,7 +1063,7 @@ inline std::expected<Constructor, Error> Class::find_constructor(
         if (detail::match_signature(info_->constructors[i].param_types, query))
             return Constructor(info_, i);
     }
-    return std::unexpected(Error::BadSignature);
+    return std::unexpected(Error::NotFound);
 }
 
 inline std::expected<Function, Error> Class::find_function(

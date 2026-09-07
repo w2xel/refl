@@ -32,15 +32,10 @@ auto fn = *my_class_class.find_function("some_method");
 std::any result = fn.invoke(my_obj, arg1, arg2);
 ```
 
-When you need the concrete type, cast explicitly.  The fast cast returns
-a non-owning `T*` (valid as long as the Object is alive):
-
-```cpp
-MyClass* ptr = my_obj.cast<MyClass>();
-```
-
-Or use the safe cast, which checks the class name at runtime and returns
-a `std::shared_ptr<T>` that shares ownership with the Object:
+When you need the concrete type, use the safe cast, which checks the class
+name at runtime and returns a `std::shared_ptr<T>` that shares ownership
+with the Object — it succeeds for the object's own class and for any base
+class (upcast):
 
 ```cpp
 auto result = my_obj.cast_safe<MyClass>();
@@ -91,10 +86,14 @@ Initial implementation. The API above is working:
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
   type-erased, shared-ownership handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on an `Object`
-  (or on a concrete `T&` via `invoke<T>`) and returns `std::any`.
-- `Field::get(Object&)` returns the field value as `std::any`.
+  (or on a concrete `T&` via `invoke<T>`) and returns `std::expected<std::any, Error>`.
+  Returns `Error::TypeError` if the object is not the function's class (or a
+  derived class), `Error::NullHandle` if the handle is invalid.
+- `Field::get(Object&)` returns the field value as `std::expected<std::any, Error>`,
+  with the same `Error::TypeError` / `Error::NullHandle` semantics.
 - `Field::set(Object&, std::any)` sets the field value.  Returns
-  `Error::BadSignature` for read-only (const or bit-field) fields.
+  `Error::BadSignature` for read-only (const or bit-field) fields, and
+  `Error::TypeError` / `Error::NullHandle` as above.
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
   (walks bases).
   `StaticField::get()` returns the value as `std::any`; `StaticField::set(std::any)`

@@ -39,6 +39,10 @@ int main() {
     for (const auto& n : refl::list_all_classes()) std::printf(" %s", n.c_str());
     std::printf("\n");
 
+    // Refl<T> doubles as a value container: hold a concrete instance, get/take it.
+    refl::Refl<Shape> shape_value{Shape{7}};
+    std::printf("  wrapped shape id = %d\n", shape_value.get().id);
+
     auto cls = *refl::find_class("Rect");
     std::printf("class: %s\n", cls.name().c_str());
     std::printf("  bases:");
@@ -51,13 +55,13 @@ int main() {
 
     // Field get/set.
     auto wf = *cls.find_field("w");
-    std::printf("  field w = %d\n", std::any_cast<int>(wf.get(obj)));
+    std::printf("  field w = %d\n", std::any_cast<int>(*wf.get(obj)));
     (void)wf.set(obj, std::any(10));
 
     // Overloaded function resolution.
     auto resize2 = *cls.find_function("resize", {"int", "int"});
     std::printf("  resize(%zu params)\n", resize2.param_types().size());
-    resize2.invoke(obj, 5, 6);
+    (void)resize2.invoke(obj, 5, 6).value();
     auto rect = obj.cast_safe<Rect>().value();
     std::printf("  after resize: w=%d h=%d\n", rect->w, rect->h);
 
@@ -66,7 +70,7 @@ int main() {
 
     // Inherited method from Shape.
     auto inherited = cls.find_function("area");
-    std::printf("  area() = %d\n", std::any_cast<int>(inherited->invoke(obj)));
+    std::printf("  area() = %d\n", std::any_cast<int>(*inherited->invoke(obj)));
 
     // Safe cast.
     std::printf("  safe cast: w=%d h=%d\n", rect->w, rect->h);

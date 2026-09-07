@@ -60,8 +60,7 @@ add_project_arguments(
   language: 'cpp',
 )
 
-# Header-only framework: expose include/ to subprojects/tests/samples.
-refl_inc = include_directories('include')
-
+# Header-only framework: subprojects/tests/samples include via their own
+# include_directories('../include').
 subdir('tests')
 subdir('samples')

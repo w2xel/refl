@@ -15,14 +15,6 @@ selfcheck = executable(
 )
 test('selfcheck', selfcheck)
 
-test_skeleton = executable(
-  'test_skeleton',
-  'test_skeleton.cpp',
-  include_directories: inc,
-  install: false,
-)
-test('skeleton', test_skeleton)
-
 test_refl = executable(
   'test_refl',
   'test_refl.cpp',
