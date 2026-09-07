@@ -9,3 +9,10 @@ executable(
   include_directories: inc,
   install: false,
 )
+
+executable(
+  'dynamic_sample',
+  'dynamic.cpp',
+  include_directories: inc,
+  install: false,
+)

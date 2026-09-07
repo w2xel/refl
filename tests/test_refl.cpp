@@ -43,6 +43,12 @@ struct Mixed {
     double compute(double f) const { return v * f; }
 };
 
+struct IShape {
+    virtual int area(int scale) = 0;
+    virtual void set_color(int c) = 0;
+    virtual ~IShape() = default;
+};
+
 [[maybe_unused]] static refl::Refl<Base> reg_base;
 [[maybe_unused]] static refl::Refl<Point> reg_point;
 [[maybe_unused]] static refl::Refl<Color> reg_color;
@@ -381,6 +387,29 @@ int main() {
     CHECK(ci == 15, "compute(3) should be 15 (5*3)");
     double cd = rm->compute(3.0);
     CHECK(cd == 15.0, "compute(3.0) should be 15.0 (5*3.0)");
+
+    // === dynamic interface implementation ===
+    // Refl<IShape> with an abstract T — no object constructed, methods
+    // implemented via runtime callables.
+    refl::Refl<IShape> ishape;
+    ishape.implement<^^IShape::area>([](int scale) {
+        return scale * 100;
+    });
+    ishape.implement<^^IShape::set_color>([](int) {
+        // no-op for test
+    });
+
+    int ar = ishape->area(5);
+    CHECK(ar == 500, "dynamic area(5) should be 500 (5*100)");
+    ishape->set_color(42);  // should not crash
+    CHECK(true, "set_color called successfully");
+
+    // Re-implement at runtime
+    ishape.implement<^^IShape::area>([](int scale) {
+        return scale * 200;
+    });
+    int ar2 = ishape->area(5);
+    CHECK(ar2 == 1000, "dynamic area(5) after re-implement should be 1000");
 
     std::printf("refl API test ok\n");
     return 0;

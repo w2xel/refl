@@ -799,8 +799,11 @@ class Refl {
                     }
                 }
             }
-            specs.push_back(std::meta::data_member_spec(
-                ^^std::shared_ptr<T>, {.name="obj"}));
+            // Only add the obj field when T is constructible (not abstract).
+            if constexpr (!std::meta::is_abstract_type(^^T)) {
+                specs.push_back(std::meta::data_member_spec(
+                    ^^std::shared_ptr<T>, {.name="obj"}));
+            }
             std::meta::define_aggregate(^^Dispatch, specs);
         } else {
             std::meta::define_aggregate(^^Dispatch, {});
@@ -810,7 +813,7 @@ class Refl {
     Dispatch dispatch_;
 
     void populate() {
-        if constexpr (std::is_class_v<T>) {
+        if constexpr (std::is_class_v<T> && !std::meta::is_abstract_type(^^T)) {
             static constexpr auto dm = std::define_static_array(
                 std::meta::nonstatic_data_members_of(^^Dispatch,
                     std::meta::access_context::unchecked()));
@@ -932,10 +935,57 @@ class Refl {
     std::map<std::string, std::function<void(std::any&)>> invoke_hooks_;
     std::map<std::string, std::function<void(std::any&)>> change_hooks_;
 
+    // --- Dynamic mode: runtime callable storage + trampolines.
+    //     When T is abstract, no object is constructed; instead, implement()
+    //     wires each method to a runtime-provided callable.
+    std::map<std::string, std::any> dynamic_callables_;
+
+    // Trampoline: calls a stored std::function matching the method's signature.
+    // Supports 0-2 args (extendable).  The void* ctx points into
+    // dynamic_callables_ at the matching std::any (which holds the function).
+    template <std::meta::info Method>
+    static std::any trampoline(void* ctx, const std::any* args) {
+        using R = [: std::meta::return_type_of(Method) :];
+        constexpr auto params = std::define_static_array(
+            std::meta::parameters_of(Method));
+        if constexpr (params.size() == 0) {
+            auto* fn = static_cast<std::function<R()>*>(ctx);
+            if constexpr (std::is_void_v<R>) { (*fn)(); return {}; }
+            else return std::any((*fn)());
+        } else if constexpr (params.size() == 1) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            auto* fn = static_cast<std::function<R(C0)>*>(ctx);
+            if constexpr (std::is_void_v<R>) {
+                (*fn)(std::any_cast<C0>(args[0])); return {};
+            } else {
+                return std::any((*fn)(std::any_cast<C0>(args[0])));
+            }
+        } else if constexpr (params.size() == 2) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using P1 = [: std::meta::type_of(params[1]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            using C1 = std::remove_cvref_t<P1>;
+            auto* fn = static_cast<std::function<R(C0, C1)>*>(ctx);
+            if constexpr (std::is_void_v<R>) {
+                (*fn)(std::any_cast<C0>(args[0]), std::any_cast<C1>(args[1]));
+                return {};
+            } else {
+                return std::any((*fn)(
+                    std::any_cast<C0>(args[0]),
+                    std::any_cast<C1>(args[1])));
+            }
+        } else {
+            // ponytail: 3+ args not yet supported in the trampoline.
+            // Extend with more else-if branches if needed.
+            return {};
+        }
+    }
+
 public:
     using value_type = T;
 
-    Refl() { ensure_registered<T>(); }
+    Refl() { if constexpr (!std::meta::is_abstract_type(^^T)) ensure_registered<T>(); }
 
     template <typename... Args>
     explicit Refl(Args&&... args) {
@@ -952,6 +1002,77 @@ public:
         if constexpr (std::is_class_v<T>) {
             dispatch_.obj = std::make_shared<T>(std::forward<Args>(args)...);
             populate();
+        }
+    }
+
+    // Implement a method with a runtime callable (dynamic mode).
+    // T must be abstract or the method must not have a real invoker yet.
+    // The callable's signature must match the method's.
+    //
+    //   refl::Refl<IShape> s;
+    //   s.implement<^^IShape::area>([](int scale) { return scale * 100; });
+    //   int a = s->area(5);  // calls the lambda
+    template <std::meta::info Method, typename F>
+    void implement(F fn) {
+        using R = [: std::meta::return_type_of(Method) :];
+        constexpr auto params = std::define_static_array(
+            std::meta::parameters_of(Method));
+        constexpr auto nm_sv = std::meta::identifier_of(Method);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        // Store the callable as a typed std::function inside std::any.
+        if constexpr (params.size() == 0) {
+            dynamic_callables_[key] = std::function<R()>(std::move(fn));
+        } else if constexpr (params.size() == 1) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            dynamic_callables_[key] = std::function<R(C0)>(std::move(fn));
+        } else if constexpr (params.size() == 2) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using P1 = [: std::meta::type_of(params[1]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            using C1 = std::remove_cvref_t<P1>;
+            dynamic_callables_[key] = std::function<R(C0, C1)>(std::move(fn));
+        }
+        // Wire the trampoline into the dispatch struct field.
+        static constexpr auto dm = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch,
+                std::meta::access_context::unchecked()));
+        template for (constexpr auto field : dm) {
+            if constexpr (std::meta::has_identifier(field)
+                          && std::meta::identifier_of(field) == nm_sv) {
+                using FT = [:std::meta::type_of(field):];
+                if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
+                    constexpr auto entries = []() consteval {
+                        using OE = typename
+                            std::remove_cv_t<FT>::OverloadEntry;
+                        return std::define_static_array(
+                            std::vector<OE>{OE{&trampoline<Method>}});
+                    }();
+                    dispatch_.[:field:].overloads = entries.data();
+                    dispatch_.[:field:].num = 1;
+                    // Point obj at the std::function inside dynamic_callables_.
+                    if constexpr (params.size() == 0) {
+                        dispatch_.[:field:].obj =
+                            std::any_cast<std::function<R()>>(
+                                &dynamic_callables_[key]);
+                    } else if constexpr (params.size() == 1) {
+                        using P0 = [: std::meta::type_of(params[0]) :];
+                        using C0 = std::remove_cvref_t<P0>;
+                        dispatch_.[:field:].obj =
+                            std::any_cast<std::function<R(C0)>>(
+                                &dynamic_callables_[key]);
+                    } else if constexpr (params.size() == 2) {
+                        using P0 = [: std::meta::type_of(params[0]) :];
+                        using P1 = [: std::meta::type_of(params[1]) :];
+                        using C0 = std::remove_cvref_t<P0>;
+                        using C1 = std::remove_cvref_t<P1>;
+                        dispatch_.[:field:].obj =
+                            std::any_cast<std::function<R(C0, C1)>>(
+                                &dynamic_callables_[key]);
+                    }
+                }
+            }
         }
     }
 
