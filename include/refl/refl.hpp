@@ -938,12 +938,11 @@ class Refl {
     // --- Dynamic mode: runtime callable storage + trampolines.
     //     When T is abstract, no object is constructed; instead, implement()
     //     wires each method to a runtime-provided callable.
-    //     When T is concrete, calling implement() switches from real-object
-    //     mode to dynamic mode — the real object is released and methods
-    //     are backed by runtime callables instead.  This enables mocking:
-    //     start with a real object, then swap to a mock at runtime.
+    //     When T is concrete, implement() can override individual methods
+    //     while keeping the real object alive — other methods still call
+    //     through to the real object.  This enables per-method mocking.
     std::map<std::string, std::any> dynamic_callables_;
-    bool dynamic_mode_ = false;  // true when methods are runtime-implemented
+    bool dynamic_mode_ = false;  // true = fully dynamic (no real object)
 
     // Trampoline: calls a stored std::function matching the method's signature.
     // Supports 0-2 args (extendable).  The void* ctx points into
@@ -1003,7 +1002,7 @@ public:
 
     // Replace the underlying object (swap to real-object mode).
     // Re-populates all fields with real invokers.  Clears any
-    // dynamic-mode callables.
+    // dynamic-mode callables and per-method overrides.
     template <typename... Args>
     void reset(Args&&... args) requires (!std::meta::is_abstract_type(^^T)) {
         if constexpr (std::is_class_v<T>) {
@@ -1011,6 +1010,52 @@ public:
             dynamic_mode_ = false;
             dynamic_callables_.clear();
             populate();
+        }
+    }
+
+    // Remove a per-method override, restoring the real invoker.
+    // Only works when a real object is present (not in full dynamic mode).
+    template <std::meta::info Method>
+    void restore() requires (!std::meta::is_abstract_type(^^T)) {
+        if (dynamic_mode_) return;  // can't restore in full dynamic mode
+        constexpr auto nm_sv = std::meta::identifier_of(Method);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        dynamic_callables_.erase(std::string(nm));
+        // Re-populate just this method with the real invoker.
+        if constexpr (std::is_class_v<T>) {
+            static constexpr auto dm = std::define_static_array(
+                std::meta::nonstatic_data_members_of(^^Dispatch,
+                    std::meta::access_context::unchecked()));
+            template for (constexpr auto field : dm) {
+                if constexpr (std::meta::has_identifier(field)
+                              && std::meta::identifier_of(field) == nm_sv) {
+                    using FT = [:std::meta::type_of(field):];
+                    if constexpr (detail::is_typed_method_v<
+                            std::remove_cv_t<FT>>) {
+                        dispatch_.[:field:].obj = dispatch_.obj.get();
+                        constexpr auto entries = []() consteval {
+                            using OE = typename
+                                std::remove_cv_t<FT>::OverloadEntry;
+                            std::vector<OE> v;
+                            static constexpr auto tmembers =
+                                std::define_static_array(
+                                    std::meta::members_of(^^T,
+                                        std::meta::access_context::unchecked()));
+                            template for (constexpr auto m : tmembers) {
+                                if constexpr (std::meta::is_function(m)
+                                    && std::meta::has_identifier(m)
+                                    && !std::meta::is_static_member(m)
+                                    && std::meta::identifier_of(m) == nm_sv) {
+                                    v.push_back(OE{&detail::invoker<T, m>});
+                                }
+                            }
+                            return std::define_static_array(v);
+                        }();
+                        dispatch_.[:field:].overloads = entries.data();
+                        dispatch_.[:field:].num = entries.size();
+                    }
+                }
+            }
         }
     }
 
@@ -1032,11 +1077,10 @@ public:
     //   int a = s->area(5);  // calls the lambda
     template <std::meta::info Method, typename F>
     void implement(F fn) {
-        // Auto-switch to dynamic mode if currently in real-object mode.
-        if (!dynamic_mode_) {
-            dynamic_mode_ = true;
-            dynamic_callables_.clear();
-        }
+        // If in real-object mode (not dynamic_mode_), keep the real object
+        // alive and only override this one method.  If in dynamic mode or
+        // abstract T, this is a full dynamic implementation.
+        // No mode switch needed — just store the callable and wire it.
         using R = [: std::meta::return_type_of(Method) :];
         constexpr auto params = std::define_static_array(
             std::meta::parameters_of(Method));

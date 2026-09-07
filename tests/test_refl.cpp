@@ -417,25 +417,31 @@ int main() {
     CHECK(!rp2.is_dynamic(), "rp2 should start in real mode");
     CHECK(rp2->sum() == 7, "real sum() should be 7 (3+4)");
 
-    // Switch to dynamic mode — implement sum as a mock.
+    // Per-method override: keep real object, override just sum().
     rp2.implement<^^Point::sum>([]() { return 999; });
-    CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after implement");
-    CHECK(rp2->sum() == 999, "mocked sum() should be 999");
+    CHECK(!rp2.is_dynamic(), "rp2 should NOT be in full dynamic mode (partial override)");
+    CHECK(rp2->sum() == 999, "overridden sum() should be 999");
+    rp2->set(10, 20);
+    CHECK(rp2.get().x == 10, "set() should still call real object (x=10)");
+    CHECK(rp2.get().y == 20, "set() should still call real object (y=20)");
 
-    // Switch back to real mode.
-    rp2.reset(10, 20);
-    CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
-    CHECK(rp2->sum() == 30, "real sum() should be 30 (10+20)");
+    // Restore the real sum() — removes the override.
+    rp2.restore<^^Point::sum>();
+    CHECK(rp2->sum() == 30, "restored sum() should be 30 (10+20)");
 
-    // Use make_dynamic() then implement multiple methods.
+    // Full dynamic mode: make_dynamic() then implement everything.
     rp2.make_dynamic();
     CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after make_dynamic");
     rp2.implement<^^Point::sum>([]() { return 42; });
     CHECK(rp2->sum() == 42, "mocked sum() should be 42");
     // Note: ^^Point::set can't be used — it's an overload set.
-    // Only non-overloaded methods can be used with implement<^^>().
     rp2.implement<^^Point::sum>([]() { return 84; });
     CHECK(rp2->sum() == 84, "re-implemented sum() should be 84");
+
+    // Switch back to real mode.
+    rp2.reset(1, 2);
+    CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
+    CHECK(rp2->sum() == 3, "real sum() should be 3 (1+2)");
 
     std::printf("refl API test ok\n");
     return 0;
