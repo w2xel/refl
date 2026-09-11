@@ -45,8 +45,11 @@ enum class Error {
     TypeError,
     ArityMismatch,   // argument count doesn't match the member's param count
     ReadOnly,        // write to a const / bit-field member
-    NotCopyable,     // clone of a non-copy-constructible class
+    NotCopyable,     // clone of a non-copy-constructible class / get on move-only
 };
+
+// Forward declarations — needed for function pointer type aliases below.
+class Object;
 
 inline std::string_view to_string(Error e) {
     switch (e) {
@@ -64,19 +67,28 @@ inline std::string_view to_string(Error e) {
 // Type-erased function pointer signatures for factories, invokers, getters,
 // and setters.
 //
-// The factory returns a shared_ptr<void> with the deleter baked in, so the
-// result is never a bare owning pointer.  Invokers, getters, and setters
-// take a non-owning void* (a borrow from the Object's internal storage,
-// valid for the duration of the call) and the void*[] arg array (borrows
-// of the caller's arguments).
+// Args arrive as const Object* — each carries a void* to the caller's
+// stack storage plus a string_view type name (from display_string_of, no
+// RTTI).  The invoker checks the type name against the compile-time param
+// type and moves from the caller's storage.
+//
+// The invoker also receives the shared_ptr<void> owner of the target
+// object (empty for non-owning / stack objects).  This allows
+// reference-returning functions (operator=, operator+=, etc.) to return
+// an aliasing Object that shares ownership with the original.
+//
+// Returns are Object (owning or non-owning).  Void functions return
+// a default (invalid) Object.  The caller checks .valid() to distinguish
+// void from a real return value.
 // ---------------------------------------------------------------------------
-using FactoryFn       = std::shared_ptr<void> (*)(const std::any* args);
-using InvokerFn       = std::any (*)(void* obj, const std::any* args);
-using GetterFn        = std::any (*)(void* obj);
-using SetterFn        = void  (*)(void* obj, std::any val);
-using StaticGetterFn  = std::any (*)();
-using StaticSetterFn  = void  (*)(std::any val);
-using StaticInvokerFn = std::any (*)(const std::any* args);
+using FactoryFn       = Object (*)(const Object* args);
+using InvokerFn       = Object (*)(const std::shared_ptr<void>& owner,
+                                  void* obj, const Object* args);
+using GetterFn        = Object (*)(void* obj);
+using SetterFn        = void  (*)(void* obj, const Object* val);
+using StaticGetterFn  = Object (*)();
+using StaticSetterFn  = void  (*)(const Object* val);
+using StaticInvokerFn = Object (*)(const Object* args);
 using CloneFn         = std::shared_ptr<void> (*)(void* obj);
 
 struct ConstructorInfo {
@@ -101,8 +113,9 @@ struct StaticFunctionInfo {
 struct FieldInfo {
     std::string name;
     std::string type;
-    GetterFn getter;
-    SetterFn setter;  // nullptr for const / bit-field members
+    std::ptrdiff_t offset;  // byte offset of member within T (for get_ref)
+    GetterFn getter;        // nullptr if move-only
+    SetterFn setter;        // nullptr for const / bit-field / move-only
 };
 
 struct StaticFieldInfo {
@@ -186,10 +199,33 @@ std::expected<Class, Error> find_class(std::string_view name);
 namespace detail {
 
 // Normalize a type string: lowercase, strip whitespace, const, ref qualifiers.
-// Applied at storage time so lookups compare raw strings.  Handles both
-// west const (`const int`) and east const (`int const`): const is stripped
-// while whitespace is still present, so it matches as a distinct token
-// rather than a substring (e.g. `const_iterator` is left untouched).
+// Applied at storage time (param_types) and at lookup time (find_constructor,
+// find_function with types) so both sides compare the same canonical form.
+//
+// Only used for the user-facing string-based overload-resolution API
+// (find_constructor({"int","int"}), find_function("set",{"int"})).  The
+// invoker path does not use this — arg type checking is done at compile
+// time via type_name<T>() (display_string_of), which is exact.
+//
+// Why the west-const / east-const handling looks more complex than it
+// needs to be: GCC's display_string_of already normalizes to west-const
+// ("const int*" regardless of how the source was written), so both
+// spellings produce the same string before normalize_type runs.  The
+// east-const stripping (" const" suffix) is therefore dead in practice
+// for GCC 16, but kept for robustness against future compiler changes or
+// hand-written type strings.  Tested: "const int*" and "int const*"
+// both normalize to "int*".
+//
+// Limitations (intentional): volatile is not stripped (matches on both
+// sides if present or absent).  Pointer-to-const const ("const int* const")
+// normalizes to "int*" — indistinguishable from "const int*".  These are
+// not practical problems for reflected signatures (value types, pointers,
+// references — rarely volatile, rarely double-const-pointers).
+//
+// Handles west const ("const int") and east const ("int const"): const
+// is stripped while whitespace is still present, so it matches as a
+// distinct token rather than a substring (e.g. "const_iterator" is left
+// untouched).
 inline std::string normalize_type(std::string_view sv) {
     std::string s;
     for (char c : sv)
@@ -223,6 +259,15 @@ inline std::string normalize_type(std::string_view sv) {
     return result;
 }
 
+// Compile-time fully-qualified type name for pool keys and safe-cast checks.
+// display_string_of yields the qualified name (e.g. "ns::Point"), so two
+// classes with the same unqualified name in different namespaces no longer
+// collide in the pool or in cast_safe.  Global-scope types have no prefix.
+template <typename T>
+consteval std::string_view type_name() {
+    return std::meta::display_string_of(^^T);
+}
+
 // Match a query (already-normalized type names) against a candidate's
 // param_types (also pre-normalized at storage time).  Returns true if
 // the param counts and types match.
@@ -234,201 +279,6 @@ inline bool match_signature(
         if (candidate_types[j] != query[j]) return false;
     }
     return true;
-}
-
-// Build an std::any array from forwarded arguments.  The caller
-// checks `.empty()` on the returned array to get the pointer.
-template <typename... Args>
-std::array<std::any, sizeof...(Args)>
-make_arg_anys(Args&&... args) {
-    return std::array<std::any, sizeof...(Args)>{
-        std::any(std::forward<Args>(args))...
-    };
-}
-
-// Arity-check forwarded args against the member's param count and build
-// the std::any arg array in the caller-provided storage.  Returns the
-// pointer into storage (nullptr for zero args) or an ArityMismatch error.
-// The returned pointer is valid as long as `storage` is alive.
-template <std::size_t N, typename... Args>
-std::expected<const std::any*, Error>
-prepare_args(std::array<std::any, N>& storage,
-             std::size_t param_count, Args&&... args) {
-    static_assert(N == sizeof...(Args),
-                  "storage size must match argument count");
-    if (sizeof...(Args) != param_count)
-        return std::unexpected(Error::ArityMismatch);
-    if constexpr (sizeof...(Args) == 0) {
-        return nullptr;
-    } else {
-        storage = make_arg_anys(std::forward<Args>(args)...);
-        return storage.data();
-    }
-}
-
-// Compile-time fully-qualified type name for pool keys and safe-cast checks.
-// display_string_of yields the qualified name (e.g. "ns::Point"), so two
-// classes with the same unqualified name in different namespaces no longer
-// collide in the pool or in cast_safe.  Global-scope types have no prefix.
-template <typename T>
-consteval std::string_view type_name() {
-    return std::meta::display_string_of(^^T);
-}
-
-template <typename T, std::meta::info Ctor>
-std::shared_ptr<void> factory(const std::any* args) {
-    static constexpr auto params = std::define_static_array(
-        std::meta::parameters_of(Ctor));
-    constexpr std::size_t n = params.size();
-
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
-        using P = [:std::meta::type_of(params[J]):];
-        return std::any_cast<std::remove_reference_t<P>>(args[J]);
-    };
-
-    return [&]<std::size_t... I>(std::index_sequence<I...>) -> std::shared_ptr<void> {
-        if constexpr (n == 0) {
-            return std::make_shared<T>();
-        } else {
-            return std::make_shared<T>(extract(std::integral_constant<std::size_t, I>{})...);
-        }
-    }(std::make_index_sequence<n>{});
-}
-
-template <typename T, std::meta::info Fn>
-std::any invoker(void* obj, const std::any* args) {
-    auto* target = static_cast<T*>(obj);
-    auto mfn = &[:Fn:];
-    static constexpr auto params = std::define_static_array(
-        std::meta::parameters_of(Fn));
-    constexpr std::size_t n = params.size();
-    using R = [:std::meta::return_type_of(Fn):];
-
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
-        using P = [:std::meta::type_of(params[J]):];
-        return std::any_cast<std::remove_reference_t<P>>(args[J]);
-    };
-
-    return [&]<std::size_t... I>(std::index_sequence<I...>) -> std::any {
-        if constexpr (n == 0) {
-            if constexpr (std::is_void_v<R>) {
-                (target->*mfn)();
-                return std::any{};
-            } else {
-                return std::any((target->*mfn)());
-            }
-        } else {
-            if constexpr (std::is_void_v<R>) {
-                (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
-                return std::any{};
-            } else {
-                return std::any((target->*mfn)(
-                    extract(std::integral_constant<std::size_t, I>{})...));
-            }
-        }
-    }(std::make_index_sequence<n>{});
-}
-
-template <typename T, std::meta::info Member>
-std::any getter(void* obj) {
-    auto* target = static_cast<T*>(obj);
-    auto ptr = &[:Member:];
-    return std::any(target->*ptr);
-}
-
-template <typename T, std::meta::info Member>
-void setter(void* obj, std::any val) {
-    auto* target = static_cast<T*>(obj);
-    auto ptr = &[:Member:];
-    using MemberType = [:std::meta::type_of(Member):];
-    target->*ptr = std::any_cast<MemberType>(std::move(val));
-}
-
-// --- Static data member getter/setter ---
-// No obj pointer — static storage is accessed via &[:Member:].
-
-template <typename T, std::meta::info Member>
-std::any static_getter() {
-    auto* ptr = &[:Member:];
-    return std::any(*ptr);
-}
-
-template <typename T, std::meta::info Member>
-void static_setter(std::any val) {
-    auto* ptr = &[:Member:];
-    using MemberType = [:std::meta::type_of(Member):];
-    *ptr = std::any_cast<MemberType>(std::move(val));
-}
-
-// --- Cloner ---
-// Deep-copies the object via the copy constructor.  Only generated if T
-// is copy-constructible.
-
-template <typename T>
-std::shared_ptr<void> clone(void* obj) {
-    auto* src = static_cast<T*>(obj);
-    return std::make_shared<T>(*src);
-}
-
-// --- Static member function invoker ---
-// No obj pointer — static functions are called directly via &[:Fn:].
-
-template <typename T, std::meta::info Fn>
-std::any static_invoker(const std::any* args) {
-    auto fn = &[:Fn:];
-    static constexpr auto params = std::define_static_array(
-        std::meta::parameters_of(Fn));
-    constexpr std::size_t n = params.size();
-    using R = [:std::meta::return_type_of(Fn):];
-
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
-        using P = [:std::meta::type_of(params[J]):];
-        return std::any_cast<std::remove_reference_t<P>>(args[J]);
-    };
-
-    return [&]<std::size_t... I>(std::index_sequence<I...>) -> std::any {
-        if constexpr (n == 0) {
-        if constexpr (std::is_void_v<R>) {
-            fn();
-            return std::any{};
-        } else {
-            return std::any(fn());
-        }
-    } else {
-        if constexpr (std::is_void_v<R>) {
-            fn(extract(std::integral_constant<std::size_t, I>{})...);
-            return std::any{};
-        } else {
-            return std::any(fn(extract(std::integral_constant<std::size_t, I>{})...));
-        }
-    }
-    }(std::make_index_sequence<n>{});
-}
-
-// --- Arity + type-erased call guards ---
-//
-// The invokers, factory, getters, and setters above forward arguments as
-// std::any.  An arity mismatch indexes the any array out of bounds (UB),
-// and a type mismatch inside std::any_cast throws std::bad_any_cast.  The
-// helper below wraps the raw calls so the runtime handles report a clean
-// Error instead of crashing or throwing across the C boundary.
-
-// Call fn(args...) and translate std::bad_any_cast into Error::TypeError.
-// Works for any callable returning std::any, std::shared_ptr<void>, or
-// void (deduced via decltype).
-template <typename Fn, typename... CallArgs>
-auto checked_call(Fn&& fn, CallArgs&&... args)
-    -> std::expected<decltype(fn(std::forward<CallArgs>(args)...)), Error> {
-    try {
-        if constexpr (std::is_void_v<decltype(fn(std::forward<CallArgs>(args)...))>) {
-            fn(std::forward<CallArgs>(args)...);
-            return {};
-        } else {
-            return fn(std::forward<CallArgs>(args)...);
-        }
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
 }
 
 }  // namespace detail
@@ -545,95 +395,352 @@ struct Reg {
     Reg() { ensure_registered<T>(); }
 };
 // ---------------------------------------------------------------------------
-// Object — a type-erased, shared-ownership handle to a heap-allocated
-// instance.
+// Object — a type-erased handle to an instance, either owning (backed by
+// shared_ptr) or non-owning (raw pointer into a stack or heap object).
 //
-// Returned by Constructor::call.  Internally holds a std::shared_ptr<void>
-// with the deleter baked in, plus the class name for runtime type checks.
-// Copyable — copies share ownership.  Use cast_safe<T>() for a checked
-// std::shared_ptr<T> that keeps the object alive independently.  The cast
-// checks not only the exact class but also walks the base-class hierarchy,
-// so casting a derived Object to a base type succeeds.
+// Returned by Constructor::call (owning) and Function::invoke (owning for
+// value returns, aliasing for reference returns, invalid for void).  Also
+// used as the argument type for invoke/get/set — constructed from any
+// concrete object via the template constructor, which infers the class
+// name at compile time.
+//
+// is_owned() distinguishes the two modes.  cast_safe<T>() returns a
+// shared_ptr<T> (owning, keeps alive) for owned Objects.  cast_ref<T>()
+// returns a raw T* for both modes — the caller manages lifetime.
 // ---------------------------------------------------------------------------
 
 class Object {
 public:
     Object() = default;
 
-    Object(std::shared_ptr<void> ptr, std::string class_name)
-        : ptr_(std::move(ptr)), class_name_(std::move(class_name)) {}
+    // Owning construction — from a shared_ptr (factory, getter, invoker).
+    Object(std::shared_ptr<void> owner, std::string_view class_name)
+        : owner_(std::move(owner))
+        , ptr_(owner_.get())
+        , class_name_(class_name) {}
 
-    // Shared ownership — copies are fine.
+    // Owning construction with separate pointer (aliasing — for reference
+    // returns where the shared_ptr keeps the original alive but the
+    // pointer points at a subobject or the object itself).
+    Object(std::shared_ptr<void> owner, void* ptr,
+           std::string_view class_name)
+        : owner_(std::move(owner))
+        , ptr_(ptr)
+        , class_name_(class_name) {}
+
+    // Non-owning construction — raw pointer + class name.
+    Object(void* ptr, std::string_view class_name)
+        : ptr_(ptr), class_name_(class_name) {}
+
+    // From a concrete object — infers class name at compile time.
+    // Non-owning: the caller must keep obj alive.
+    template <typename T>
+        requires (not std::same_as<std::remove_cvref_t<T>, Object>)
+    Object(T& obj) noexcept
+        : ptr_(static_cast<void*>(std::addressof(obj)))
+        , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
+
+    // Block temporaries from the template constructor (below) — but allow
+    // move construction (needed for expected<Object> returns).
+    Object(Object&&) noexcept = default;
     Object(const Object&) = default;
     Object& operator=(const Object&) = default;
-    Object(Object&&) noexcept = default;
     Object& operator=(Object&&) noexcept = default;
 
-    // The class name this object was constructed as (for runtime checks).
-    const std::string& class_name() const { return class_name_; }
+    std::string_view class_name() const { return class_name_; }
 
-    // Check whether this object is of the given class or a class derived
-    // from it.  Walks the base-class hierarchy at runtime.
+    bool is_owned() const { return static_cast<bool>(owner_); }
+
     bool is_class(std::string_view name) const {
         if (!valid()) return false;
         if (class_name_ == name) return true;
         return is_base_of(class_name_, name);
     }
 
-    // Safe cast: checks the class name against T's name at runtime and
-    // returns a std::shared_ptr<T> that shares ownership with the Object.
-    // Succeeds if T matches the object's class or any of its bases.
-    // Returns Error::TypeError on mismatch, Error::NullHandle if invalid.
+    // Owning cast — returns a shared_ptr<T> that keeps the object alive.
+    // Only works for owned Objects.  Returns Error::NotCopyable for
+    // non-owning Objects (use cast_ref instead).
     template <typename T>
     std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!is_owned()) return std::unexpected(Error::NotCopyable);
         const auto tname = detail::type_name<T>();
-        // One hierarchy walk: 0 for exact match or first base, nonzero for
-        // offset bases, nullopt if T is not the class or a base.
         auto off = is_base_of_with_offset(class_name_, tname);
         if (!off) return std::unexpected(Error::TypeError);
-        auto* adjusted = static_cast<char*>(ptr_.get()) + *off;
-        // Alias: share the control block with the original, point at the
-        // offset-adjusted T (via void* — the offset is computed from
-        // reflection metadata, not from the type system).
-        return std::shared_ptr<T>(ptr_, static_cast<T*>(static_cast<void*>(adjusted)));
+        auto* adjusted = static_cast<char*>(ptr_) + *off;
+        return std::shared_ptr<T>(owner_,
+                                  static_cast<T*>(static_cast<void*>(adjusted)));
     }
 
-    // Deep-copy the object through the type-erased handle.  Returns a
-    // new Object with independent ownership.  Returns Error::NotCopyable
-    // if the class is not copy-constructible, Error::NullHandle if invalid.
+    // Non-owning cast — returns a raw T* for both owned and non-owning
+    // Objects.  The caller must ensure the object stays alive.
+    template <typename T>
+    std::expected<T*, Error> cast_ref() const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        const auto tname = detail::type_name<T>();
+        auto off = is_base_of_with_offset(class_name_, tname);
+        if (!off) return std::unexpected(Error::TypeError);
+        auto* adjusted = static_cast<char*>(ptr_) + *off;
+        return static_cast<T*>(static_cast<void*>(adjusted));
+    }
+
     std::expected<Object, Error> clone() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!is_owned()) return std::unexpected(Error::NotCopyable);
         std::lock_guard<std::mutex> lk(pool_mutex());
-        auto it = class_pool().find(class_name_);
+        auto it = class_pool().find(std::string(class_name_));
         if (it == class_pool().end() || !it->second.clone)
             return std::unexpected(Error::NotCopyable);
-        auto copied = it->second.clone(ptr_.get());
+        auto copied = it->second.clone(ptr_);
         return Object(std::move(copied), class_name_);
     }
 
-    // Debug string: class name and pointer address.
     std::string to_string() const {
         if (!valid()) return "Object(invalid)";
-        return "Object(" + class_name_ + " @ " +
-               std::to_string(reinterpret_cast<std::uintptr_t>(ptr_.get())) + ")";
+        return "Object(" + std::string(class_name_) + " @ " +
+               std::to_string(reinterpret_cast<std::uintptr_t>(ptr_)) + ")";
     }
 
     bool valid() const { return ptr_ != nullptr; }
     explicit operator bool() const { return valid(); }
 
-private:
-    // Non-owning borrow of the internal pointer, for passing to invokers
-    // and getters/setters.  Only accessible to friend classes.
-    void* raw() { return ptr_.get(); }
-    const void* raw() const { return ptr_.get(); }
+    // Raw pointer to the object — for passing to invokers/getters/setters.
+    void* raw() const { return ptr_; }
+    const std::shared_ptr<void>& owner() const { return owner_; }
 
-    std::shared_ptr<void> ptr_;
-    std::string class_name_;
+private:
+    std::shared_ptr<void> owner_;
+    void* ptr_ = nullptr;
+    std::string_view class_name_;
 
     friend class Function;
     friend class Field;
 };
+
+// ---------------------------------------------------------------------------
+// detail templates that need Object to be complete.
+// Defined here (after Object) but still in namespace detail.
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+// Build an Object from a tuple element for the arg array.
+// Object args carry their class name natively; concrete types use
+// type_name<decay_t<Args>>.  Both are just Object construction.
+template <std::size_t I, typename Tuple>
+Object make_arg_ref(Tuple& storage) {
+    return Object(std::get<I>(storage));  // template ctor for concrete types,
+                                          // copy ctor for Object (keeps class_name)
+}
+
+template <typename... Args>
+std::expected<const Object*, Error>
+prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
+             std::array<Object, sizeof...(Args)>& refs,
+             std::size_t param_count, Args&&... args) {
+    if (sizeof...(Args) != param_count)
+        return std::unexpected(Error::ArityMismatch);
+    if constexpr (sizeof...(Args) == 0) {
+        return nullptr;
+    } else {
+        storage.emplace(std::forward<Args>(args)...);
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            using Tuple = std::tuple<std::decay_t<Args>...>;
+            ((refs[I] = make_arg_ref<I, Tuple>(*storage)), ...);
+        }(std::make_index_sequence<sizeof...(Args)>{});
+        return refs.data();
+    }
+}
+
+template <typename T, std::meta::info Ctor>
+Object factory(const Object* args) {
+    static constexpr auto params = std::define_static_array(
+        std::meta::parameters_of(Ctor));
+    constexpr std::size_t n = params.size();
+
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+        using P = [:std::meta::type_of(params[J]):];
+        using PBare = std::remove_cvref_t<P>;
+        constexpr auto param_type = type_name<PBare>();
+        if (args[J].class_name() != param_type) throw std::bad_cast{};
+        if constexpr (std::is_rvalue_reference_v<P>)
+            return std::move(*static_cast<PBare*>(args[J].raw()));
+        else
+            return *static_cast<PBare*>(args[J].raw());
+    };
+
+    return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
+        if constexpr (n == 0) {
+            return Object(std::make_shared<T>(), type_name<T>());
+        } else {
+            return Object(std::make_shared<T>(extract(std::integral_constant<std::size_t, I>{})...),
+                          type_name<T>());
+        }
+    }(std::make_index_sequence<n>{});
+}
+
+template <typename T, std::meta::info Fn>
+Object invoker(const std::shared_ptr<void>& owner, void* obj,
+               const Object* args) {
+    auto* target = static_cast<T*>(obj);
+    auto mfn = &[:Fn:];
+    static constexpr auto params = std::define_static_array(
+        std::meta::parameters_of(Fn));
+    constexpr std::size_t n = params.size();
+    using R = [:std::meta::return_type_of(Fn):];
+    using RStore = std::remove_cvref_t<R>;
+
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+        using P = [:std::meta::type_of(params[J]):];
+        using PBare = std::remove_cvref_t<P>;
+        constexpr auto param_type = type_name<PBare>();
+        if (args[J].class_name() != param_type) throw std::bad_cast{};
+        if constexpr (std::is_rvalue_reference_v<P>)
+            return std::move(*static_cast<PBare*>(args[J].raw()));
+        else
+            return *static_cast<PBare*>(args[J].raw());
+    };
+
+    return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
+        if constexpr (n == 0) {
+            if constexpr (std::is_void_v<R>) {
+                (target->*mfn)();
+                return Object{};
+            } else if constexpr (std::is_reference_v<R>) {
+                // Reference return: alias the owner's shared_ptr so the
+                // returned Object keeps the original alive.  For non-owning
+                // (stack) objects, owner is empty — the Object is non-owning.
+                auto& ref = (target->*mfn)();
+                return Object(owner, std::addressof(ref), type_name<RStore>());
+            } else {
+                return Object(std::make_shared<RStore>((target->*mfn)()),
+                             type_name<RStore>());
+            }
+        } else {
+            if constexpr (std::is_void_v<R>) {
+                (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
+                return Object{};
+            } else if constexpr (std::is_reference_v<R>) {
+                auto& ref = (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
+                return Object(owner, std::addressof(ref), type_name<RStore>());
+            } else {
+                return Object(std::make_shared<RStore>(
+                    (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...)),
+                    type_name<RStore>());
+            }
+        }
+    }(std::make_index_sequence<n>{});
+}
+
+template <typename T, std::meta::info Member>
+Object getter(void* obj) {
+    auto* target = static_cast<T*>(obj);
+    auto ptr = &[:Member:];
+    using MemberType = [:std::meta::type_of(Member):];
+    using StorageType = std::remove_const_t<std::remove_reference_t<MemberType>>;
+    return Object(std::make_shared<StorageType>(target->*ptr),
+                 type_name<StorageType>());
+}
+
+template <typename T, std::meta::info Member>
+void setter(void* obj, const Object* val) {
+    auto* target = static_cast<T*>(obj);
+    auto ptr = &[:Member:];
+    using MemberType = [:std::meta::type_of(Member):];
+    using MemberBare = std::remove_cvref_t<MemberType>;
+    constexpr auto member_type = type_name<MemberBare>();
+    if (val->class_name() != member_type) throw std::bad_cast{};
+    target->*ptr = std::move(*static_cast<MemberBare*>(val->raw()));
+}
+
+template <typename T, std::meta::info Member>
+Object static_getter() {
+    auto* ptr = &[:Member:];
+    using MemberType = [:std::meta::type_of(Member):];
+    using StorageType = std::remove_const_t<std::remove_reference_t<MemberType>>;
+    return Object(std::make_shared<StorageType>(*ptr),
+                 type_name<StorageType>());
+}
+
+template <typename T, std::meta::info Member>
+void static_setter(const Object* val) {
+    auto* ptr = &[:Member:];
+    using MemberType = [:std::meta::type_of(Member):];
+    using MemberBare = std::remove_cvref_t<MemberType>;
+    constexpr auto member_type = type_name<MemberBare>();
+    if (val->class_name() != member_type) throw std::bad_cast{};
+    *ptr = std::move(*static_cast<MemberBare*>(val->raw()));
+}
+
+template <typename T>
+std::shared_ptr<void> clone(void* obj) {
+    auto* src = static_cast<T*>(obj);
+    return std::make_shared<T>(*src);
+}
+
+template <typename T, std::meta::info Fn>
+Object static_invoker(const Object* args) {
+    auto fn = &[:Fn:];
+    static constexpr auto params = std::define_static_array(
+        std::meta::parameters_of(Fn));
+    constexpr std::size_t n = params.size();
+    using R = [:std::meta::return_type_of(Fn):];
+    using RStore = std::remove_cvref_t<R>;
+
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+        using P = [:std::meta::type_of(params[J]):];
+        using PBare = std::remove_cvref_t<P>;
+        constexpr auto param_type = type_name<PBare>();
+        if (args[J].class_name() != param_type) throw std::bad_cast{};
+        if constexpr (std::is_rvalue_reference_v<P>)
+            return std::move(*static_cast<PBare*>(args[J].raw()));
+        else
+            return *static_cast<PBare*>(args[J].raw());
+    };
+
+    return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
+        if constexpr (n == 0) {
+            if constexpr (std::is_void_v<R>) {
+                fn();
+                return Object{};
+            } else if constexpr (std::is_reference_v<R>) {
+                auto& ref = fn();
+                return Object(std::addressof(ref), type_name<RStore>());
+            } else {
+                return Object(std::make_shared<RStore>(fn()), type_name<RStore>());
+            }
+        } else {
+            if constexpr (std::is_void_v<R>) {
+                fn(extract(std::integral_constant<std::size_t, I>{})...);
+                return Object{};
+            } else if constexpr (std::is_reference_v<R>) {
+                auto& ref = fn(extract(std::integral_constant<std::size_t, I>{})...);
+                return Object(std::addressof(ref), type_name<RStore>());
+            } else {
+                return Object(std::make_shared<RStore>(
+                    fn(extract(std::integral_constant<std::size_t, I>{})...)),
+                    type_name<RStore>());
+            }
+        }
+    }(std::make_index_sequence<n>{});
+}
+
+template <typename Fn, typename... CallArgs>
+auto checked_call(Fn&& fn, CallArgs&&... args)
+    -> std::expected<decltype(fn(std::forward<CallArgs>(args)...)), Error> {
+    try {
+        if constexpr (std::is_void_v<decltype(fn(std::forward<CallArgs>(args)...))>) {
+            fn(std::forward<CallArgs>(args)...);
+            return {};
+        } else {
+            return fn(std::forward<CallArgs>(args)...);
+        }
+    } catch (const std::bad_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+}  // namespace detail
 
 // ---------------------------------------------------------------------------
 // make_info — gather all reflection metadata for T at compile time.
@@ -645,16 +752,22 @@ ClassInfo RegistrarHolder<T>::make_info() {
     info.name = std::string(std::meta::display_string_of(^^T));
 
     // Base classes — store name + byte offset within T.
+    // Only public bases are stored, so walk_bases (used by find_function,
+    // find_field, is_class, cast_safe, etc.) naturally skips protected
+    // and private inheritance.
     static constexpr auto bases = std::define_static_array(
         std::meta::bases_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto b : bases) {
-        info.bases.push_back({
-            std::string(std::meta::display_string_of(std::meta::type_of(b))),
-            std::meta::offset_of(b).bytes,
-        });
+        if constexpr (std::meta::is_public(b)) {
+            info.bases.push_back({
+                std::string(std::meta::display_string_of(std::meta::type_of(b))),
+                std::meta::offset_of(b).bytes,
+            });
+        }
     }
 
-    // Data members — generate getter/setter for each.
+    // Data members — generate getter/setter for each.  Store the byte
+    // offset for get_ref (works for all members, including move-only).
     static constexpr auto data_members = std::define_static_array(
         std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto m : data_members) {
@@ -664,11 +777,22 @@ ClassInfo RegistrarHolder<T>::make_info() {
             fi.name = std::string(std::meta::identifier_of(m));
             fi.type = std::string(
                 std::meta::display_string_of(std::meta::type_of(m)));
-            fi.getter = &detail::getter<T, m>;
+            fi.offset = std::meta::offset_of(m).bytes;
 
-            // No setter for const members.
             using MemberType = [:std::meta::type_of(m):];
-            if constexpr (std::is_const_v<MemberType>) {
+            using MemberBare = std::remove_cvref_t<MemberType>;
+
+            // Getter: only for copy-constructible members (getter copies
+            // into a shared_ptr).  Move-only members are get_ref-only.
+            if constexpr (std::is_copy_constructible_v<MemberBare>) {
+                fi.getter = &detail::getter<T, m>;
+            } else {
+                fi.getter = nullptr;
+            }
+
+            // Setter: skip const and non-copy-constructible members.
+            if constexpr (std::is_const_v<MemberType> ||
+                          !std::is_copy_constructible_v<MemberBare>) {
                 fi.setter = nullptr;
             } else {
                 fi.setter = &detail::setter<T, m>;
@@ -686,10 +810,18 @@ ClassInfo RegistrarHolder<T>::make_info() {
         fi.name = std::string(std::meta::identifier_of(m));
         fi.type = std::string(
             std::meta::display_string_of(std::meta::type_of(m)));
-        fi.getter = &detail::static_getter<T, m>;
 
         using MemberType = [:std::meta::type_of(m):];
-        if constexpr (std::is_const_v<MemberType>) {
+        using MemberBare = std::remove_cvref_t<MemberType>;
+
+        if constexpr (std::is_copy_constructible_v<MemberBare>) {
+            fi.getter = &detail::static_getter<T, m>;
+        } else {
+            fi.getter = nullptr;
+        }
+
+        if constexpr (std::is_const_v<MemberType> ||
+                      !std::is_copy_constructible_v<MemberBare>) {
             fi.setter = nullptr;
         } else {
             fi.setter = &detail::static_setter<T, m>;
@@ -735,14 +867,28 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.constructors.push_back(std::move(ci));
             }
-        } else if constexpr (std::meta::is_function(m) && std::meta::has_identifier(m)) {
+        } else if constexpr (std::meta::is_function(m) &&
+                            !std::meta::is_deleted(m) &&
+                            (std::meta::has_identifier(m) ||
+                             std::meta::is_operator_function(m))) {
             static constexpr auto fparams = std::define_static_array(
                 std::meta::parameters_of(m));
+
+            // Name: identifier for normal functions, "operator" + symbol
+            // for overloaded operators (including defaulted operator=).
+            std::string fname;
+            if constexpr (std::meta::has_identifier(m)) {
+                fname = std::string(std::meta::identifier_of(m));
+            } else {
+                constexpr auto op = std::meta::operator_of(m);
+                constexpr auto sym = std::meta::symbol_of(op);
+                fname = "operator" + std::string(sym);
+            }
 
             if constexpr (std::meta::is_static_member(m)) {
                 // Static member function — no obj pointer.
                 StaticFunctionInfo fi;
-                fi.name = std::string(std::meta::identifier_of(m));
+                fi.name = fname;
                 fi.return_type = std::string(
                     std::meta::display_string_of(std::meta::return_type_of(m)));
                 fi.invoker = &detail::static_invoker<T, m>;
@@ -754,7 +900,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 info.static_functions.push_back(std::move(fi));
             } else {
                 FunctionInfo fi;
-                fi.name = std::string(std::meta::identifier_of(m));
+                fi.name = fname;
                 fi.return_type = std::string(
                     std::meta::display_string_of(std::meta::return_type_of(m)));
                 fi.invoker = &detail::invoker<T, m>;
@@ -812,20 +958,19 @@ public:
 
     // Construct via the type-erased factory.  Returns Error::ArityMismatch
     // if the argument count doesn't match the constructor's parameter count,
-    // Error::TypeError if an argument's std::any type doesn't match the
-    // parameter type, Error::NullHandle if the handle is invalid.
+    // Error::TypeError if an argument's type doesn't match the parameter
+    // type, Error::NullHandle if the handle is invalid.
     template <typename... Args>
     std::expected<Object, Error> call(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& ci = owner_->constructors[idx_];
-        std::array<std::any, sizeof...(Args)> arg_anys;
-        auto args_ptr = detail::prepare_args(arg_anys, ci.param_types.size(),
+        std::optional<std::tuple<std::decay_t<Args>...>> storage;
+        std::array<Object, sizeof...(Args)> refs;
+        auto args_ptr = detail::prepare_args(storage, refs,
+                                             ci.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
-
-        auto result = detail::checked_call(ci.factory, *args_ptr);
-        if (!result) return std::unexpected(result.error());
-        return Object(std::move(*result), owner_->name);
+        return detail::checked_call(ci.factory, *args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -850,59 +995,27 @@ public:
         return owner_->functions[idx_].return_type;
     }
 
-    // Invoke on an Object — the type-erased owning handle from call().
+    // Invoke on any object — owned Object or stack/concrete instance.
     // Returns Error::TypeError if obj is not the function's class (or a
-    // derived class) or if an argument's std::any type doesn't match the
-    // parameter type, Error::ArityMismatch if the argument count is wrong,
+    // derived class) or if an argument's type doesn't match the parameter
+    // type, Error::ArityMismatch if the argument count is wrong,
     // Error::NullHandle if the handle is invalid.
+    // The return value is an Object; .valid() is false for void functions,
+    // .is_owned() is false for reference returns on non-owning inputs.
     template <typename... Args>
-    std::expected<std::any, Error> invoke(Object& obj, Args&&... args) const {
+    std::expected<Object, Error> invoke(Object obj, Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         const auto& fi = owner_->functions[idx_];
-        std::array<std::any, sizeof...(Args)> arg_anys;
-        auto args_ptr = detail::prepare_args(arg_anys, fi.param_types.size(),
+        std::optional<std::tuple<std::decay_t<Args>...>> storage;
+        std::array<Object, sizeof...(Args)> refs;
+        auto args_ptr = detail::prepare_args(storage, refs,
+                                             fi.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_call(fi.invoker, adj, *args_ptr);
-    }
-
-    // Invoke on a const Object — same as above, for const-correct call sites.
-    // The underlying object is accessed through shared_ptr<void> (mutable
-    // storage), so invoking through a const handle is safe.
-    template <typename... Args>
-    std::expected<std::any, Error> invoke(const Object& obj, Args&&... args) const {
-        if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!obj.valid()) return std::unexpected(Error::NullHandle);
-        const auto& fi = owner_->functions[idx_];
-        std::array<std::any, sizeof...(Args)> arg_anys;
-        auto args_ptr = detail::prepare_args(arg_anys, fi.param_types.size(),
-                                             std::forward<Args>(args)...);
-        if (!args_ptr) return std::unexpected(args_ptr.error());
-        void* adj = adjust_to_base(const_cast<Object&>(obj).raw(),
-                                   obj.class_name(), owner_->name);
-        if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_call(fi.invoker, adj, *args_ptr);
-    }
-
-    // Invoke on a concrete type — for when you have the real object already.
-    // Returns Error::TypeError if T is not the function's class or a class
-    // derived from it, Error::ArityMismatch if the argument count is wrong,
-    // Error::NullHandle if the handle is invalid.
-    template <typename T, typename... Args>
-    std::expected<std::any, Error> invoke(T& obj, Args&&... args) const {
-        if (!valid()) return std::unexpected(Error::NullHandle);
-        const auto& fi = owner_->functions[idx_];
-        std::array<std::any, sizeof...(Args)> arg_anys;
-        auto args_ptr = detail::prepare_args(arg_anys, fi.param_types.size(),
-                                             std::forward<Args>(args)...);
-        if (!args_ptr) return std::unexpected(args_ptr.error());
-        constexpr auto tname = detail::type_name<T>();
-        void* adj = adjust_to_base(static_cast<void*>(&obj), tname, owner_->name);
-        if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_call(fi.invoker, adj, *args_ptr);
+        return detail::checked_call(fi.invoker, obj.owner(), adj, *args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -922,40 +1035,48 @@ public:
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
     bool is_readonly() const { return owner_->fields[idx_].setter == nullptr; }
+    bool has_getter() const { return owner_->fields[idx_].getter != nullptr; }
 
-    // Get the field value from an Object.  Returns Error::TypeError if obj
-    // is not the field's class (or a derived class), Error::NullHandle if
-    // the handle is invalid.
-    std::expected<std::any, Error> get(Object& obj) const {
+    // Get the field value (copy).  Returns Error::TypeError if obj is not
+    // the field's class, Error::NullHandle if the handle is invalid,
+    // Error::NotCopyable if the field has no getter (move-only member).
+    std::expected<Object, Error> get(Object obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        if (!has_getter()) return std::unexpected(Error::NotCopyable);
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(owner_->fields[idx_].getter, adj);
     }
 
-    std::expected<std::any, Error> get(const Object& obj) const {
+    // Get a non-owning pointer to the field inside the object — works
+    // for all members including move-only.  The pointer is valid as long
+    // as the object is alive.  The caller casts void* to the member type.
+    // Returns Error::TypeError if obj is not the field's class,
+    // Error::NullHandle if the handle is invalid.
+    std::expected<void*, Error> get_ref(Object obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
-        void* adj = adjust_to_base(const_cast<Object&>(obj).raw(),
-                                   obj.class_name(), owner_->name);
+        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_call(owner_->fields[idx_].getter, adj);
+        return static_cast<char*>(adj) + owner_->fields[idx_].offset;
     }
 
-    // Set the field value on an Object.  Returns Error::ReadOnly if
-    // the field is read-only (const or bit-field), Error::TypeError if obj
-    // is not the field's class (or a derived class) or the std::any value's
-    // type doesn't match the field type, Error::NullHandle if the Field
-    // handle is invalid.
-    std::expected<void, Error> set(Object& obj, std::any val) const {
+    // Set the field value.  Returns Error::ReadOnly if the field is
+    // read-only (const, bit-field, or move-only), Error::TypeError if obj
+    // is not the field's class or the value's type doesn't match the
+    // field type, Error::NullHandle if the Field handle is invalid.
+    template <typename V>
+    std::expected<void, Error> set(Object obj, V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         if (is_readonly()) return std::unexpected(Error::ReadOnly);
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
+        std::decay_t<V> storage(std::forward<V>(val));
+        Object val_ref(&storage, detail::type_name<std::decay_t<V>>());
         return detail::checked_call(owner_->fields[idx_].setter,
-                                    adj, std::move(val));
+                                    adj, &val_ref);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -975,22 +1096,29 @@ public:
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
     bool is_readonly() const { return owner_->static_fields[idx_].setter == nullptr; }
+    bool has_getter() const { return owner_->static_fields[idx_].getter != nullptr; }
 
-    // Get the static field value.  Returns Error::NullHandle if the handle
-    // is invalid.
-    std::expected<std::any, Error> get() const {
+    // Get the static field value (copy).  Returns Error::NullHandle if
+    // the handle is invalid, Error::NotCopyable if the field has no
+    // getter (move-only static member).
+    std::expected<Object, Error> get() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!has_getter()) return std::unexpected(Error::NotCopyable);
         return detail::checked_call(owner_->static_fields[idx_].getter);
     }
 
     // Set the static field value.  Returns Error::ReadOnly if the field
-    // is read-only (const), Error::TypeError if the std::any value's type
-    // doesn't match the field type, Error::NullHandle if the handle is invalid.
-    std::expected<void, Error> set(std::any val) const {
+    // is read-only (const or move-only), Error::TypeError if the value's
+    // type doesn't match the field type, Error::NullHandle if the handle
+    // is invalid.
+    template <typename V>
+    std::expected<void, Error> set(V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (is_readonly()) return std::unexpected(Error::ReadOnly);
+        std::decay_t<V> storage(std::forward<V>(val));
+        Object val_ref(&storage, detail::type_name<std::decay_t<V>>());
         return detail::checked_call(owner_->static_fields[idx_].setter,
-                                    std::move(val));
+                                    &val_ref);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1016,15 +1144,18 @@ public:
     }
 
     // Invoke the static function.  Returns Error::ArityMismatch if the
-    // argument count is wrong, Error::TypeError if an argument's std::any
-    // type doesn't match the parameter type, Error::NullHandle if the
-    // handle is invalid.
+    // argument count is wrong, Error::TypeError if an argument's type
+    // doesn't match the parameter type, Error::NullHandle if the handle
+    // is invalid.  The return value is an Object; .valid() is false for
+    // void functions.
     template <typename... Args>
-    std::expected<std::any, Error> invoke(Args&&... args) const {
+    std::expected<Object, Error> invoke(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& sf = owner_->static_functions[idx_];
-        std::array<std::any, sizeof...(Args)> arg_anys;
-        auto args_ptr = detail::prepare_args(arg_anys, sf.param_types.size(),
+        std::optional<std::tuple<std::decay_t<Args>...>> storage;
+        std::array<Object, sizeof...(Args)> refs;
+        auto args_ptr = detail::prepare_args(storage, refs,
+                                             sf.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
         return detail::checked_call(sf.invoker, *args_ptr);

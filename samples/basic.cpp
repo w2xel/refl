@@ -47,12 +47,12 @@ int main() {
 
     // Construct.
     auto obj = *cls.find_constructor({"int", "int"})->call(3, 4);
-    std::printf("  object: %s\n", obj.class_name().c_str());
+    std::printf("  object: %.*s\n", static_cast<int>(obj.class_name().size()), obj.class_name().data());
 
     // Field get/set.
     auto wf = *cls.find_field("w");
-    std::printf("  field w = %d\n", std::any_cast<int>(*wf.get(obj)));
-    (void)wf.set(obj, std::any(10));
+    std::printf("  field w = %d\n", *wf.get(obj)->cast_safe<int>().value());
+    (void)wf.set(obj, 10);
 
     // Overloaded function resolution.
     auto resize2 = *cls.find_function("resize", {"int", "int"});
@@ -66,18 +66,18 @@ int main() {
 
     // Inherited method from Shape.
     auto inherited = cls.find_function("area");
-    std::printf("  area() = %d\n", std::any_cast<int>(*inherited->invoke(obj)));
+    std::printf("  area() = %d\n", *inherited->invoke(obj)->cast_safe<int>().value());
 
     // Safe cast.
     std::printf("  safe cast: w=%d h=%d\n", rect->w, rect->h);
 
     // Static data member.
     auto sf = *cls.find_static_field("total_created");
-    std::printf("  static field total_created = %d\n", std::any_cast<int>(*sf.get()));
+    std::printf("  static field total_created = %d\n", *sf.get()->cast_safe<int>().value());
 
     // Static member function.
     auto sfn = *cls.find_static_function("get_total");
-    std::printf("  static fn get_total() = %d\n", std::any_cast<int>(*sfn.invoke()));
+    std::printf("  static fn get_total() = %d\n", *sfn.invoke()->cast_safe<int>().value());
 
     // Enum reflection.
     auto e = *refl::find_enum("ShapeType");

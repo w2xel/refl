@@ -87,13 +87,14 @@ Initial implementation. The API above is working:
 - `Class::bases()` returns the direct base classes (name + byte offset within T).
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
   type-erased, shared-ownership handle.  No template parameter needed.
-- `Function::invoke(obj, args...)` calls the member function on an `Object`
-  (or on a concrete `T&` via `invoke<T>`) and returns `std::expected<std::any, Error>`.
+- `Function::invoke(obj, args...)` calls the member function on any object —
+  an owned `Object` or a stack/concrete instance — both via `ObjectRef`
+  (implicit conversion).  Returns `std::expected<std::any, Error>`.
   Returns `Error::TypeError` if the object is not the function's class (or a
   derived class), `Error::NullHandle` if the handle is invalid.
-- `Field::get(Object&)` returns the field value as `std::expected<std::any, Error>`,
-  with the same `Error::TypeError` / `Error::NullHandle` semantics.
-- `Field::set(Object&, std::any)` sets the field value.  Returns
+- `Field::get(obj)` and `Field::set(obj, std::any)` get/set the field on any
+  object (owned `Object` or stack/concrete instance, via `ObjectRef`).
+  `get` returns `std::expected<std::any, Error>`; `set` returns
   `Error::ReadOnly` for read-only (const or bit-field) fields, and
   `Error::TypeError` / `Error::NullHandle` as above.
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
@@ -120,6 +121,13 @@ Initial implementation. The API above is working:
 - `Object::clone()` deep-copies the object through the type-erased handle.
   Returns `Error::NotCopyable` if the class is not copy-constructible.
 - `Object::to_string()` returns a debug string with the class name and address.
+- `ObjectRef` is a non-owning borrow (void* + string_view class name) that works
+  with both owned `Object` instances and stack/concrete objects.  `Object`
+  converts to `ObjectRef` implicitly (lvalues only — temporaries are deleted
+  to prevent dangling).  `Function::invoke`, `Field::get`, and `Field::set`
+  all take `ObjectRef` by value, so a single overload each serves owned,
+  const-owned, and stack objects.  `ObjectRef::is_class("Name")` works the
+  same as `Object::is_class`.
 
 Type identity uses the fully-qualified name (`display_string_of`), so two
 classes with the same unqualified name in different namespaces do not collide
@@ -139,10 +147,22 @@ Limitations (marked with `ponytail:` in the source):
 
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
 - Const data members (static and non-static) are read-only (getter only, no setter).
+- Move-only data members (e.g. `unique_ptr`) have no getter or setter — use
+  `Field::get_ref()` to access them by pointer.  Registration no longer fails
+  to compile for classes with move-only members.
+- Functions with reference return types (e.g. `operator=`, `operator+=`)
+  are invoked but the return is ignored (invalid `Object` returned).
+- Deleted functions are skipped (not registered).
 - Multiple inheritance is supported — base-class pointer adjustment uses
   `offset_of` at registration time, accumulated through the base hierarchy.
-  Virtual inheritance is not supported (`offset_of` is not constant for
+  Only public inheritance is walked — protected and private bases are not
+  stored, so `find_function`, `find_field`, `is_class`, and `cast_safe` skip
+  them.  Virtual inheritance is not supported (`offset_of` is not constant for
   virtual bases); virtual base hierarchies will fail to register correctly.
+- Overloaded operators (`operator+`, `operator==`, `operator[]`, `operator()`,
+  `operator+=`, `operator=`, etc.) are registered as functions, findable by
+  name (`"operator+"`, `"operator=="`, etc.).  Conversion operators and the
+  destructor are not registered.
 - Clone requires a copy constructor — non-copyable classes return
   `Error::NotCopyable`.
 - Registration is static-init order dependent — `find_class` only works after

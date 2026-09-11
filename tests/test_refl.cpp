@@ -69,6 +69,26 @@ struct Deep : Mid {
     int dmethod() const { return dp; }
 };
 
+// Operator support: operator+, operator==, operator[], operator+=
+struct Vec {
+    int x, y;
+    Vec(int x, int y) : x(x), y(y) {}
+    Vec operator+(const Vec& o) const { return Vec(x + o.x, y + o.y); }
+    bool operator==(const Vec& o) const { return x == o.x && y == o.y; }
+    int operator[](int i) const { return i == 0 ? x : y; }
+    Vec& operator+=(const Vec& o) { x += o.x; y += o.y; return *this; }
+};
+
+// Public-only base walking: public, protected, private inheritance
+struct PubBase { int pv; PubBase() : pv(0) {} PubBase(int v) : pv(v) {} int pmethod() const { return pv; } };
+struct ProtBase { int rv; ProtBase() : rv(0) {} ProtBase(int v) : rv(v) {} int rmethod() const { return rv; } };
+struct PrivBase { int iv; PrivBase() : iv(0) {} PrivBase(int v) : iv(v) {} int imethod() const { return iv; } };
+
+struct AccessMixed : public PubBase, protected ProtBase, private PrivBase {
+    int m;
+    AccessMixed(int p, int r, int i, int m) : PubBase(p), ProtBase(r), PrivBase(i), m(m) {}
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -80,6 +100,11 @@ struct Deep : Mid {
 [[maybe_unused]] static refl::Reg<Diamond> reg_diamond;
 [[maybe_unused]] static refl::Reg<Mid> reg_mid;
 [[maybe_unused]] static refl::Reg<Deep> reg_deep;
+[[maybe_unused]] static refl::Reg<Vec> reg_vec;
+[[maybe_unused]] static refl::Reg<PubBase> reg_pub;
+[[maybe_unused]] static refl::Reg<ProtBase> reg_prot;
+[[maybe_unused]] static refl::Reg<PrivBase> reg_priv;
+[[maybe_unused]] static refl::Reg<AccessMixed> reg_access_mixed;
 
 struct Wrong {};
 
@@ -149,7 +174,7 @@ int main() {
     auto wrong_get = cls.find_field("x")->get(base_obj);
     CHECK(!wrong_get.has_value(), "get on wrong-class object should fail");
     CHECK(wrong_get.error() == refl::Error::TypeError, "should be TypeError");
-    auto wrong_set = cls.find_field("x")->set(base_obj, std::any(1));
+    auto wrong_set = cls.find_field("x")->set(base_obj, 1);
     CHECK(!wrong_set.has_value(), "set on wrong-class object should fail");
     CHECK(wrong_set.error() == refl::Error::TypeError, "should be TypeError");
 
@@ -166,26 +191,26 @@ int main() {
     CHECK(overloads.size() == 2, "should find 2 overloads of set");
 
     // --- invoke overloaded ---
-    std::any r1 = *set1->invoke(obj, 50);
+    auto r1 = *set1->invoke(obj, 50);
     CHECK(p->x == 50, "after set(50), x should be 50");
-    std::any r2 = *set2->invoke(obj, 10, 20);
+    auto r2 = *set2->invoke(obj, 10, 20);
     CHECK(p->x == 10, "after set(10,20), x should be 10");
     CHECK(p->y == 20, "after set(10,20), y should be 20");
 
     // --- function on Object ---
     auto fn = *cls.find_function("sum");
-    CHECK(std::any_cast<int>(*fn.invoke(obj)) == 30, "sum(10,20) should be 30");
+    CHECK(*fn.invoke(obj)->cast_safe<int>().value() == 30, "sum(10,20) should be 30");
 
     // --- field get/set ---
     auto xf = *cls.find_field("x");
-    CHECK(std::any_cast<int>(*xf.get(obj)) == 10, "field get x should be 10");
-    (void)xf.set(obj, std::any(77));
+    CHECK(*xf.get(obj)->cast_safe<int>().value() == 10, "field get x should be 10");
+    (void)xf.set(obj, 77);
     CHECK(p->x == 77, "after field set, x should be 77");
 
     // --- readonly field ---
     auto idf = *cls.find_field("id");
     CHECK(idf.is_readonly(), "id should be readonly");
-    auto set_id = idf.set(obj, std::any(99));
+    auto set_id = idf.set(obj, 99);
     CHECK(!set_id.has_value(), "set on readonly should fail");
     CHECK(set_id.error() == refl::Error::ReadOnly, "should be ReadOnly");
 
@@ -201,12 +226,12 @@ int main() {
     // inherited method from Base
     auto base_fn = cls.find_function("base_method");
     CHECK(base_fn.has_value(), "find_function should find inherited base_method");
-    std::any base_ret = *base_fn->invoke(obj);
-    CHECK(std::any_cast<int>(base_ret) == 2, "base_method on Point(77) should be 154... wait");
+    auto base_ret = *base_fn->invoke(obj);
+    CHECK(*base_ret.cast_safe<int>().value() == 2, "base_method on Point(77) should be 154... wait");
 
     // base_method returns base_val * 2, and Base was constructed with x=1 in Point(1,3)
     // Wait — Point(1,3) calls Base(x) so Base::base_val = 1, base_method = 2
-    CHECK(std::any_cast<int>(base_ret) == 2, "base_method should be 2 (base_val=1)");
+    CHECK(*base_ret.cast_safe<int>().value() == 2, "base_method should be 2 (base_val=1)");
 
     // --- enum reflection ---
     auto enums = refl::list_all_enums();
@@ -241,17 +266,17 @@ int main() {
     CHECK(sf->name() == "instance_count", "static field name");
     CHECK(!sf->is_readonly(), "instance_count should not be readonly");
     // Point(1,3) was constructed once, so instance_count should be 1
-    CHECK(std::any_cast<int>(*sf->get()) == 1, "instance_count should be 1");
+    CHECK(*sf->get()->cast_safe<int>().value() == 1, "instance_count should be 1");
 
-    (void)sf->set(std::any(42));
-    CHECK(std::any_cast<int>(*sf->get()) == 42, "after set, instance_count should be 42");
+    (void)sf->set(42);
+    CHECK(*sf->get()->cast_safe<int>().value() == 42, "after set, instance_count should be 42");
 
     // readonly static field (const)
     auto maxf = cls.find_static_field("max_instances");
     CHECK(maxf.has_value(), "find_static_field(\"max_instances\") should succeed");
     CHECK(maxf->is_readonly(), "max_instances should be readonly (const)");
-    CHECK(std::any_cast<int>(*maxf->get()) == 100, "max_instances should be 100");
-    auto set_max = maxf->set(std::any(200));
+    CHECK(*maxf->get()->cast_safe<int>().value() == 100, "max_instances should be 100");
+    auto set_max = maxf->set(200);
     CHECK(!set_max.has_value(), "set on readonly static should fail");
     CHECK(set_max.error() == refl::Error::ReadOnly, "should be ReadOnly");
 
@@ -259,14 +284,14 @@ int main() {
     auto sf_count = cls.find_static_function("get_instance_count");
     CHECK(sf_count.has_value(), "find_static_function(\"get_instance_count\") should succeed");
     CHECK(sf_count->return_type() == "int", "get_instance_count returns int");
-    std::any sc_ret = *sf_count->invoke();
-    CHECK(std::any_cast<int>(sc_ret) == 42, "get_instance_count should be 42");
+    auto sc_ret = *sf_count->invoke();
+    CHECK(*sc_ret.cast_safe<int>().value() == 42, "get_instance_count should be 42");
 
     auto sf_reset = cls.find_static_function("reset_count");
     CHECK(sf_reset.has_value(), "find_static_function(\"reset_count\") should succeed");
     auto sr_ret = sf_reset->invoke();
     CHECK(sr_ret.has_value(), "reset_count should succeed");
-    CHECK(!sr_ret->has_value(), "reset_count returns void, any should be empty");
+    CHECK(!sr_ret->valid(), "reset_count returns void, Object should be invalid");
     CHECK(Point::instance_count == 0, "after reset_count, instance_count should be 0");
 
     // --- constructors enumeration ---
@@ -309,7 +334,7 @@ int main() {
     CHECK(cloned_p->x == 77, "cloned x should match original (77)");
     CHECK(cloned_p->y == 20, "cloned y should match original (20)");
     // modifying clone should not affect original
-    (void)xf.set(cloned, std::any(999));
+    (void)xf.set(cloned, 999);
     CHECK(p->x == 77, "original x should still be 77 after modifying clone");
     CHECK(cloned_p->x == 999, "cloned x should be 999");
 
@@ -368,7 +393,7 @@ int main() {
     CHECK(bad_arity.error() == refl::Error::ArityMismatch, "wrong arity invoke should be ArityMismatch");
 
     // Wrong any type → TypeError (not bad_any_cast throw).
-    auto bad_type = fn2.invoke(obj, std::any(1.5), std::any(2));
+    auto bad_type = fn2.invoke(obj, 1.5, 2);
     CHECK(!bad_type.has_value(), "invoke with wrong arg type should fail");
     CHECK(bad_type.error() == refl::Error::TypeError, "wrong arg type should be TypeError");
 
@@ -378,7 +403,7 @@ int main() {
     CHECK(bad_sfn.error() == refl::Error::ArityMismatch, "static wrong arity should be ArityMismatch");
 
     // Field set with wrong any type → TypeError.
-    auto bad_field = xf.set(obj, std::any(3.14));
+    auto bad_field = xf.set(obj, 3.14);
     CHECK(!bad_field.has_value(), "field set with wrong type should fail");
     CHECK(bad_field.error() == refl::Error::TypeError, "field wrong type should be TypeError");
 
@@ -403,18 +428,18 @@ int main() {
 
     // Invoke inherited methods through the type-erased path.
     auto lfn = *dia_cls.find_function("lmethod");
-    CHECK(std::any_cast<int>(*lfn.invoke(dia_obj)) == 30, "lmethod via invoke should be 30");
+    CHECK(*lfn.invoke(dia_obj)->cast_safe<int>().value() == 30, "lmethod via invoke should be 30");
     auto rfn = *dia_cls.find_function("rmethod");
-    CHECK(std::any_cast<int>(*rfn.invoke(dia_obj)) == 100, "rmethod via invoke should be 100");
+    CHECK(*rfn.invoke(dia_obj)->cast_safe<int>().value() == 100, "rmethod via invoke should be 100");
 
     // Get/set inherited fields through the type-erased path.
     auto lfield = *dia_cls.find_field("lv");
-    CHECK(std::any_cast<int>(*lfield.get(dia_obj)) == 10, "field get lv should be 10");
+    CHECK(*lfield.get(dia_obj)->cast_safe<int>().value() == 10, "field get lv should be 10");
     auto rfield = *dia_cls.find_field("rv");
-    CHECK(std::any_cast<int>(*rfield.get(dia_obj)) == 20, "field get rv should be 20");
-    (void)lfield.set(dia_obj, std::any(99));
+    CHECK(*rfield.get(dia_obj)->cast_safe<int>().value() == 20, "field get rv should be 20");
+    (void)lfield.set(dia_obj, 99);
     CHECK(lp.value()->lv == 99, "after field set lv=99, Left::lv should be 99");
-    (void)rfield.set(dia_obj, std::any(88));
+    (void)rfield.set(dia_obj, 88);
     CHECK(rp.value()->rv == 88, "after field set rv=88, Right::rv should be 88");
 
     // === 3-level transitive: Deep -> Mid -> {Left, Right} ===
@@ -434,7 +459,95 @@ int main() {
 
     // Inherited method 2 levels up.
     auto deep_lfn = *refl::find_class("Deep")->find_function("lmethod");
-    CHECK(std::any_cast<int>(*deep_lfn.invoke(deep_obj)) == 3, "transitive lmethod via invoke should be 3");
+    CHECK(*deep_lfn.invoke(deep_obj)->cast_safe<int>().value() == 3, "transitive lmethod via invoke should be 3");
+
+    // === ObjectRef: field get/set and invoke on stack objects ===
+    // No Object, no shared_ptr — just a concrete instance on the stack.
+    Point stack_point(100, 200);
+
+    // Field get on stack object — previously impossible (Field::get needed Object).
+    auto stack_x = cls.find_field("x")->get(stack_point);
+    CHECK(stack_x.has_value(), "field get on stack object should succeed");
+    CHECK(*stack_x->cast_safe<int>().value() == 100, "stack field get x should be 100");
+
+    // Field set on stack object — previously impossible.
+    (void)cls.find_field("x")->set(stack_point, 555);
+    CHECK(stack_point.x == 555, "stack field set x should be 555");
+
+    // Invoke on stack object — previously needed invoke<T> overload.
+    auto stack_sum = cls.find_function("sum")->invoke(stack_point);
+    CHECK(stack_sum.has_value(), "invoke on stack object should succeed");
+    CHECK(*stack_sum->cast_safe<int>().value() == 755, "stack invoke sum should be 755 (555+200)");
+
+    // === Operators ===
+    auto vec_cls = *refl::find_class("Vec");
+    auto v1 = *vec_cls.find_constructor({"int", "int"})->call(3, 4);
+    auto v2 = *vec_cls.find_constructor({"int", "int"})->call(1, 2);
+
+    // operator+ — returns Vec by value
+    auto add = vec_cls.find_function("operator+");
+    CHECK(add.has_value(), "find operator+ should succeed");
+    auto add_ret = add->invoke(v1, v2);
+    CHECK(add_ret.has_value(), "invoke operator+ should succeed");
+    CHECK(add_ret->valid(), "operator+ returns a value");
+    auto add_obj = add_ret->cast_safe<Vec>().value();
+    CHECK(add_obj->x == 4, "operator+ x should be 4");
+    CHECK(add_obj->y == 6, "operator+ y should be 6");
+
+    // operator== — returns bool
+    auto eq = vec_cls.find_function("operator==");
+    CHECK(eq.has_value(), "find operator== should succeed");
+    auto eq_ret = eq->invoke(v1, v2);
+    CHECK(eq_ret.has_value() && eq_ret->valid(), "operator== returns a value");
+    CHECK(*eq_ret->cast_safe<bool>().value() == false, "3,4 != 1,2");
+
+    // operator[] — returns int
+    auto idx = vec_cls.find_function("operator[]");
+    CHECK(idx.has_value(), "find operator[] should succeed");
+    auto idx_ret = idx->invoke(v1, 0);
+    CHECK(*idx_ret->cast_safe<int>().value() == 3, "operator[](0) should be 3");
+
+    // operator+= — returns Vec& (reference), valid non-owning Object + mutation
+    auto pe = vec_cls.find_function("operator+=");
+    CHECK(pe.has_value(), "find operator+= should succeed");
+    auto pe_ret = pe->invoke(v1, v2);
+    CHECK(pe_ret.has_value(), "invoke operator+= should succeed");
+    CHECK(pe_ret->valid(), "operator+= returns reference, Object should be valid");
+    CHECK(pe_ret->is_owned(), "operator+= on owned Object returns aliasing (owned) Object");
+    // The returned reference points at v1 (the object += was called on).
+    auto pe_ref = pe_ret->cast_ref<Vec>().value();
+    CHECK(pe_ref->x == 4, "operator+= return x should be 4");
+    CHECK(pe_ref->y == 6, "operator+= return y should be 6");
+    // Mutation should have happened on v1.
+    auto vp = v1.cast_safe<Vec>().value();
+    CHECK(vp->x == 4, "after += x should be 4");
+    CHECK(vp->y == 6, "after += y should be 6");
+
+    // operator= (defaulted) — should be findable
+    auto assign = vec_cls.find_function("operator=");
+    CHECK(assign.has_value(), "find operator= should succeed");
+
+    // === Public-only base walking ===
+    auto am_cls = *refl::find_class("AccessMixed");
+    auto am_obj = *am_cls.find_constructor({"int", "int", "int", "int"})->call(10, 20, 30, 40);
+
+    CHECK(am_obj.is_class("PubBase"), "is_class PubBase (public) should be true");
+    CHECK(!am_obj.is_class("ProtBase"), "is_class ProtBase (protected) should be false");
+    CHECK(!am_obj.is_class("PrivBase"), "is_class PrivBase (private) should be false");
+
+    auto pub_cast = am_obj.cast_safe<PubBase>();
+    CHECK(pub_cast.has_value(), "cast_safe<PubBase> should succeed");
+    CHECK(pub_cast.value()->pv == 10, "PubBase::pv should be 10");
+
+    CHECK(!am_obj.cast_safe<ProtBase>().has_value(), "cast_safe<ProtBase> should fail");
+    CHECK(!am_obj.cast_safe<PrivBase>().has_value(), "cast_safe<PrivBase> should fail");
+
+    auto pfn = am_cls.find_function("pmethod");
+    CHECK(pfn.has_value(), "find pmethod from public base should succeed");
+    CHECK(*pfn->invoke(am_obj)->cast_safe<int>().value() == 10, "pmethod should be 10");
+
+    CHECK(!am_cls.find_function("rmethod").has_value(), "find rmethod from protected base should fail");
+    CHECK(!am_cls.find_function("imethod").has_value(), "find imethod from private base should fail");
 
     std::printf("refl core API test ok\n");
     return 0;
