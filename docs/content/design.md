@@ -108,6 +108,8 @@ Initial implementation. The API above is working:
   `set` takes a typed value (no `std::any` needed) and returns
   `Error::ReadOnly` for read-only (const, bit-field, or move-only) fields,
   and `Error::TypeError` / `Error::NullHandle` as above.
+  Like `invoke`, `set` upcasts a derived-class value to a base-class field
+  (the value is adjusted to the base subobject before copying).
 - `Field::get_ref(obj)` returns `std::expected<void*, Error>` — a non-owning
   pointer into the field inside the object.  Works for all members including
   move-only (unique_ptr).  The caller casts `void*` to the member type.
@@ -174,7 +176,7 @@ comparison (no RTTI), and the project compiles with `-Wconversion
 -Wsign-conversion`, so silent widening at the reflection boundary would
 contradict the codebase's own stance on implicit conversions.
 
-Limitations (marked with `ponytail:` in the source):
+Limitations:
 
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
 - Const data members (static and non-static) are read-only (getter only, no setter).

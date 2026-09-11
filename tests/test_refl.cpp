@@ -96,6 +96,21 @@ struct Receiver {
     int add_base(Base b) { acc += b.base_val; return acc; }
 };
 
+// Class with a deleted default constructor — registration must not fail.
+struct NoDefault {
+    NoDefault() = delete;
+    NoDefault(int v) : v(v) {}
+    int v;
+    int get() const { return v; }
+};
+
+// Class with a class-typed field — used to test field-set upcast.
+struct Holder {
+    Base b;
+    Holder() : b() {}
+    Holder(int v) : b(v) {}
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -113,6 +128,8 @@ struct Receiver {
 [[maybe_unused]] static refl::Reg<PrivBase> reg_priv;
 [[maybe_unused]] static refl::Reg<AccessMixed> reg_access_mixed;
 [[maybe_unused]] static refl::Reg<Receiver> reg_receiver;
+[[maybe_unused]] static refl::Reg<NoDefault> reg_nodefault;
+[[maybe_unused]] static refl::Reg<Holder> reg_holder;
 
 struct Wrong {};
 
@@ -599,6 +616,31 @@ int main() {
 
     CHECK(!am_cls.find_function("rmethod").has_value(), "find rmethod from protected base should fail");
     CHECK(!am_cls.find_function("imethod").has_value(), "find imethod from private base should fail");
+
+    // === Deleted constructor: registration must not fail ===
+    auto nd_cls = *refl::find_class("NoDefault");
+    auto nd_obj = nd_cls.find_constructor({"int"})->call(42);
+    CHECK(nd_obj.has_value(), "class with deleted default ctor should register and construct");
+    auto nd_ret = *nd_cls.find_function("get")->invoke(*nd_obj);
+    CHECK(*nd_ret.cast_safe<int>().value() == 42, "NoDefault get() should return 42");
+    CHECK(nd_cls.constructors().size() == 1, "NoDefault should have 1 registered ctor");
+
+    // === Field set with derived-to-base value (upcast, matching invoke) ===
+    auto holder_cls = *refl::find_class("Holder");
+    auto holder = *holder_cls.find_constructor({"int"})->call(5);
+    auto bfield = holder_cls.find_field("b");
+    CHECK(bfield.has_value(), "find field b on Holder should succeed");
+    // stack_point is a Point (derives from Base) — set should upcast + slice.
+    auto set_derived = bfield->set(holder, stack_point);
+    CHECK(set_derived.has_value(), "field set with derived value should upcast and succeed");
+    auto holder_b = holder.cast_safe<Holder>().value();
+    CHECK(holder_b->b.base_val == 100, "field set from Point should see base_val=100 (upcast + slice)");
+    // Exact-type set still works.
+    auto base_for_set = *base_cls.find_constructor({"int"})->call(7);
+    auto base_sp = base_for_set.cast_safe<Base>().value();
+    auto set_exact = bfield->set(holder, *base_sp);
+    CHECK(set_exact.has_value(), "field set with exact Base value should succeed");
+    CHECK(holder_b->b.base_val == 7, "after exact set, base_val should be 7");
 
     std::printf("refl core API test ok\n");
     return 0;

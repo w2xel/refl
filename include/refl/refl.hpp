@@ -671,8 +671,13 @@ void setter(void* obj, const Object* val) {
     using MemberType = [:std::meta::type_of(Member):];
     using MemberBare = std::remove_cvref_t<MemberType>;
     constexpr auto member_type = type_name<MemberBare>();
-    if (val->class_name() != member_type) throw std::bad_cast{};
-    target->*ptr = std::move(*static_cast<MemberBare*>(val->raw()));
+    void* src = val->raw();
+    if (val->class_name() != member_type) {
+        auto off = is_base_of_with_offset(val->class_name(), member_type);
+        if (!off) throw std::bad_cast{};
+        src = static_cast<char*>(src) + *off;
+    }
+    target->*ptr = std::move(*static_cast<MemberBare*>(src));
 }
 
 template <typename T, std::meta::info Member>
@@ -690,8 +695,13 @@ void static_setter(const Object* val) {
     using MemberType = [:std::meta::type_of(Member):];
     using MemberBare = std::remove_cvref_t<MemberType>;
     constexpr auto member_type = type_name<MemberBare>();
-    if (val->class_name() != member_type) throw std::bad_cast{};
-    *ptr = std::move(*static_cast<MemberBare*>(val->raw()));
+    void* src = val->raw();
+    if (val->class_name() != member_type) {
+        auto off = is_base_of_with_offset(val->class_name(), member_type);
+        if (!off) throw std::bad_cast{};
+        src = static_cast<char*>(src) + *off;
+    }
+    *ptr = std::move(*static_cast<MemberBare*>(src));
 }
 
 template <typename T>
@@ -851,7 +861,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
         std::meta::members_of(^^T, std::meta::access_context::unchecked()));
 
     template for (constexpr auto m : all_members) {
-        if constexpr (std::meta::is_constructor(m)) {
+        if constexpr (std::meta::is_constructor(m) &&
+                      !std::meta::is_deleted(m)) {
             static constexpr auto params = std::define_static_array(
                 std::meta::parameters_of(m));
             constexpr std::size_t n = params.size();
@@ -1098,8 +1109,8 @@ public:
 
     // Set the field value.  Returns Error::ReadOnly if the field is
     // read-only (const, bit-field, or move-only), Error::TypeError if obj
-    // is not the field's class or the value's type doesn't match the
-    // field type, Error::NullHandle if the Field handle is invalid.
+    // is not the field's class or the value's type doesn't match or derive
+    // from the field type, Error::NullHandle if the Field handle is invalid.
     template <typename V>
     std::expected<void, Error> set(Object obj, V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
@@ -1143,8 +1154,8 @@ public:
 
     // Set the static field value.  Returns Error::ReadOnly if the field
     // is read-only (const or move-only), Error::TypeError if the value's
-    // type doesn't match the field type, Error::NullHandle if the handle
-    // is invalid.
+    // type doesn't match or derive from the field type, Error::NullHandle
+    // if the handle is invalid.
     template <typename V>
     std::expected<void, Error> set(V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
