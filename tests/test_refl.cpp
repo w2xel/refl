@@ -860,6 +860,52 @@ int main() {
     CHECK(nvd_ret.has_value(), "invoke fn on NVDerived should succeed");
     CHECK(*nvd_ret->cast_safe<int>().value() == 35, "non-virtual hide should call base fn (5*7)");
 
+    // === all_functions(): merged view across hierarchy ===
+    // Point has sum, set, set (3 own — operator= is deleted due to const
+    // id member); Base has base_method, operator=, operator= (3 inherited).
+    // functions() returns only Point's own; all_functions() includes Base's.
+    CHECK(cls.functions().size() == 3, "functions() should have 3 (sum, set, set)");
+    auto all_fns = cls.all_functions();
+    CHECK(all_fns.size() == 6, "all_functions() should have 6 (3 own + 3 inherited from Base)");
+
+    // Verify base_method is present in the merged view.
+    bool all_has_base_method = false;
+    for (const auto& fi : all_fns)
+        if (fi.name == "base_method") all_has_base_method = true;
+    CHECK(all_has_base_method, "all_functions() should include inherited base_method");
+
+    // FunctionInfo -> Function conversion: wrap an info and invoke.
+    // Find base_method in the merged vector and invoke it.
+    for (const auto& fi : all_fns) {
+        if (fi.name == "base_method") {
+            refl::Function f(fi);
+            CHECK(f.valid(), "Function from FunctionInfo should be valid");
+            auto ret = f.invoke(obj);
+            CHECK(ret.has_value(), "invoke via FunctionInfo-constructed Function should succeed");
+            CHECK(*ret->cast_safe<int>().value() == 2, "base_method via all_functions + conversion should be 2");
+            break;
+        }
+    }
+
+    // === all_static_functions(): merged view across hierarchy ===
+    // StaticChild has none; StaticBase has sbval (1 inherited).
+    auto sc_cls2 = *refl::find_class("StaticChild");
+    CHECK(sc_cls2.static_functions().empty(), "StaticChild has 0 own static functions");
+    auto all_sfns = sc_cls2.all_static_functions();
+    CHECK(all_sfns.size() == 1, "all_static_functions() should have 1 (sbval from StaticBase)");
+
+    // StaticFunctionInfo -> StaticFunction conversion: wrap and invoke.
+    for (const auto& sfi : all_sfns) {
+        if (sfi.name == "sbval") {
+            refl::StaticFunction sf(sfi);
+            CHECK(sf.valid(), "StaticFunction from StaticFunctionInfo should be valid");
+            auto ret = sf.invoke();
+            CHECK(ret.has_value(), "invoke via StaticFunctionInfo-constructed StaticFunction should succeed");
+            CHECK(*ret->cast_safe<int>().value() == 7, "sbval via all_static_functions + conversion should be 7");
+            break;
+        }
+    }
+
     std::printf("refl core API test ok\n");
     return 0;
 }

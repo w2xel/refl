@@ -92,9 +92,14 @@ using StaticSetterFn  = void  (*)(const Object* val);
 using StaticInvokerFn = Object (*)(const Object* args);
 using CloneFn         = std::shared_ptr<void> (*)(void* obj);
 
+// Forward declaration — *Info structs carry a back-pointer to their owner.
+struct ClassInfo;
+
 struct ConstructorInfo {
     std::vector<std::string> param_types;
     FactoryFn factory;
+    const ClassInfo* owner = nullptr;  // set by Registrar after pool insertion
+    std::size_t index = 0;             // position within ClassInfo::constructors
 };
 
 struct FunctionInfo {
@@ -102,6 +107,8 @@ struct FunctionInfo {
     std::vector<std::string> param_types;
     std::string return_type;
     InvokerFn invoker;
+    const ClassInfo* owner = nullptr;
+    std::size_t index = 0;
 };
 
 struct StaticFunctionInfo {
@@ -109,6 +116,8 @@ struct StaticFunctionInfo {
     std::vector<std::string> param_types;
     std::string return_type;
     StaticInvokerFn invoker;
+    const ClassInfo* owner = nullptr;
+    std::size_t index = 0;
 };
 
 struct FieldInfo {
@@ -117,6 +126,8 @@ struct FieldInfo {
     std::ptrdiff_t offset;  // byte offset of member within T (for get_ref)
     GetterFn getter;        // nullptr if move-only
     SetterFn setter;        // nullptr for const / bit-field / move-only
+    const ClassInfo* owner = nullptr;
+    std::size_t index = 0;
 };
 
 struct StaticFieldInfo {
@@ -124,6 +135,8 @@ struct StaticFieldInfo {
     std::string type;
     StaticGetterFn getter;
     StaticSetterFn setter;  // nullptr for const members
+    const ClassInfo* owner = nullptr;
+    std::size_t index = 0;
 };
 
 struct BaseInfo {
@@ -170,10 +183,31 @@ inline std::mutex& pool_mutex() {
     return m;
 }
 
+// Stamp owner back-pointer and index on every member-info vector after
+// the ClassInfo is placed in the pool (where its address is stable).
+// This lets any *Info (original or copy) be wrapped into a handle.
+namespace detail {
+template <typename T>
+void stamp_owner(std::vector<T>& vec, const ClassInfo* owner) {
+    for (std::size_t i = 0; i < vec.size(); ++i) {
+        vec[i].owner = owner;
+        vec[i].index = i;
+    }
+}
+inline void stamp_all(ClassInfo& ci) {
+    stamp_owner(ci.constructors, &ci);
+    stamp_owner(ci.fields, &ci);
+    stamp_owner(ci.static_fields, &ci);
+    stamp_owner(ci.functions, &ci);
+    stamp_owner(ci.static_functions, &ci);
+}
+}  // namespace detail
+
 struct Registrar {
     explicit Registrar(const ClassInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        class_pool()[info.name] = info;
+        auto& stored = class_pool()[info.name] = info;
+        detail::stamp_all(stored);
     }
 };
 
@@ -953,6 +987,8 @@ public:
     Constructor() = default;
     Constructor(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
+    explicit Constructor(const ConstructorInfo& ci)
+        : owner_(ci.owner), idx_(ci.index) {}
 
     const std::vector<std::string>& param_types() const {
         return owner_->constructors[idx_].param_types;
@@ -988,6 +1024,8 @@ public:
     Function() = default;
     Function(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
+    explicit Function(const FunctionInfo& fi)
+        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1033,6 +1071,8 @@ public:
     Field() = default;
     Field(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
+    explicit Field(const FieldInfo& fi)
+        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
@@ -1112,6 +1152,8 @@ public:
     StaticField() = default;
     StaticField(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
+    explicit StaticField(const StaticFieldInfo& fi)
+        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
@@ -1154,6 +1196,8 @@ public:
     StaticFunction() = default;
     StaticFunction(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
+    explicit StaticFunction(const StaticFunctionInfo& fi)
+        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->static_functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1275,6 +1319,12 @@ public:
     // Find all overloads of a function by name.  Walks base classes.
     std::vector<Function> find_functions(std::string_view name) const;
 
+    // All functions across the full hierarchy (this class + bases).
+    // Returns FunctionInfo by value (merged view), unlike functions()
+    // which returns a reference to this class's own members only.
+    // Wrap any element in a Function via its explicit constructor to invoke.
+    std::vector<FunctionInfo> all_functions() const;
+
     std::expected<Field, Error> find_field(std::string_view name) const;
 
     // Find a static data member by name.  Walks base classes.
@@ -1291,6 +1341,10 @@ public:
 
     // Find all overloads of a static function by name.  Walks base classes.
     std::vector<StaticFunction> find_static_functions(std::string_view name) const;
+
+    // All static functions across the full hierarchy (this class + bases).
+    // Returns StaticFunctionInfo by value (merged view).
+    std::vector<StaticFunctionInfo> all_static_functions() const;
 
     bool valid() const { return info_ != nullptr; }
     explicit operator bool() const { return valid(); }
@@ -1437,6 +1491,22 @@ inline std::vector<Function> Class::find_functions(
     return results;
 }
 
+inline std::vector<FunctionInfo> Class::all_functions() const {
+    std::vector<FunctionInfo> results;
+    if (!valid()) return results;
+
+    for (const auto& f : info_->functions)
+        results.push_back(f);
+    for (const auto& b : info_->bases) {
+        auto base = find_class(b.name);
+        if (base) {
+            auto more = base->all_functions();
+            results.insert(results.end(), more.begin(), more.end());
+        }
+    }
+    return results;
+}
+
 inline std::expected<Enumerator, Error> Enum::find_enumerator(
     std::string_view name) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
@@ -1515,6 +1585,22 @@ inline std::vector<StaticFunction> Class::find_static_functions(
         auto base = find_class(b.name);
         if (base) {
             auto more = base->find_static_functions(name);
+            results.insert(results.end(), more.begin(), more.end());
+        }
+    }
+    return results;
+}
+
+inline std::vector<StaticFunctionInfo> Class::all_static_functions() const {
+    std::vector<StaticFunctionInfo> results;
+    if (!valid()) return results;
+
+    for (const auto& sf : info_->static_functions)
+        results.push_back(sf);
+    for (const auto& b : info_->bases) {
+        auto base = find_class(b.name);
+        if (base) {
+            auto more = base->all_static_functions();
             results.insert(results.end(), more.begin(), more.end());
         }
     }

@@ -91,6 +91,13 @@ Initial implementation. The API above is working:
 - `Class::find_functions("name")` returns all overloads as `std::vector<Function>`
   (walks base classes — inherited overloads accumulate alongside the derived
   class's own).
+- `Class::all_functions()` returns all functions across the full hierarchy as
+  `std::vector<FunctionInfo>` (by value, merged view).  Unlike `functions()`
+  which returns only this class's own members by reference, `all_functions()`
+  includes inherited functions.  Wrap any element in a `Function` via its
+  explicit constructor to invoke.
+- `Class::all_static_functions()` is the static-function equivalent of
+  `all_functions()`, returning `std::vector<StaticFunctionInfo>`.
 - `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
 - `Class::bases()` returns the direct base classes (name + byte offset within T).
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
@@ -132,7 +139,13 @@ Initial implementation. The API above is working:
   `StaticFunction::invoke(args...)` calls the function directly (no Object needed)
   and returns `std::expected<Object, Error>`.
 - `Class::constructors()` enumerates all registered constructors.
-- `Class::functions()` enumerates all registered member functions.
+- `Class::functions()` enumerates this class's own member functions
+  (by reference).  `Class::all_functions()` returns the full hierarchy
+  (by value).
+- Each `*Info` struct (`FunctionInfo`, `StaticFunctionInfo`, `FieldInfo`,
+  `StaticFieldInfo`, `ConstructorInfo`) carries an `owner` back-pointer to
+  its `ClassInfo` and an `index`.  Wrap any `*Info` into its handle type via
+  the explicit constructor (e.g. `Function(const FunctionInfo&)`) to invoke.
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
