@@ -293,12 +293,14 @@ Limitations:
   `operator+=`, `operator=`, etc.) are registered as functions, findable by
   name (`"operator+"`, `"operator=="`, etc.).  Conversion operators and the
   destructor are not registered.
-- `constexpr` and `consteval` member functions are reflected like ordinary
-  functions (they are registered and invokable at runtime).  Template member
-  functions are **not** reflected — the compiler does not surface them as
-  invokable members, so they are absent from `functions()` and
-  `find_function`.  This is silent: registration does not fail, the template
-  member simply does not appear.
+- `constexpr` member functions are reflected like ordinary functions (they
+  are registered and invokable at runtime).  `consteval` (immediate) member
+  functions are **not** reflected: taking their address is ill-formed, so
+  the framework cannot generate an invoker for them — they are skipped at
+  registration (this is silent: registration does not fail, the member
+  simply does not appear).  Template member functions are **not** reflected
+  either — the compiler does not surface them as invokable members, so they
+  are absent from `functions()` and `find_function`.  This is likewise silent.
 - Clone requires a copy constructor — non-copyable classes return
   `Error::NotCopyable`.
 - Enum values are stored as `long long`.  Enums with an unsigned underlying

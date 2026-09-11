@@ -256,6 +256,19 @@ consteval std::string_view type_name() {
     return std::meta::display_string_of(^^T);
 }
 
+// Detect a consteval member function by its display string.  GCC 16.2's
+// <meta> has no is_consteval query (added in a later P2996 revision), so we
+// inspect display_string_of, which prefixes the specifier: "[static ]consteval
+// <ret> ...".  Taking the address of an immediate function is ill-formed, so
+// such members would break detail::invoker / static_invoker if registered —
+// make_info skips them.  constexpr (non-consteval) functions are unaffected.
+template <std::meta::info Fn>
+consteval bool is_consteval_fn() {
+    std::string_view ds = std::meta::display_string_of(Fn);
+    if (ds.starts_with("static ")) ds.remove_prefix(7);
+    return ds.starts_with("consteval ");
+}
+
 // Match a query (already-normalized type names) against a candidate's
 // param_types (also pre-normalized at storage time).  Returns true if
 // the param counts and types match.
@@ -346,14 +359,6 @@ is_base_of_with_offset(std::string_view derived_name, std::string_view base_name
 inline bool is_base_of(std::string_view derived_name, std::string_view base_name) {
     std::lock_guard<std::mutex> lk(pool_mutex());
     return is_base_of_unlocked(derived_name, base_name);
-}
-
-// Number of distinct base-subobject paths from `derived_name` to
-// `base_name`.  >1 means a diamond (ambiguous unqualified lookup).
-inline std::size_t
-base_path_count(std::string_view derived_name, std::string_view base_name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    return base_path_offsets_unlocked(derived_name, base_name).size();
 }
 
 // Adjust a pointer from a most-derived object to a base subobject.
@@ -934,6 +939,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
         } else if constexpr (std::meta::is_function(m) &&
                             !std::meta::is_deleted(m) &&
                             std::meta::is_public(m) &&
+                            !detail::is_consteval_fn<m>() &&
                             (std::meta::has_identifier(m) ||
                              std::meta::is_operator_function(m))) {
             static constexpr auto fparams = std::define_static_array(

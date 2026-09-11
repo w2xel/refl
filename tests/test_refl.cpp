@@ -253,6 +253,29 @@ struct DiamBottom : DiamLeft, DiamRight {
 struct FieldHideBase { int x = 1; int y = 2; };
 struct FieldHideDer : FieldHideBase { int x = 99; };
 
+// Sibling bases each declaring a member of the same name: an unqualified
+// lookup is ambiguous (two base subobjects), so the singular find_* return
+// Ambiguous; the plural all_* list each uniquely-reachable declaration.
+struct SibA { int shared; SibA() : shared(1) {} int sa_fn() const { return shared; } };
+struct SibB { int shared; SibB() : shared(2) {} int sb_fn() const { return shared; } };
+struct Sibling : SibA, SibB { Sibling() {} };
+
+// A consteval member function: must NOT be registered (taking its address is
+// ill-formed).  A constexpr (non-consteval) function on the same class is
+// registered and invokable at runtime — it distinguishes the two qualifiers.
+struct Immediate {
+    int v;
+    Immediate(int v) : v(v) {}
+    consteval int ce_fn() const { return v * 2; }
+    constexpr int cx_fn() const { return v * 3; }
+    int plain_fn() const { return v; }
+};
+
+// A static member function returning a reference — the invoker must produce a
+// non-owning aliasing Object (no shared_ptr keeps a static alive).
+struct StaticRef { static int g_counter; static int& counter_ref() { return g_counter; } };
+int StaticRef::g_counter = 0;
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -290,6 +313,11 @@ struct FieldHideDer : FieldHideBase { int x = 99; };
 [[maybe_unused]] static refl::Reg<DiamBottom> reg_diam_bottom;
 [[maybe_unused]] static refl::Reg<FieldHideBase> reg_field_hide_base;
 [[maybe_unused]] static refl::Reg<FieldHideDer> reg_field_hide_der;
+[[maybe_unused]] static refl::Reg<SibA> reg_sib_a;
+[[maybe_unused]] static refl::Reg<SibB> reg_sib_b;
+[[maybe_unused]] static refl::Reg<Sibling> reg_sibling;
+[[maybe_unused]] static refl::Reg<Immediate> reg_immediate;
+[[maybe_unused]] static refl::Reg<StaticRef> reg_static_ref;
 
 struct Wrong {};
 
@@ -1231,6 +1259,53 @@ int main() {
     auto fh_yf = fh_cls.find_field("y");
     CHECK(fh_yf.has_value(), "find_field y should succeed (inherited, not hidden)");
     CHECK(*fh_yf->get(fh_obj)->cast_safe<int>().value() == 2, "y should be base's (2)");
+
+    // === Sibling bases: same-named member is ambiguous for singular lookups ===
+    auto sib_cls = *refl::find_class("Sibling");
+    // singular find_field("shared") — two base subobjects → Ambiguous
+    auto sib_shared = sib_cls.find_field("shared");
+    CHECK(!sib_shared.has_value(), "find_field(shared) on Sibling should fail (ambiguous)");
+    CHECK(sib_shared.error() == refl::Error::Ambiguous, "sibling shared should be Ambiguous");
+    // plural all_fields — each uniquely reachable, both listed
+    auto sib_all = sib_cls.all_fields();
+    int sib_shared_count = 0;
+    for (const auto& f : sib_all) if (f.name() == "shared") ++sib_shared_count;
+    CHECK(sib_shared_count == 2, "all_fields() should list shared twice (one per sibling)");
+    // each sibling's own function is uniquely reachable, not ambiguous
+    CHECK(sib_cls.find_function("sa_fn").has_value(), "sa_fn (SibA only) should be findable");
+    CHECK(sib_cls.find_function("sb_fn").has_value(), "sb_fn (SibB only) should be findable");
+
+    // === consteval member is skipped; constexpr member is invokable ===
+    auto im_cls = *refl::find_class("Immediate");
+    CHECK(!im_cls.find_function("ce_fn").has_value(),
+          "consteval member must NOT be registered");
+    bool im_has_ce = false;
+    for (const auto& f : im_cls.functions())
+        if (f.name() == "ce_fn") im_has_ce = true;
+    CHECK(!im_has_ce, "consteval member must not appear in functions()");
+    // constexpr (non-consteval) is registered and runs at runtime.
+    auto im_cx = im_cls.find_function("cx_fn");
+    CHECK(im_cx.has_value(), "constexpr member should be registered");
+    auto im_obj = *im_cls.find_constructor({"int"})->call(5);
+    CHECK(*im_cx->invoke(im_obj)->cast_safe<int>().value() == 15, "constexpr cx_fn(5) should be 15");
+    // plain function still works.
+    CHECK(*im_cls.find_function("plain_fn")->invoke(im_obj)->cast_safe<int>().value() == 5,
+          "plain_fn(5) should be 5");
+
+    // === Static function with reference return → non-owning aliasing Object ===
+    auto sr_cls = *refl::find_class("StaticRef");
+    auto sr_fn = sr_cls.find_static_function("counter_ref");
+    CHECK(sr_fn.has_value(), "find_static_function(counter_ref) should succeed");
+    StaticRef::g_counter = 0;
+    auto sr_invoke = sr_fn->invoke();
+    CHECK(sr_invoke.has_value(), "invoke counter_ref should succeed");
+    CHECK(sr_invoke->valid(), "reference return yields a valid Object");
+    CHECK(!sr_invoke->is_owned(), "static reference return must be non-owning (no shared_ptr)");
+    auto sr_ref = sr_invoke->cast_ref<int>();
+    CHECK(sr_ref.has_value(), "cast_ref<int> on reference return should succeed");
+    CHECK(*sr_ref.value() == 0, "counter_ref should read 0");
+    *sr_ref.value() = 42;
+    CHECK(StaticRef::g_counter == 42, "writing through the returned reference must hit the static");
 
     std::printf("refl core API test ok\n");
     return 0;

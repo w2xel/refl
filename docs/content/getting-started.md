@@ -36,8 +36,8 @@ reflecting a `struct Point { int x; int y; }` and asserting two members.
 ## Run a sample
 
 ```sh
-./builddir/basic_sample      # core type-erased API
-./builddir/dynamic_sample    # Dyn<T> dispatch + mocking
+./builddir/samples/basic_sample      # core type-erased API
+./builddir/samples/dynamic_sample    # Dyn<T> dispatch + mocking
 ```
 
 ## Serve the documentation
