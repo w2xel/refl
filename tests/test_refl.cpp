@@ -276,6 +276,50 @@ struct Immediate {
 struct StaticRef { static int g_counter; static int& counter_ref() { return g_counter; } };
 int StaticRef::g_counter = 0;
 
+// Out-parameter: a function taking int& must write through to the caller's
+// variable.  The framework borrows non-const lvalue args directly from the
+// caller, so the function's reference aliases the caller's storage.
+struct OutParam {
+    int last;
+    OutParam() : last(0) {}
+    void fill(int& out) { out = 42; last = out; }
+    void fill_two(int& a, int& b) { a = 10; b = 20; }
+};
+
+// Rvalue-reference parameter: the function takes int&& and the framework moves
+// from the argument storage.
+struct RvRef {
+    int v;
+    RvRef() : v(0) {}
+    int take_rv(int&& x) { v = x; return v; }
+};
+
+// By-value move-only parameter: the function takes unique_ptr by value.
+// Previously a compile error (extract_arg copied); now moves correctly.
+struct TakeMove {
+    int result;
+    TakeMove() : result(0) {}
+    int take_ptr(std::unique_ptr<int> p) { result = *p; return result; }
+};
+
+// Abstract class: registration must succeed (fields and functions are
+// discoverable for interface introspection).  Constructors are skipped
+// (can't instantiate an abstract class).  Functions are invokable on
+// derived objects via the abstract class handle.
+struct IShape {
+    int id;
+    IShape() : id(0) {}
+    IShape(int id) : id(id) {}
+    virtual int area() const = 0;
+    virtual ~IShape() = default;
+};
+struct Circle : IShape {
+    int r;
+    Circle() : IShape(), r(1) {}
+    Circle(int r) : IShape(r), r(r) {}
+    int area() const override { return 3 * r * r; }
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -318,6 +362,11 @@ int StaticRef::g_counter = 0;
 [[maybe_unused]] static refl::Reg<Sibling> reg_sibling;
 [[maybe_unused]] static refl::Reg<Immediate> reg_immediate;
 [[maybe_unused]] static refl::Reg<StaticRef> reg_static_ref;
+[[maybe_unused]] static refl::Reg<OutParam> reg_out_param;
+[[maybe_unused]] static refl::Reg<RvRef> reg_rv_ref;
+[[maybe_unused]] static refl::Reg<TakeMove> reg_take_move;
+[[maybe_unused]] static refl::Reg<IShape> reg_ishape;
+[[maybe_unused]] static refl::Reg<Circle> reg_circle;
 
 struct Wrong {};
 
@@ -1306,6 +1355,64 @@ int main() {
     CHECK(*sr_ref.value() == 0, "counter_ref should read 0");
     *sr_ref.value() = 42;
     CHECK(StaticRef::g_counter == 42, "writing through the returned reference must hit the static");
+
+    // === Out-parameters: T& writes propagate to the caller's variable ===
+    {
+        auto op_cls = *refl::find_class("OutParam");
+        auto op_obj = *op_cls.find_constructor({})->call();
+        auto fill_fn = *op_cls.find_function("fill");
+        int x = 0;
+        auto fill_r = fill_fn.invoke(op_obj, x);
+        CHECK(fill_r.has_value(), "fill(int&) should succeed");
+        CHECK(x == 42, "out-param x should be 42 after fill(int&)");
+        // Two out-params at once.
+        auto fill2_fn = *op_cls.find_function("fill_two");
+        int a = 0, b = 0;
+        auto fill2_r = fill2_fn.invoke(op_obj, a, b);
+        CHECK(fill2_r.has_value(), "fill_two(int&,int&) should succeed");
+        CHECK(a == 10, "out-param a should be 10");
+        CHECK(b == 20, "out-param b should be 20");
+    }
+
+    // === Rvalue-reference parameters: int&& moves from argument storage ===
+    {
+        auto rv_cls = *refl::find_class("RvRef");
+        auto rv_obj = *rv_cls.find_constructor({})->call();
+        auto rv_fn = *rv_cls.find_function("take_rv");
+        auto rv_r = rv_fn.invoke(rv_obj, 99);
+        CHECK(rv_r.has_value(), "take_rv(int&&) should succeed");
+        CHECK(*rv_r->cast_safe<int>().value() == 99, "take_rv(99) should return 99");
+    }
+
+    // === By-value move-only parameter: unique_ptr by value (was a compile error) ===
+    {
+        auto tm_cls = *refl::find_class("TakeMove");
+        auto tm_obj = *tm_cls.find_constructor({})->call();
+        auto tm_fn = *tm_cls.find_function("take_ptr");
+        auto tm_r = tm_fn.invoke(tm_obj, std::make_unique<int>(77));
+        CHECK(tm_r.has_value(), "take_ptr(unique_ptr<int>) should succeed");
+        CHECK(*tm_r->cast_safe<int>().value() == 77, "take_ptr(77) should return 77");
+    }
+
+    // === Abstract class: registration succeeds, constructors skipped ===
+    {
+        auto abs_cls = *refl::find_class("IShape");
+        // No constructors for an abstract class.
+        CHECK(abs_cls.constructors().empty(), "abstract class should have 0 constructors");
+        // Fields and functions are discoverable (interface introspection).
+        CHECK(abs_cls.find_field("id").has_value(), "abstract class field 'id' should be findable");
+        auto area_fn = abs_cls.find_function("area");
+        CHECK(area_fn.has_value(), "abstract class function 'area' should be findable");
+        // Invoke on a derived object via the abstract class handle.
+        auto circ_cls = *refl::find_class("Circle");
+        auto circ_obj = *circ_cls.find_constructor({"int"})->call(5);
+        auto area_r = area_fn->invoke(circ_obj);
+        CHECK(area_r.has_value(), "invoke area() on Circle via IShape handle should succeed");
+        CHECK(*area_r->cast_safe<int>().value() == 75, "Circle(5).area() should be 75 (3*5*5)");
+        // Virtual dispatch: the override runs, not the (non-existent) base body.
+        auto circ_p = circ_obj.cast_safe<Circle>().value();
+        CHECK(circ_p->area() == 75, "Circle(5).area() direct should be 75");
+    }
 
     std::printf("refl core API test ok\n");
     return 0;

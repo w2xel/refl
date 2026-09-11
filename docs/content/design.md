@@ -227,6 +227,16 @@ comparison (no RTTI), and the project compiles with `-Wconversion
 -Wsign-conversion`, so silent widening at the reflection boundary would
 contradict the codebase's own stance on implicit conversions.
 
+Argument value categories are preserved: by-value parameters move from the
+argument storage, `const T&` parameters bind a const reference, `T&&` (rvalue
+ref) parameters move, and `T&` (lvalue ref / out-parameter) parameters bind a
+reference to the caller's variable.  Non-const lvalue arguments are borrowed
+directly from the caller (not copied into the argument tuple), so a function
+that writes through a `T&` parameter modifies the caller's variable — out-
+parameters work.  Rvalue and const-lvalue arguments borrow the tuple copy.  By-
+value move-only types (e.g. `std::unique_ptr` by value) are supported: the
+argument is moved into the tuple and then moved into the function parameter.
+
 All `Class` and `Enum` accessor methods are null-safe: calling `fields()`,
 `functions()`, `bases()`, `name()`, etc. on a default-constructed (invalid)
 handle returns an empty vector or empty string rather than crashing.  The
@@ -289,6 +299,11 @@ Limitations:
   registered `Class` handle for a base (invalid if the base was never `Reg<T>`'d).
 - `Class::find_constructor` does **not** walk bases — constructors are not
   inherited (only the class's own public constructors are registered/searched).
+  Abstract classes have no constructors registered (`std::is_abstract_v<T>`
+  guard) — you cannot construct an abstract type through the framework, but
+  its fields and functions are discoverable for interface introspection, and
+  functions can be invoked on derived objects via the abstract class handle
+  (virtual dispatch runs the derived override).
 - Overloaded operators (`operator+`, `operator==`, `operator[]`, `operator()`,
   `operator+=`, `operator=`, etc.) are registered as functions, findable by
   name (`"operator+"`, `"operator=="`, etc.).  Conversion operators and the

@@ -30,7 +30,10 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace refl {
@@ -567,13 +570,22 @@ private:
 
 namespace detail {
 
-// Build an Object from a tuple element for the arg array.
-// Object args carry their class name natively; concrete types use
-// type_name<decay_t<Args>>.  Both are just Object construction.
-template <std::size_t I, typename Tuple>
-Object make_arg_ref(Tuple& storage) {
-    return Object(std::get<I>(storage));  // template ctor for concrete types,
-                                          // copy ctor for Object (keeps class_name)
+// Build an Object from argument I.  Non-const lvalue args borrow the
+// caller's variable directly (so functions with T& out-params write through
+// to the caller); rvalue and const-lvalue args borrow the tuple copy (rvalues
+// need stable storage; const lvalues can't be borrowed mutably by design).
+//
+// lvalue-ness is determined from the Args pack (not from std::get on the
+// forward_as_tuple result): std::get on tuple<T&&> returns T& due to reference
+// collapsing, which would misclassify rvalues as lvalues.
+template <std::size_t I, typename Tuple, typename ArgType, typename ArgRef>
+Object make_arg_ref(Tuple& storage, ArgRef&& arg) {
+    if constexpr (std::is_lvalue_reference_v<ArgType> &&
+                 !std::is_const_v<std::remove_reference_t<ArgType>>) {
+        return Object(arg);                  // non-owning borrow of caller's lvalue
+    } else {
+        return Object(std::get<I>(storage)); // borrow the tuple element
+    }
 }
 
 template <typename... Args>
@@ -587,25 +599,29 @@ prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
         return nullptr;
     } else {
         storage.emplace(std::forward<Args>(args)...);
+        auto fwd = std::forward_as_tuple(args...);
         [&]<std::size_t... I>(std::index_sequence<I...>) {
             using Tuple = std::tuple<std::decay_t<Args>...>;
-            ((refs[I] = make_arg_ref<I, Tuple>(*storage)), ...);
+            using ArgTuple = std::tuple<Args...>;
+            ((refs[I] = make_arg_ref<I, Tuple, std::tuple_element_t<I, ArgTuple>>(
+                           *storage, std::get<I>(fwd))), ...);
         }(std::make_index_sequence<sizeof...(Args)>{});
         return refs.data();
     }
 }
 
 // Unbox one Object argument against its compile-time parameter type P.
-// Lvalue params copy, rvalue-ref params move.  Throws bad_cast on a
-// type-name mismatch — caught by checked_call and mapped to TypeError.
-// P is the spliced parameter type (e.g. [:std::meta::type_of(params[J]):]);
-// J is the argument index, passed at runtime.
+// Lvalue-reference params return a reference (writes propagate for T& out-params
+// when the arg was borrowed directly from the caller); by-value and rvalue-ref
+// params move.  Throws bad_cast on a type-name mismatch — caught by checked_call
+// and mapped to TypeError.  P is the spliced parameter type (e.g.
+// [:std::meta::type_of(params[J]):]);  J is the argument index, passed at runtime.
 //
 // If the argument's class doesn't exactly match P, checks whether it's a
 // derived class of P and adjusts the pointer to the base subobject — the
 // same upcast that invoke does for the target object.
 template <typename P>
-auto extract_arg(const Object* args, std::size_t J) {
+decltype(auto) extract_arg(const Object* args, std::size_t J) {
     using PBare = std::remove_cvref_t<P>;
     constexpr auto param_type = type_name<PBare>();
     void* src = args[J].raw();
@@ -614,10 +630,10 @@ auto extract_arg(const Object* args, std::size_t J) {
         if (!off) throw std::bad_cast{};
         src = static_cast<char*>(src) + *off;
     }
-    if constexpr (std::is_rvalue_reference_v<P>)
-        return std::move(*static_cast<PBare*>(src));
+    if constexpr (std::is_lvalue_reference_v<P>)
+        return static_cast<std::remove_reference_t<P>&>(*static_cast<PBare*>(src));
     else
-        return *static_cast<PBare*>(src);
+        return std::move(*static_cast<PBare*>(src));
 }
 
 template <typename T, std::meta::info Ctor>
@@ -626,7 +642,7 @@ Object factory(const Object* args) {
         std::meta::parameters_of(Ctor));
     constexpr std::size_t n = params.size();
 
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) -> decltype(auto) {
         using P = [:std::meta::type_of(params[J]):];
         return extract_arg<P>(args, J);
     };
@@ -648,7 +664,7 @@ Object invoker(const std::shared_ptr<void>& owner, void* obj,
     using R = [:std::meta::return_type_of(Fn):];
     using RStore = std::remove_cvref_t<R>;
 
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) -> decltype(auto) {
         using P = [:std::meta::type_of(params[J]):];
         return extract_arg<P>(args, J);
     };
@@ -747,7 +763,7 @@ Object static_invoker(const Object* args) {
     using R = [:std::meta::return_type_of(Fn):];
     using RStore = std::remove_cvref_t<R>;
 
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
+    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) -> decltype(auto) {
         using P = [:std::meta::type_of(params[J]):];
         return extract_arg<P>(args, J);
     };
@@ -905,7 +921,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
     template for (constexpr auto m : all_members) {
         if constexpr (std::meta::is_constructor(m) &&
                       !std::meta::is_deleted(m) &&
-                      std::meta::is_public(m)) {
+                      std::meta::is_public(m) &&
+                      !std::is_abstract_v<T>) {
             static constexpr auto params = std::define_static_array(
                 std::meta::parameters_of(m));
             constexpr std::size_t n = params.size();
