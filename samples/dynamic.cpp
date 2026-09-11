@@ -1,13 +1,12 @@
-// Sample: runtime interface implementation and dynamic switching with Refl<T>.
+// Sample: typed dispatch and dynamic implementation with Dyn<T>.
 //
 // Demonstrates:
-// 1. Building an object that implements an abstract interface at runtime.
-// 2. Starting with a real object, then switching to a mock at runtime.
-// 3. Switching back to a real object after mocking.
-//
-// This enables mocking patterns: test with a real object, swap to a mock
-// for specific test cases, then swap back — all through the same Refl<T>.
-#include <refl/refl.hpp>
+// 1. Dyn<T> dispatch struct — typed method calls, member-like property
+//    access, and Qt-style hooks (connect / on_change).
+// 2. Building an object that implements an abstract interface at runtime.
+// 3. Starting with a real object, then switching to a mock at runtime.
+// 4. Switching back to a real object after mocking.
+#include <refl/dyn.hpp>
 #include <cstdio>
 
 // A concrete shape — can be constructed normally.
@@ -26,13 +25,37 @@ struct IRenderer {
     virtual ~IRenderer() = default;
 };
 
-[[maybe_unused]] static refl::Refl<Circle> reg_circle;
-[[maybe_unused]] static refl::Refl<IRenderer> reg_renderer;
+// A rect with overloaded resize, for the dispatch-struct demo.
+struct Rect {
+    int w;
+    int h;
+    Rect(int w, int h) : w(w), h(h) {}
+    void resize(int nw, int nh) { w = nw; h = nh; }
+    void resize(int sq) { w = sq; h = sq; }
+};
+
+[[maybe_unused]] static refl::Dyn<Circle> reg_circle;
+[[maybe_unused]] static refl::Dyn<IRenderer> reg_renderer;
+[[maybe_unused]] static refl::Dyn<Rect> reg_rect;
 
 int main() {
-    // --- Real object: Refl<Circle> with a concrete instance.
-    std::printf("=== Real Circle (radius=5) ===\n");
-    refl::Refl<Circle> circle(5);
+    // --- Dyn<T> dispatch struct: typed calls + hooks.
+    std::printf("=== Dyn<Rect> dispatch (3, 4) ===\n");
+    refl::Dyn<Rect> r(3, 4);
+    r.connect("resize", [](std::any&) {
+        std::printf("  hook: resize() was called\n");
+    });
+    r.on_change("w", [](std::any& v) {
+        std::printf("  hook: w changed to %d\n", std::any_cast<int>(v));
+    });
+    r->resize(5, 6);
+    std::printf("  after resize: w=%d h=%d\n", r.get().w, r.get().h);
+    r->w = 10;
+    std::printf("  after w = 10: w=%d\n", r.get().w);
+
+    // --- Real object: Dyn<Circle> with a concrete instance.
+    std::printf("\n=== Real Circle (radius=5) ===\n");
+    refl::Dyn<Circle> circle(5);
     int ca = circle->area(2);
     std::printf("  area(2) = %d\n", ca);
     circle->set_color(42);
@@ -43,10 +66,10 @@ int main() {
     // --- Switch to dynamic (mock) mode.
     std::printf("\n=== Mock Circle ===\n");
     int mock_color = 0;
-    circle.implement<^^Circle::area>([](refl::Refl<Circle>&, int scale) {
+    circle.implement<^^Circle::area>([](refl::Dyn<Circle>&, int scale) {
         return scale * 1000;  // mock: always 1000*scale
     });
-    circle.implement<^^Circle::set_color>([&mock_color](refl::Refl<Circle>&, int c) {
+    circle.implement<^^Circle::set_color>([&mock_color](refl::Dyn<Circle>&, int c) {
         mock_color = c;
     });
     std::printf("  is_dynamic = %d\n", circle.is_dynamic());
@@ -62,16 +85,16 @@ int main() {
     int ra = circle->area(1);
     std::printf("  real area(1) = %d\n", ra);
 
-    // --- Dynamic interface: Refl<IRenderer> implemented at runtime.
+    // --- Dynamic interface: Dyn<IRenderer> implemented at runtime.
     std::printf("\n=== Dynamic IRenderer (abstract) ===\n");
-    refl::Refl<IRenderer> renderer;
+    refl::Dyn<IRenderer> renderer;
     int stored_color = 0;
     int fake_radius = 7;
 
-    renderer.implement<^^IRenderer::area>([fake_radius](refl::Refl<IRenderer>&, int scale) {
+    renderer.implement<^^IRenderer::area>([fake_radius](refl::Dyn<IRenderer>&, int scale) {
         return scale * fake_radius * fake_radius;
     });
-    renderer.implement<^^IRenderer::set_color>([&stored_color](refl::Refl<IRenderer>&, int c) {
+    renderer.implement<^^IRenderer::set_color>([&stored_color](refl::Dyn<IRenderer>&, int c) {
         stored_color = c;
         std::printf("  set_color(%d) — stored\n", c);
     });
@@ -83,7 +106,7 @@ int main() {
 
     // Re-implement at runtime.
     std::printf("\n=== Re-implemented IRenderer ===\n");
-    renderer.implement<^^IRenderer::area>([](refl::Refl<IRenderer>&, int scale) {
+    renderer.implement<^^IRenderer::area>([](refl::Dyn<IRenderer>&, int scale) {
         return scale * 7;
     });
     int r_area2 = renderer->area(3);
@@ -91,4 +114,3 @@ int main() {
 
     return 0;
 }
-
