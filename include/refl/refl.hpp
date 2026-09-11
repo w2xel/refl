@@ -596,12 +596,8 @@ Object factory(const Object* args) {
     };
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
-        if constexpr (n == 0) {
-            return Object(std::make_shared<T>(), type_name<T>());
-        } else {
-            return Object(std::make_shared<T>(extract(std::integral_constant<std::size_t, I>{})...),
-                          type_name<T>());
-        }
+        return Object(std::make_shared<T>(extract(std::integral_constant<std::size_t, I>{})...),
+                      type_name<T>());
     }(std::make_index_sequence<n>{});
 }
 
@@ -622,32 +618,16 @@ Object invoker(const std::shared_ptr<void>& owner, void* obj,
     };
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
-        if constexpr (n == 0) {
-            if constexpr (std::is_void_v<R>) {
-                (target->*mfn)();
-                return Object{};
-            } else if constexpr (std::is_reference_v<R>) {
-                // Reference return: alias the owner's shared_ptr so the
-                // returned Object keeps the original alive.  For non-owning
-                // (stack) objects, owner is empty — the Object is non-owning.
-                auto& ref = (target->*mfn)();
-                return Object(owner, std::addressof(ref), type_name<RStore>());
-            } else {
-                return Object(std::make_shared<RStore>((target->*mfn)()),
-                             type_name<RStore>());
-            }
+        if constexpr (std::is_void_v<R>) {
+            (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
+            return Object{};
+        } else if constexpr (std::is_reference_v<R>) {
+            auto& ref = (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
+            return Object(owner, std::addressof(ref), type_name<RStore>());
         } else {
-            if constexpr (std::is_void_v<R>) {
-                (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
-                return Object{};
-            } else if constexpr (std::is_reference_v<R>) {
-                auto& ref = (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
-                return Object(owner, std::addressof(ref), type_name<RStore>());
-            } else {
-                return Object(std::make_shared<RStore>(
-                    (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...)),
-                    type_name<RStore>());
-            }
+            return Object(std::make_shared<RStore>(
+                (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...)),
+                type_name<RStore>());
         }
     }(std::make_index_sequence<n>{});
 }
@@ -723,28 +703,16 @@ Object static_invoker(const Object* args) {
     };
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
-        if constexpr (n == 0) {
-            if constexpr (std::is_void_v<R>) {
-                fn();
-                return Object{};
-            } else if constexpr (std::is_reference_v<R>) {
-                auto& ref = fn();
-                return Object(std::addressof(ref), type_name<RStore>());
-            } else {
-                return Object(std::make_shared<RStore>(fn()), type_name<RStore>());
-            }
+        if constexpr (std::is_void_v<R>) {
+            fn(extract(std::integral_constant<std::size_t, I>{})...);
+            return Object{};
+        } else if constexpr (std::is_reference_v<R>) {
+            auto& ref = fn(extract(std::integral_constant<std::size_t, I>{})...);
+            return Object(std::addressof(ref), type_name<RStore>());
         } else {
-            if constexpr (std::is_void_v<R>) {
-                fn(extract(std::integral_constant<std::size_t, I>{})...);
-                return Object{};
-            } else if constexpr (std::is_reference_v<R>) {
-                auto& ref = fn(extract(std::integral_constant<std::size_t, I>{})...);
-                return Object(std::addressof(ref), type_name<RStore>());
-            } else {
-                return Object(std::make_shared<RStore>(
-                    fn(extract(std::integral_constant<std::size_t, I>{})...)),
-                    type_name<RStore>());
-            }
+            return Object(std::make_shared<RStore>(
+                fn(extract(std::integral_constant<std::size_t, I>{})...)),
+                type_name<RStore>());
         }
     }(std::make_index_sequence<n>{});
 }
