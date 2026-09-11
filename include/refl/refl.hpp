@@ -364,6 +364,26 @@ inline bool is_base_of(std::string_view derived_name, std::string_view base_name
     return is_base_of_unlocked(derived_name, base_name);
 }
 
+// Upcast offset with diamond-ambiguity check.  Returns the byte offset
+// if the base is uniquely reachable; Error::Ambiguous if reachable via
+// 2+ distinct offsets (a diamond — C++ rejects an unqualified upcast
+// to the shared base); Error::TypeError if not a base at all.
+// Used by Object::cast_safe / cast_ref — the cast must not silently pick
+// one of two base subobjects.
+inline std::expected<std::ptrdiff_t, Error>
+upcast_offset_unlocked(std::string_view derived_name, std::string_view base_name) {
+    auto offsets = base_path_offsets_unlocked(derived_name, base_name);
+    if (offsets.empty()) return std::unexpected(Error::TypeError);
+    if (offsets.size() > 1) return std::unexpected(Error::Ambiguous);
+    return *offsets.begin();
+}
+
+inline std::expected<std::ptrdiff_t, Error>
+upcast_offset(std::string_view derived_name, std::string_view base_name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    return upcast_offset_unlocked(derived_name, base_name);
+}
+
 // Adjust a pointer from a most-derived object to a base subobject.
 // Returns nullptr if the base is not found (guards against pool races
 // after is_class passed).  Caller need not hold pool_mutex — this helper
@@ -504,14 +524,16 @@ public:
 
     // Owning cast — returns a shared_ptr<T> that keeps the object alive.
     // Only works for owned Objects.  Returns Error::NotOwned for
-    // non-owning Objects (use cast_ref instead).
+    // non-owning Objects (use cast_ref instead).  Returns Error::Ambiguous
+    // if T is a base reachable via 2+ distinct offsets (a diamond) — C++
+    // rejects an unqualified upcast to the shared base, and so does this.
     template <typename T>
     std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!is_owned()) return std::unexpected(Error::NotOwned);
         const auto tname = detail::type_name<T>();
-        auto off = detail::is_base_of_with_offset(class_name_, tname);
-        if (!off) return std::unexpected(Error::TypeError);
+        auto off = detail::upcast_offset(class_name_, tname);
+        if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return std::shared_ptr<T>(owner_,
                                   static_cast<T*>(static_cast<void*>(adjusted)));
@@ -519,12 +541,14 @@ public:
 
     // Non-owning cast — returns a raw T* for both owned and non-owning
     // Objects.  The caller must ensure the object stays alive.
+    // Returns Error::Ambiguous for diamond-ambiguous upcasts (same as
+    // cast_safe).
     template <typename T>
     std::expected<T*, Error> cast_ref() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto tname = detail::type_name<T>();
-        auto off = detail::is_base_of_with_offset(class_name_, tname);
-        if (!off) return std::unexpected(Error::TypeError);
+        auto off = detail::upcast_offset(class_name_, tname);
+        if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return static_cast<T*>(static_cast<void*>(adjusted));
     }
@@ -612,8 +636,10 @@ prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
 
 // Unbox one Object argument against its compile-time parameter type P.
 // Lvalue-reference params return a reference (writes propagate for T& out-params
-// when the arg was borrowed directly from the caller); by-value and rvalue-ref
-// params move.  Throws bad_cast on a type-name mismatch — caught by checked_call
+// when the arg was borrowed directly from the caller).  Rvalue-ref params move.
+// By-value params copy if the type is copy-constructible (matching C++: an lvalue
+// passed to a by-value parameter is copied, not moved); move-only by-value params
+// still move.  Throws bad_cast on a type-name mismatch — caught by checked_call
 // and mapped to TypeError.  P is the spliced parameter type (e.g.
 // [:std::meta::type_of(params[J]):]);  J is the argument index, passed at runtime.
 //
@@ -632,6 +658,10 @@ decltype(auto) extract_arg(const Object* args, std::size_t J) {
     }
     if constexpr (std::is_lvalue_reference_v<P>)
         return static_cast<std::remove_reference_t<P>&>(*static_cast<PBare*>(src));
+    else if constexpr (std::is_rvalue_reference_v<P>)
+        return std::move(*static_cast<PBare*>(src));
+    else if constexpr (std::is_copy_constructible_v<PBare>)
+        return PBare(*static_cast<PBare*>(src));
     else
         return std::move(*static_cast<PBare*>(src));
 }

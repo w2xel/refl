@@ -183,15 +183,21 @@ Initial implementation. The API above is working:
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
   object's class or any of its bases (upcast).  Only works on owning
-  Objects; returns `Error::NotOwned` for non-owning Objects.  Downcasts
-  (T is a derived class of the object's class) are **not** supported:
-  `class_name_` is a compile-time type tag (`type_name<T>()`), not RTTI,
-  so the framework cannot tell whether an Object whose known type is
-  `Base` is actually a `Derived` at runtime.  A safe downcast would
-  require either `dynamic_cast`/`typeid` (the design avoids RTTI) or a
-  virtual type tag on reflected classes (not required by the framework).
+  Objects; returns `Error::NotOwned` for non-owning Objects.  Returns
+  `Error::Ambiguous` if T is a base reachable via 2+ distinct offsets (a
+  diamond) — C++ rejects an unqualified upcast to the shared base, and
+  so does the framework; cast to the intermediate base that uniquely
+  owns the subobject instead.  Downcasts (T is a derived class of the
+  object's class) are **not** supported: `class_name_` is a compile-time
+  type tag (`type_name<T>()`), not RTTI, so the framework cannot tell
+  whether an Object whose known type is `Base` is actually a `Derived`
+  at runtime.  A safe downcast would require either `dynamic_cast`/
+  `typeid` (the design avoids RTTI) or a virtual type tag on reflected
+  classes (not required by the framework).
 - `Object::cast_ref<T>()` returns `std::expected<T*, Error>` — a raw pointer
   for both owned and non-owning Objects.  The caller manages lifetime.
+  Returns `Error::Ambiguous` for diamond-ambiguous upcasts (same as
+  `cast_safe`).
 - `Object::is_owned()` returns true if the Object owns its data (backed by
   shared_ptr), false if it's a non-owning borrow.
 - Constructing an `Object` from a const lvalue yields an owning copy, not a
@@ -233,15 +239,16 @@ comparison (no RTTI), and the project compiles with `-Wconversion
 -Wsign-conversion`, so silent widening at the reflection boundary would
 contradict the codebase's own stance on implicit conversions.
 
-Argument value categories are preserved: by-value parameters move from the
-argument storage, `const T&` parameters bind a const reference, `T&&` (rvalue
-ref) parameters move, and `T&` (lvalue ref / out-parameter) parameters bind a
-reference to the caller's variable.  Non-const lvalue arguments are borrowed
-directly from the caller (not copied into the argument tuple), so a function
-that writes through a `T&` parameter modifies the caller's variable — out-
-parameters work.  Rvalue and const-lvalue arguments borrow the tuple copy.  By-
-value move-only types (e.g. `std::unique_ptr` by value) are supported: the
-argument is moved into the tuple and then moved into the function parameter.
+Argument value categories are preserved: by-value parameters copy if the
+type is copy-constructible (matching C++ — an lvalue passed to a by-value
+parameter is copied, not moved); by-value move-only types (e.g.
+`std::unique_ptr` by value) still move from the argument storage.
+`const T&` parameters bind a const reference, `T&&` (rvalue ref) parameters
+move, and `T&` (lvalue ref / out-parameter) parameters bind a reference to
+the caller's variable.  Non-const lvalue arguments are borrowed directly
+from the caller (not copied into the argument tuple), so a function that
+writes through a `T&` parameter modifies the caller's variable — out-
+parameters work.  Rvalue and const-lvalue arguments borrow the tuple copy.
 
 All `Class` and `Enum` accessor methods are null-safe: calling `fields()`,
 `functions()`, `bases()`, `name()`, etc. on a default-constructed (invalid)
@@ -300,6 +307,12 @@ Limitations:
   Two different sibling bases that each declare the same name are likewise
   `Ambiguous` for the singular lookup; each declaration (uniquely reachable)
   is still listed by the plural views and is individually invokable.
+  Diamond upcasts via `cast_safe<T>()` / `cast_ref<T>()` are also
+  `Error::Ambiguous` — casting a diamond-derived object to the shared base
+  is rejected just as C++ rejects the unqualified pointer conversion;
+  cast to the intermediate base that uniquely owns the subobject instead.
+  `is_class("Base")` still returns true (it tests the base relationship,
+  not convertibility).
 - `Class::all_bases()` returns the transitive base classes, deduplicated by
   name so a diamond-shared base appears once.  `Base::as_class()` returns the
   registered `Class` handle for a base (invalid if the base was never `Reg<T>`'d).

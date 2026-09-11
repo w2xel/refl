@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
 
 struct Base {
     int base_val;
@@ -302,6 +303,16 @@ struct TakeMove {
     int take_ptr(std::unique_ptr<int> p) { result = *p; return result; }
 };
 
+// By-value copyable parameter: a function taking std::string by value.
+// The framework must copy (not move) from a non-const lvalue argument —
+// matching C++ semantics.  Passing an lvalue and then checking it still
+// holds its value verifies the copy (a move would empty it).
+struct ByValString {
+    int n;
+    ByValString() : n(0) {}
+    void take_str(std::string s) { n = static_cast<int>(s.size()); }
+};
+
 // Abstract class: registration must succeed (fields and functions are
 // discoverable for interface introspection).  Constructors are skipped
 // (can't instantiate an abstract class).  Functions are invokable on
@@ -365,6 +376,7 @@ struct Circle : IShape {
 [[maybe_unused]] static refl::Reg<OutParam> reg_out_param;
 [[maybe_unused]] static refl::Reg<RvRef> reg_rv_ref;
 [[maybe_unused]] static refl::Reg<TakeMove> reg_take_move;
+[[maybe_unused]] static refl::Reg<ByValString> reg_byval_string;
 [[maybe_unused]] static refl::Reg<IShape> reg_ishape;
 [[maybe_unused]] static refl::Reg<Circle> reg_circle;
 
@@ -1412,6 +1424,78 @@ int main() {
         // Virtual dispatch: the override runs, not the (non-existent) base body.
         auto circ_p = circ_obj.cast_safe<Circle>().value();
         CHECK(circ_p->area() == 75, "Circle(5).area() direct should be 75");
+    }
+
+    // === Diamond upcast: cast_safe/cast_ref to ambiguous base must fail ===
+    // DiamBottom -> {DiamLeft, DiamRight} -> DiamBase.  Casting to DiamBase
+    // is ambiguous (two base subobjects) — C++ rejects the unqualified
+    // upcast, and so must the framework.
+    {
+        auto dbd_cls = *refl::find_class("DiamBottom");
+        auto dbd_obj = *dbd_cls.find_constructor({"int", "int"})->call(11, 22);
+
+        // Unambiguous upcasts to DiamLeft / DiamRight still work.
+        CHECK(dbd_obj.cast_safe<DiamLeft>().has_value(), "cast_safe<DiamLeft> on DiamBottom should succeed");
+        CHECK(dbd_obj.cast_safe<DiamRight>().has_value(), "cast_safe<DiamRight> on DiamBottom should succeed");
+        CHECK(dbd_obj.cast_safe<DiamLeft>().value()->v == 11, "DiamLeft::v should be 11");
+
+        // Upcast to the shared DiamBase is ambiguous.
+        auto amb_safe = dbd_obj.cast_safe<DiamBase>();
+        CHECK(!amb_safe.has_value(), "cast_safe<DiamBase> on DiamBottom should fail");
+        CHECK(amb_safe.error() == refl::Error::Ambiguous, "diamond cast_safe should be Ambiguous");
+
+        auto amb_ref = dbd_obj.cast_ref<DiamBase>();
+        CHECK(!amb_ref.has_value(), "cast_ref<DiamBase> on DiamBottom should fail");
+        CHECK(amb_ref.error() == refl::Error::Ambiguous, "diamond cast_ref should be Ambiguous");
+
+        // is_class(DiamBase) is still true — is_base_of semantics, not
+        // convertibility.  The ambiguity is about which subobject, not
+        // whether the base relationship exists.
+        CHECK(dbd_obj.is_class("DiamBase"), "is_class(DiamBase) should be true (base relationship exists)");
+    }
+
+    // === By-value params copy (not move) from non-const lvalue args ===
+    // A function taking std::string by value must copy an lvalue argument,
+    // matching C++.  Before the fix, the framework moved from the caller's
+    // variable, leaving it empty.
+    {
+        auto bvs_cls = *refl::find_class("ByValString");
+        auto bvs_obj = *bvs_cls.find_constructor({})->call();
+        auto take_fn = *bvs_cls.find_function("take_str");
+
+        std::string s = "hello";  // 5 chars
+        auto r = take_fn.invoke(bvs_obj, s);
+        CHECK(r.has_value(), "take_str(lvalue) should succeed");
+        CHECK(s == "hello", "lvalue string must not be moved from (C++ copies by-value args)");
+        CHECK(s.size() == 5, "lvalue string should still be 5 chars");
+
+        // Verify the function received the value.
+        auto bvs_p = bvs_obj.cast_safe<ByValString>().value();
+        CHECK(bvs_p->n == 5, "take_str should have received 5 chars");
+
+        // Rvalue still works (moved into tuple, then copied — correct).
+        auto r2 = take_fn.invoke(bvs_obj, std::string("world"));
+        CHECK(r2.has_value(), "take_str(rvalue) should succeed");
+        auto bvs_p2 = bvs_obj.cast_safe<ByValString>().value();
+        CHECK(bvs_p2->n == 5, "take_str(rvalue) should have received 5 chars");
+
+        // Move-only by-value still moves (not copyable → move path).
+        auto tm_cls = *refl::find_class("TakeMove");
+        auto tm_obj = *tm_cls.find_constructor({})->call();
+        auto tm_fn = *tm_cls.find_function("take_ptr");
+        auto tm_r = tm_fn.invoke(tm_obj, std::make_unique<int>(77));
+        CHECK(tm_r.has_value(), "take_ptr(unique_ptr) should succeed");
+        CHECK(*tm_r->cast_safe<int>().value() == 77, "take_ptr(77) should return 77");
+
+        // Out-params still write through to the caller's variable.
+        {
+            auto op_cls = *refl::find_class("OutParam");
+            auto op_obj = *op_cls.find_constructor({})->call();
+            auto fill_fn = *op_cls.find_function("fill");
+            int x = 0;
+            (void)fill_fn.invoke(op_obj, x);
+            CHECK(x == 42, "out-param must still write through to caller");
+        }
     }
 
     std::printf("refl core API test ok\n");
