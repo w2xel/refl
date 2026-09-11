@@ -88,7 +88,9 @@ Initial implementation. The API above is working:
 - `Class::find_constructor({"int", "int"})` returns `std::expected<Constructor, Error>`.
 - `Class::find_function("name")` returns `std::expected<Function, Error>` (walks bases).
 - `Class::find_function("name", {"int"})` resolves overloads by param types (walks bases).
-- `Class::find_functions("name")` returns all overloads as `std::vector<Function>`.
+- `Class::find_functions("name")` returns all overloads as `std::vector<Function>`
+  (walks base classes — inherited overloads accumulate alongside the derived
+  class's own).
 - `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
 - `Class::bases()` returns the direct base classes (name + byte offset within T).
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
@@ -126,7 +128,7 @@ Initial implementation. The API above is working:
   and returns `std::expected<void, Error>`.
 - `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`
   (walks bases). `find_static_function("name", {"int"})` resolves overloads by param
-  types. `find_static_functions("name")` returns all overloads.
+  types. `find_static_functions("name")` returns all overloads (walks bases).
   `StaticFunction::invoke(args...)` calls the function directly (no Object needed)
   and returns `std::expected<Object, Error>`.
 - `Class::constructors()` enumerates all registered constructors.
@@ -140,6 +142,9 @@ Initial implementation. The API above is working:
   for both owned and non-owning Objects.  The caller manages lifetime.
 - `Object::is_owned()` returns true if the Object owns its data (backed by
   shared_ptr), false if it's a non-owning borrow.
+- Constructing an `Object` from a const lvalue yields an owning copy, not a
+  mutable borrow — a non-owning borrow of a const object would let `cast_ref`
+  write through it (UB), so the borrow constructor rejects `const T&`.
 - `Object::is_class("Name")` checks whether the object is of the given class
   or a class derived from it.
 - `find_enum("Name")` returns `std::expected<Enum, Error>`.

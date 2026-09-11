@@ -199,34 +199,24 @@ std::expected<Class, Error> find_class(std::string_view name);
 
 namespace detail {
 
-// Normalize a type string: lowercase, strip whitespace, const, ref qualifiers.
-// Applied at storage time (param_types) and at lookup time (find_constructor,
-// find_function with types) so both sides compare the same canonical form.
+// Normalize a type string for the string-based overload-resolution API
+// (find_constructor / find_function with type-name lists): lowercase,
+// strip whitespace, ref qualifiers, and const (west- and east-const).
+// Applied at both storage (param_types) and lookup so both sides compare
+// the same canonical form.
 //
-// Only used for the user-facing string-based overload-resolution API
-// (find_constructor({"int","int"}), find_function("set",{"int"})).  The
-// invoker path does not use this — arg type checking is done at compile
-// time via type_name<T>() (display_string_of), which is exact.
+// The invocation path (call/invoke/set) does NOT use this — arg type
+// checking there is exact, via compile-time type_name<T>() (display_string_of).
 //
-// Why the west-const / east-const handling looks more complex than it
-// needs to be: GCC's display_string_of already normalizes to west-const
-// ("const int*" regardless of how the source was written), so both
-// spellings produce the same string before normalize_type runs.  The
-// east-const stripping (" const" suffix) is therefore dead in practice
-// for GCC 16, but kept for robustness against future compiler changes or
-// hand-written type strings.  Tested: "const int*" and "int const*"
-// both normalize to "int*".
+// East-const (" const" suffix) stripping is live for hand-written query
+// strings (a user may write "int const"); display_string_of emits west-const,
+// so stored param_types never carry the suffix, but the query side can.
+// const is stripped while whitespace still separates it as a token, so
+// "const_iterator" is left untouched.
 //
-// Limitations (intentional): volatile is not stripped (matches on both
-// sides if present or absent).  Pointer-to-const const ("const int* const")
-// normalizes to "int*" — indistinguishable from "const int*".  These are
-// not practical problems for reflected signatures (value types, pointers,
-// references — rarely volatile, rarely double-const-pointers).
-//
-// Handles west const ("const int") and east const ("int const"): const
-// is stripped while whitespace is still present, so it matches as a
-// distinct token rather than a substring (e.g. "const_iterator" is left
-// untouched).
+// Not stripped: volatile.  "const int* const" normalizes to "int*",
+// indistinguishable from "const int*" — not a practical problem for
+// reflected signatures (value types, pointers, references).
 inline std::string normalize_type(std::string_view sv) {
     std::string s;
     for (char c : sv)
@@ -297,6 +287,8 @@ class Object;
 class Enum;
 class Enumerator;
 
+namespace detail {
+
 // Unlocked helper — caller must hold pool_mutex.
 // Returns the byte offset of `base_name` within `derived_name` (accumulated
 // through the base hierarchy), or nullopt if not found.  Offset 0 means
@@ -350,6 +342,8 @@ inline void* adjust_to_base(void* obj, std::string_view derived_name,
     if (!off) return nullptr;
     return static_cast<char*>(obj) + *off;
 }
+
+}  // namespace detail
 
 // ---------------------------------------------------------------------------
 // Registration — the single responsibility of the core.
@@ -434,9 +428,13 @@ public:
         : ptr_(ptr), class_name_(class_name) {}
 
     // From a concrete lvalue — non-owning borrow.
-    // The caller must keep obj alive.
+    // The caller must keep obj alive.  Rejected for const T: a mutable
+    // borrow of a const object would let cast_ref<T>() write through it
+    // (UB).  A const lvalue instead falls through to the rvalue ctor,
+    // which makes an owning copy.
     template <typename T>
-        requires (not std::same_as<std::remove_cvref_t<T>, Object>)
+        requires (not std::same_as<std::remove_cvref_t<T>, Object>) &&
+                 (not std::is_const_v<T>)
     Object(T& obj) noexcept
         : ptr_(static_cast<void*>(std::addressof(obj)))
         , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
@@ -463,7 +461,7 @@ public:
     bool is_class(std::string_view name) const {
         if (!valid()) return false;
         if (class_name_ == name) return true;
-        return is_base_of(class_name_, name);
+        return detail::is_base_of(class_name_, name);
     }
 
     // Owning cast — returns a shared_ptr<T> that keeps the object alive.
@@ -474,7 +472,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!is_owned()) return std::unexpected(Error::NotOwned);
         const auto tname = detail::type_name<T>();
-        auto off = is_base_of_with_offset(class_name_, tname);
+        auto off = detail::is_base_of_with_offset(class_name_, tname);
         if (!off) return std::unexpected(Error::TypeError);
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return std::shared_ptr<T>(owner_,
@@ -487,7 +485,7 @@ public:
     std::expected<T*, Error> cast_ref() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto tname = detail::type_name<T>();
-        auto off = is_base_of_with_offset(class_name_, tname);
+        auto off = detail::is_base_of_with_offset(class_name_, tname);
         if (!off) return std::unexpected(Error::TypeError);
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return static_cast<T*>(static_cast<void*>(adjusted));
@@ -1040,7 +1038,7 @@ public:
                                              fi.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
-        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(fi.invoker, obj.owner(), adj, *args_ptr);
     }
@@ -1071,7 +1069,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         if (!has_getter()) return std::unexpected(Error::NotCopyable);
-        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(owner_->fields[idx_].getter, adj);
     }
@@ -1084,7 +1082,7 @@ public:
     std::expected<void*, Error> get_ref(Object obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
-        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<char*>(adj) + owner_->fields[idx_].offset;
     }
@@ -1101,7 +1099,7 @@ public:
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         if (detail::type_name<T>() != owner_->fields[idx_].type)
             return std::unexpected(Error::TypeError);
-        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<T*>(static_cast<void*>(
             static_cast<char*>(adj) + owner_->fields[idx_].offset));
@@ -1116,7 +1114,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         if (is_readonly()) return std::unexpected(Error::ReadOnly);
-        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         std::decay_t<V> storage(std::forward<V>(val));
         Object val_ref(&storage, detail::type_name<std::decay_t<V>>());
@@ -1297,7 +1295,7 @@ public:
         std::string_view name,
         std::initializer_list<std::string_view> types) const;
 
-    // Find all overloads of a function by name.  Does not walk bases.
+    // Find all overloads of a function by name.  Walks base classes.
     std::vector<Function> find_functions(std::string_view name) const;
 
     std::expected<Field, Error> find_field(std::string_view name) const;
@@ -1314,7 +1312,7 @@ public:
         std::string_view name,
         std::initializer_list<std::string_view> types) const;
 
-    // Find all overloads of a static function by name.  Does not walk bases.
+    // Find all overloads of a static function by name.  Walks base classes.
     std::vector<StaticFunction> find_static_functions(std::string_view name) const;
 
     bool valid() const { return info_ != nullptr; }
@@ -1367,6 +1365,7 @@ inline std::vector<std::string> list_all_enums() {
 
 // Walk the base-class hierarchy, calling `finder(base_class)` on each
 // base until one returns a value.  Returns the first hit or Error::NotFound.
+namespace detail {
 template <typename R, typename Finder>
 std::expected<R, Error> walk_bases(
     const std::vector<BaseInfo>& bases,
@@ -1380,6 +1379,7 @@ std::expected<R, Error> walk_bases(
     }
     return std::unexpected(Error::NotFound);
 }
+}  // namespace detail
 
 inline std::expected<Constructor, Error> Class::find_constructor(
     std::initializer_list<std::string_view> types) const {
@@ -1404,7 +1404,7 @@ inline std::expected<Function, Error> Class::find_function(
         if (info_->functions[i].name == name)
             return Function(info_, i);
     }
-    return walk_bases<Function>(info_->bases,
+    return detail::walk_bases<Function>(info_->bases,
         [name](const Class& b) { return b.find_function(name); });
 }
 
@@ -1416,7 +1416,7 @@ inline std::expected<Field, Error> Class::find_field(
         if (info_->fields[i].name == name)
             return Field(info_, i);
     }
-    return walk_bases<Field>(info_->bases,
+    return detail::walk_bases<Field>(info_->bases,
         [name](const Class& b) { return b.find_field(name); });
 }
 
@@ -1434,10 +1434,13 @@ inline std::expected<Function, Error> Class::find_function(
         if (fn.name == name && detail::match_signature(fn.param_types, query))
             return Function(info_, i);
     }
-    return walk_bases<Function>(info_->bases,
+    return detail::walk_bases<Function>(info_->bases,
         [name, types](const Class& b) { return b.find_function(name, types); });
 }
 
+// Find all overloads of a function by name.  Walks base classes — an
+// overload inherited from a base is included alongside the derived class's
+// own overloads (shadows accumulate, not replace).
 inline std::vector<Function> Class::find_functions(
     std::string_view name) const {
     std::vector<Function> results;
@@ -1446,6 +1449,13 @@ inline std::vector<Function> Class::find_functions(
     for (std::size_t i = 0; i < info_->functions.size(); ++i) {
         if (info_->functions[i].name == name)
             results.push_back(Function(info_, i));
+    }
+    for (const auto& b : info_->bases) {
+        auto base = find_class(b.name);
+        if (base) {
+            auto more = base->find_functions(name);
+            results.insert(results.end(), more.begin(), more.end());
+        }
     }
     return results;
 }
@@ -1480,7 +1490,7 @@ inline std::expected<StaticField, Error> Class::find_static_field(
         if (info_->static_fields[i].name == name)
             return StaticField(info_, i);
     }
-    return walk_bases<StaticField>(info_->bases,
+    return detail::walk_bases<StaticField>(info_->bases,
         [name](const Class& b) { return b.find_static_field(name); });
 }
 
@@ -1492,7 +1502,7 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
         if (info_->static_functions[i].name == name)
             return StaticFunction(info_, i);
     }
-    return walk_bases<StaticFunction>(info_->bases,
+    return detail::walk_bases<StaticFunction>(info_->bases,
         [name](const Class& b) { return b.find_static_function(name); });
 }
 
@@ -1510,10 +1520,11 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
         if (sf.name == name && detail::match_signature(sf.param_types, query))
             return StaticFunction(info_, i);
     }
-    return walk_bases<StaticFunction>(info_->bases,
+    return detail::walk_bases<StaticFunction>(info_->bases,
         [name, types](const Class& b) { return b.find_static_function(name, types); });
 }
 
+// Find all overloads of a static function by name.  Walks base classes.
 inline std::vector<StaticFunction> Class::find_static_functions(
     std::string_view name) const {
     std::vector<StaticFunction> results;
@@ -1522,6 +1533,13 @@ inline std::vector<StaticFunction> Class::find_static_functions(
     for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
         if (info_->static_functions[i].name == name)
             results.push_back(StaticFunction(info_, i));
+    }
+    for (const auto& b : info_->bases) {
+        auto base = find_class(b.name);
+        if (base) {
+            auto more = base->find_static_functions(name);
+            results.insert(results.end(), more.begin(), more.end());
+        }
     }
     return results;
 }

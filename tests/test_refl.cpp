@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 
 struct Base {
     int base_val;
@@ -111,6 +112,33 @@ struct Holder {
     Holder(int v) : b(v) {}
 };
 
+// Move-only member: unique_ptr has no copy getter/setter — get_ref is the
+// only access path.  Exercises the getter=nullptr / setter=nullptr branch.
+struct MoveOnly {
+    std::unique_ptr<int> ptr;
+    int plain;
+    MoveOnly(int v) : ptr(std::make_unique<int>(v)), plain(v) {}
+    int get_val() const { return *ptr; }
+};
+
+// Conversion operator: must NOT be registered as a function.
+struct WithConv {
+    int v;
+    WithConv(int v) : v(v) {}
+    operator int() const { return v; }
+    int get() const { return v; }
+};
+
+// Base with a static member function — for find_static_functions base-walk.
+struct StaticBase {
+    static int sbval() { return 7; }
+    int sb() const { return 1; }
+};
+struct StaticChild : StaticBase {
+    int c;
+    StaticChild() : c(0) {}
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -130,6 +158,10 @@ struct Holder {
 [[maybe_unused]] static refl::Reg<Receiver> reg_receiver;
 [[maybe_unused]] static refl::Reg<NoDefault> reg_nodefault;
 [[maybe_unused]] static refl::Reg<Holder> reg_holder;
+[[maybe_unused]] static refl::Reg<MoveOnly> reg_move_only;
+[[maybe_unused]] static refl::Reg<WithConv> reg_with_conv;
+[[maybe_unused]] static refl::Reg<StaticBase> reg_static_base;
+[[maybe_unused]] static refl::Reg<StaticChild> reg_static_child;
 
 struct Wrong {};
 
@@ -641,6 +673,70 @@ int main() {
     auto set_exact = bfield->set(holder, *base_sp);
     CHECK(set_exact.has_value(), "field set with exact Base value should succeed");
     CHECK(holder_b->b.base_val == 7, "after exact set, base_val should be 7");
+
+    // === Move-only member: get_ref is the only access path ===
+    auto mo_cls = *refl::find_class("MoveOnly");
+    auto mo_obj = *mo_cls.find_constructor({"int"})->call(42);
+    auto mo_ptr_field = *mo_cls.find_field("ptr");
+    CHECK(!mo_ptr_field.has_getter(), "unique_ptr field has no copy getter");
+    CHECK(mo_ptr_field.is_readonly(), "unique_ptr field is read-only (no setter)");
+    // get/set are unavailable for move-only members.
+    auto mo_get = mo_ptr_field.get(mo_obj);
+    CHECK(!mo_get.has_value(), "get on move-only field should fail");
+    CHECK(mo_get.error() == refl::Error::NotCopyable, "should be NotCopyable");
+    auto mo_set = mo_ptr_field.set(mo_obj, std::make_unique<int>(9));
+    CHECK(!mo_set.has_value(), "set on move-only field should fail");
+    CHECK(mo_set.error() == refl::Error::ReadOnly, "should be ReadOnly");
+    // Untyped get_ref (void*) — the headline path for move-only members.
+    auto mo_ref = mo_ptr_field.get_ref(mo_obj);
+    CHECK(mo_ref.has_value(), "untyped get_ref on move-only field should succeed");
+    auto* uptr = static_cast<std::unique_ptr<int>*>(mo_ref.value());
+    CHECK(**uptr == 42, "move-only field value via get_ref should be 42");
+    // Typed get_ref on the move-only member.
+    auto mo_tref = mo_ptr_field.get_ref<std::unique_ptr<int>>(mo_obj);
+    CHECK(mo_tref.has_value(), "typed get_ref<unique_ptr<int>> should succeed");
+    CHECK(**mo_tref.value() == 42, "typed get_ref value should be 42");
+    auto mo_tref_wrong = mo_ptr_field.get_ref<int>(mo_obj);
+    CHECK(!mo_tref_wrong.has_value(), "typed get_ref<int> on unique_ptr field should fail");
+    CHECK(mo_tref_wrong.error() == refl::Error::TypeError, "should be TypeError");
+    // Plain field on the same class still has a copy getter.
+    auto mo_plain = *mo_cls.find_field("plain");
+    CHECK(mo_plain.has_getter(), "plain field has getter");
+    CHECK(*mo_plain.get(mo_obj)->cast_safe<int>().value() == 42, "plain field get should be 42");
+
+    // === Untyped get_ref (void*) on a plain field ===
+    auto plain_ref = xf2.get_ref(obj);
+    CHECK(plain_ref.has_value(), "untyped get_ref on plain field should succeed");
+    *static_cast<int*>(plain_ref.value()) = 1234;
+    CHECK(p->x == 1234, "after untyped get_ref write, x should be 1234");
+
+    // === Conversion operator must NOT be registered ===
+    auto wc_cls = *refl::find_class("WithConv");
+    CHECK(wc_cls.find_function("get").has_value(), "WithConv::get should be registered");
+    CHECK(!wc_cls.find_function("operator int").has_value(),
+          "conversion operator should NOT be registered");
+    // No registered function may be the conversion.
+    for (const auto& f : wc_cls.functions())
+        CHECK(f.name != "operator int", "no registered function may be the conversion");
+
+    // === find_functions / find_static_functions walk bases ===
+    auto p_overloads = cls.find_functions("base_method");
+    CHECK(p_overloads.size() == 1, "find_functions should walk bases (base_method in Base)");
+    auto sc_cls = *refl::find_class("StaticChild");
+    auto sb_overloads = sc_cls.find_static_functions("sbval");
+    CHECK(sb_overloads.size() == 1, "find_static_functions should walk bases (sbval in StaticBase)");
+    auto sb_member = sc_cls.find_functions("sb");
+    CHECK(sb_member.size() == 1, "find_functions should walk bases (sb in StaticBase)");
+
+    // === const lvalue becomes owning (no mutable borrow of const) ===
+    const Point const_pt(11, 22);
+    refl::Object const_obj(const_pt);
+    CHECK(const_obj.is_owned(), "const lvalue must not be a mutable borrow (owning copy)");
+    auto cr = const_obj.cast_ref<Point>();
+    CHECK(cr.has_value(), "cast_ref on const-derived (now owned) object should work");
+    CHECK(cr.value()->x == 11, "const-borrow copy x should be 11");
+    CHECK(cr.value()->y == 22, "const-borrow copy y should be 22");
+    CHECK(const_pt.x == 11, "original const object must be unchanged");
 
     std::printf("refl core API test ok\n");
     return 0;
