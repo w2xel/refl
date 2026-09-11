@@ -164,6 +164,38 @@ struct StaticChild : StaticBase {
     StaticChild() : c(0) {}
 };
 
+// Private override of a public virtual: the override is excluded from
+// Derived's own function list, but find_function resolves it via the
+// base walk to the public declaration.  Virtual dispatch still hits the
+// private override at runtime — access is static, dispatch is dynamic.
+struct VBase {
+    int v;
+    VBase() : v(0) {}
+    VBase(int v) : v(v) {}
+    virtual int method() const { return v * 10; }
+    virtual ~VBase() = default;
+};
+struct VDerived : VBase {
+    VDerived(int v) : VBase(v) {}
+private:
+    int method() const override { return v * 100; }
+};
+
+// Non-virtual private hide: base's public fn is found via base walk and
+// called directly (no virtual dispatch, so the derived's hiding version
+// is never reached through the base declaration).
+struct NVBase {
+    int v;
+    NVBase() : v(0) {}
+    NVBase(int v) : v(v) {}
+    int fn() const { return v * 7; }
+};
+struct NVDerived : NVBase {
+    NVDerived(int v) : NVBase(v) {}
+private:
+    int fn() const { return v * 77; }
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -188,6 +220,10 @@ struct StaticChild : StaticBase {
 [[maybe_unused]] static refl::Reg<StaticBase> reg_static_base;
 [[maybe_unused]] static refl::Reg<StaticChild> reg_static_child;
 [[maybe_unused]] static refl::Reg<Priv> reg_priv_members;
+[[maybe_unused]] static refl::Reg<VBase> reg_vbase;
+[[maybe_unused]] static refl::Reg<VDerived> reg_vderived;
+[[maybe_unused]] static refl::Reg<NVBase> reg_nvbase;
+[[maybe_unused]] static refl::Reg<NVDerived> reg_nvderived;
 
 struct Wrong {};
 
@@ -786,6 +822,43 @@ int main() {
 
     // Public default constructor is still registered.
     CHECK(priv_cls.find_constructor({}).has_value(), "public default ctor should be registered");
+
+    // === Private override of public virtual ===
+    // The private override is not in VDerived's own function list, but
+    // find_function resolves it via the base walk to VBase's public
+    // declaration.  Virtual dispatch then hits the private override.
+    auto vd_cls = *refl::find_class("VDerived");
+    bool vd_has_method = false;
+    for (const auto& f : vd_cls.functions())
+        if (f.name == "method") vd_has_method = true;
+    CHECK(!vd_has_method, "private override should not appear in VDerived::functions()");
+    auto vd_method = vd_cls.find_function("method");
+    CHECK(vd_method.has_value(), "find_function should find 'method' via base walk");
+    auto vd_obj = *vd_cls.find_constructor({"int"})->call(3);
+    auto vd_ret = vd_method->invoke(vd_obj);
+    CHECK(vd_ret.has_value(), "invoke method on VDerived should succeed");
+    CHECK(*vd_ret->cast_safe<int>().value() == 300, "virtual dispatch should hit private override (3*100)");
+
+    // On the base itself, the base version runs.
+    auto vb_cls = *refl::find_class("VBase");
+    auto vb_obj = *vb_cls.find_constructor({"int"})->call(3);
+    auto vb_ret = vb_cls.find_function("method")->invoke(vb_obj);
+    CHECK(*vb_ret->cast_safe<int>().value() == 30, "base method should be 30 (3*10)");
+
+    // === Non-virtual private hide ===
+    // The private hide is excluded; find_function finds NVBase's public fn
+    // via base walk and calls it directly (no virtual dispatch).
+    auto nvd_cls = *refl::find_class("NVDerived");
+    bool nvd_has_fn = false;
+    for (const auto& f : nvd_cls.functions())
+        if (f.name == "fn") nvd_has_fn = true;
+    CHECK(!nvd_has_fn, "private hide should not appear in NVDerived::functions()");
+    auto nvd_fn = nvd_cls.find_function("fn");
+    CHECK(nvd_fn.has_value(), "find_function should find 'fn' via base walk");
+    auto nvd_obj = *nvd_cls.find_constructor({"int"})->call(5);
+    auto nvd_ret = nvd_fn->invoke(nvd_obj);
+    CHECK(nvd_ret.has_value(), "invoke fn on NVDerived should succeed");
+    CHECK(*nvd_ret->cast_safe<int>().value() == 35, "non-virtual hide should call base fn (5*7)");
 
     std::printf("refl core API test ok\n");
     return 0;
