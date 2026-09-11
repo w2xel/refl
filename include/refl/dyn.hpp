@@ -35,8 +35,8 @@ namespace refl {
 //     p->compute(3)    → int
 //     p->compute(3.0)   → double
 //
-// The invoker returns std::any internally; the cast to the real return
-// type happens inside operator() — the caller never sees std::any.
+// The invoker returns Object internally; the cast to the real return
+// type happens inside operator() — the caller never sees Object.
 // No std::function, no heap, no variant.
 // ---------------------------------------------------------------------------
 
@@ -93,8 +93,9 @@ struct TypedMethod {
     const OverloadEntry* overloads = nullptr;
     std::size_t num = 0;
     void* obj = nullptr;
+    std::shared_ptr<void> owner;  // shared_ptr for aliasing invoker calls
 
-    void (*after_call)(void* ctx, std::any& result) = nullptr;
+    void (*after_call)(void* ctx, Object& result) = nullptr;
     void* hook_ctx = nullptr;
 
     template <typename... Args>
@@ -107,13 +108,29 @@ struct TypedMethod {
         using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
         if constexpr (matches_sig<Sig, Args...>) {
             using R = typename sig_traits<Sig>::return_type;
-            auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-            const std::any* args_ptr =
-                arg_anys.empty() ? nullptr : arg_anys.data();
-            std::any result = overloads[I].invoker(obj, args_ptr);
+            // Build Object arg array from forwarded args.
+            std::tuple<std::decay_t<Args>...> storage(
+                std::forward<Args>(args)...);
+            std::array<Object, sizeof...(Args)> refs;
+            if constexpr (sizeof...(Args) > 0) {
+                [&]<std::size_t... J>(std::index_sequence<J...>) {
+                    ((refs[J] = Object(std::get<J>(storage))), ...);
+                }(std::make_index_sequence<sizeof...(Args)>{});
+            }
+            const Object* args_ptr =
+                sizeof...(Args) == 0 ? nullptr : refs.data();
+            Object result = overloads[I].invoker(
+                owner, obj, args_ptr);
             if (after_call) after_call(hook_ctx, result);
             if constexpr (std::is_void_v<R>) return;
-            else return std::any_cast<R>(result);
+            else {
+                // Extract the return value from the Object.
+                if constexpr (std::is_reference_v<R>) {
+                    return *result.template cast_ref<std::remove_cvref_t<R>>().value();
+                } else {
+                    return std::move(*result.template cast_ref<R>().value());
+                }
+            }
         } else {
             if constexpr (I + 1 < sizeof...(Sigs))
                 return call_dispatch<I + 1, Args...>(std::forward<Args>(args)...);
@@ -134,23 +151,27 @@ struct TypedProperty {
     GetterFn getter = nullptr;
     SetterFn setter = nullptr;  // always nullptr when Readonly=true
     void* obj = nullptr;
+    std::shared_ptr<void> owner;  // shared_ptr for getter/setter calls
     std::size_t member_offset = 0;  // byte offset of the member within T
 
-    void (*after_set)(void* ctx, std::any& val) = nullptr;
+    void (*after_set)(void* ctx, Object& val) = nullptr;
     void* hook_ctx = nullptr;
 
     // Implicit conversion to T (read).
     operator T() const {
-        if (!getter || !obj) throw std::bad_any_cast{};
-        return std::any_cast<T>(getter(obj));
+        if (!getter || !obj) throw std::bad_cast{};
+        Object result = getter(obj);
+        return std::move(*result.template cast_ref<T>().value());
     }
 
     // Assignment from T (write).  Compile error when Readonly=true.
     void operator=(T val) requires (!Readonly) {
         if (!setter || !obj) return;
-        setter(obj, std::any(std::move(val)));
+        std::decay_t<T> storage(std::move(val));
+        Object val_ref(&storage, detail::type_name<std::decay_t<T>>());
+        setter(obj, &val_ref);
         if (after_set) {
-            std::any current = getter(obj);
+            Object current = getter(obj);
             after_set(hook_ctx, current);
         }
     }
@@ -178,13 +199,16 @@ struct TypedStaticProperty {
     StaticSetterFn setter = nullptr;
 
     operator T() const {
-        if (!getter) throw std::bad_any_cast{};
-        return std::any_cast<T>(getter());
+        if (!getter) throw std::bad_cast{};
+        Object result = getter();
+        return std::move(*result.template cast_ref<T>().value());
     }
 
     void operator=(T val) requires (!Readonly) {
         if (!setter) return;
-        setter(std::any(std::move(val)));
+        std::decay_t<T> storage(std::move(val));
+        Object val_ref(&storage, detail::type_name<std::decay_t<T>>());
+        setter(&val_ref);
     }
 
     static constexpr bool is_readonly() { return Readonly; }
@@ -199,9 +223,9 @@ struct TypedStaticMethod {
     StaticInvokerFn invoker = nullptr;
 
     R operator()() {
-        std::any result = invoker(nullptr);
+        Object result = invoker(nullptr);
         if constexpr (std::is_void_v<R>) return;
-        else return std::any_cast<R>(result);
+        else return std::move(*result.template cast_ref<R>().value());
     }
 };
 
@@ -425,6 +449,8 @@ class Dyn {
                             std::remove_cv_t<FieldType>>) {
                         // Non-static member function → bind invokers.
                         dispatch_.[:field:].obj = dispatch_.obj.get();
+                        dispatch_.[:field:].owner =
+                            std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         constexpr auto entries = []() consteval {
                             using OE = typename
@@ -487,6 +513,8 @@ class Dyn {
                     } else {
                         // Non-static data member → bind getter/setter/offset.
                         dispatch_.[:field:].obj = dispatch_.obj.get();
+                        dispatch_.[:field:].owner =
+                            std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         static constexpr auto tdm = std::define_static_array(
                             std::meta::nonstatic_data_members_of(^^T,
@@ -534,11 +562,11 @@ class Dyn {
 
     // Hook storage: multi-listener (vector of callbacks per name).
     // std::map nodes are stable — pointers to the vectors don't move.
-    std::map<std::string, std::vector<std::function<void(std::any&)>>> invoke_hooks_;
-    std::map<std::string, std::vector<std::function<void(std::any&)>>> change_hooks_;
+    std::map<std::string, std::vector<std::function<void(Object&)>>> invoke_hooks_;
+    std::map<std::string, std::vector<std::function<void(Object&)>>> change_hooks_;
 
     // Dynamic properties (runtime-added, not reflected from T).
-    std::map<std::string, std::any> dynamic_props_;
+    std::map<std::string, Object> dynamic_props_;
 
     // --- Dynamic mode: runtime callable storage + trampolines.
     //     When T is abstract, no object is constructed; instead, implement()
@@ -555,8 +583,11 @@ class Dyn {
     // argument — so the lambda receives Dyn<T>& as its "this".
     // Supports 0-2 args (extendable).  The lambda signature is
     // R(Dyn<T>&, Args...) — the first arg is always the self-reference.
+    // dynamic_callables_ still stores the lambdas in std::any (it's
+    // internal storage, not the call boundary).
     template <std::meta::info Method>
-    static std::any trampoline(void* ctx, const std::any* args) {
+    static Object trampoline(const std::shared_ptr<void>&,
+                             void* ctx, const Object* args) {
         auto* self = static_cast<Dyn<T>*>(ctx);
         using R = [: std::meta::return_type_of(Method) :];
         constexpr auto params = std::define_static_array(
@@ -567,17 +598,20 @@ class Dyn {
         if constexpr (params.size() == 0) {
             auto& fn = std::any_cast<std::function<R(Dyn<T>&)>&>(
                 self->dynamic_callables_[key]);
-            if constexpr (std::is_void_v<R>) { fn(*self); return {}; }
-            else return std::any(fn(*self));
+            if constexpr (std::is_void_v<R>) { fn(*self); return Object{}; }
+            else return Object(std::make_shared<R>(fn(*self)),
+                             detail::type_name<R>());
         } else if constexpr (params.size() == 1) {
             using P0 = [: std::meta::type_of(params[0]) :];
             using C0 = std::remove_cvref_t<P0>;
             auto& fn = std::any_cast<std::function<R(Dyn<T>&, C0)>&>(
                 self->dynamic_callables_[key]);
+            auto& a0 = *static_cast<C0*>(args[0].raw());
             if constexpr (std::is_void_v<R>) {
-                fn(*self, std::any_cast<C0>(args[0])); return {};
+                fn(*self, a0); return Object{};
             } else {
-                return std::any(fn(*self, std::any_cast<C0>(args[0])));
+                return Object(std::make_shared<R>(fn(*self, a0)),
+                             detail::type_name<R>());
             }
         } else if constexpr (params.size() == 2) {
             using P0 = [: std::meta::type_of(params[0]) :];
@@ -586,16 +620,17 @@ class Dyn {
             using C1 = std::remove_cvref_t<P1>;
             auto& fn = std::any_cast<std::function<R(Dyn<T>&, C0, C1)>&>(
                 self->dynamic_callables_[key]);
+            auto& a0 = *static_cast<C0*>(args[0].raw());
+            auto& a1 = *static_cast<C1*>(args[1].raw());
             if constexpr (std::is_void_v<R>) {
-                fn(*self, std::any_cast<C0>(args[0]),
-                   std::any_cast<C1>(args[1])); return {};
+                fn(*self, a0, a1); return Object{};
             } else {
-                return std::any(fn(*self, std::any_cast<C0>(args[0]),
-                                   std::any_cast<C1>(args[1])));
+                return Object(std::make_shared<R>(fn(*self, a0, a1)),
+                             detail::type_name<R>());
             }
         } else {
             // ponytail: 3+ args not yet supported in the trampoline.
-            return {};
+            return Object{};
         }
     }
 
@@ -646,6 +681,8 @@ public:
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FT>>) {
                         dispatch_.[:field:].obj = dispatch_.obj.get();
+                        dispatch_.[:field:].owner =
+                            std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto entries = []() consteval {
                             using OE = typename
                                 std::remove_cv_t<FT>::OverloadEntry;
@@ -795,7 +832,7 @@ public:
     //   p.connect("sum", [](std::any& r) { ... });
     //   p.connect("sum", [](std::any& r) { ... });  // also fires
     void connect(std::string_view name,
-                  std::function<void(std::any&)> cb) {
+                  std::function<void(Object&)> cb) {
         auto key = std::string(name);
         auto& vec = invoke_hooks_[key];
         vec.push_back(std::move(cb));
@@ -814,9 +851,9 @@ public:
                     if (name == std::string_view(nm)) {
                         auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
                         tm->hook_ctx = &vec;
-                        tm->after_call = +[](void* ctx, std::any& r) {
+                        tm->after_call = +[](void* ctx, Object& r) {
                             auto* v = static_cast<
-                                std::vector<std::function<void(std::any&)>>*>(
+                                std::vector<std::function<void(Object&)>>*>(
                                     ctx);
                             for (auto& cb : *v) cb(r);
                         };
@@ -828,7 +865,7 @@ public:
 
     // on_change: connect a callback to a property change (multi-listener).
     void on_change(std::string_view name,
-                    std::function<void(std::any&)> cb) {
+                    std::function<void(Object&)> cb) {
         auto key = std::string(name);
         auto& vec = change_hooks_[key];
         vec.push_back(std::move(cb));
@@ -849,9 +886,9 @@ public:
                     if (name == std::string_view(nm)) {
                         auto* tp = static_cast<std::remove_cv_t<FT>*>(field);
                         tp->hook_ctx = &vec;
-                        tp->after_set = +[](void* ctx, std::any& v) {
+                        tp->after_set = +[](void* ctx, Object& v) {
                             auto* vct = static_cast<
-                                std::vector<std::function<void(std::any&)>>*>(
+                                std::vector<std::function<void(Object&)>>*>(
                                     ctx);
                             for (auto& cb : *vct) cb(v);
                         };
@@ -864,7 +901,7 @@ public:
     // Explicitly emit a signal — fire all connected callbacks for a name.
     // The std::any is passed to each callback.  Useful for custom signals
     // that don't map to a specific method.
-    void emit(std::string_view name, std::any value = {}) {
+    void emit(std::string_view name, Object value = {}) {
         auto key = std::string(name);
         auto it = invoke_hooks_.find(key);
         if (it != invoke_hooks_.end())
@@ -873,7 +910,7 @@ public:
 
     // Set a dynamic property (runtime-added, not reflected from T).
     // Fires on_change hooks for that name if any are connected.
-    void set_property(std::string_view name, std::any val) {
+    void set_property(std::string_view name, Object val) {
         auto key = std::string(name);
         dynamic_props_[key] = std::move(val);
         auto it = change_hooks_.find(key);
@@ -882,11 +919,11 @@ public:
     }
 
     // Get a dynamic property (runtime-added).
-    std::any get_property(std::string_view name) const {
+    Object get_property(std::string_view name) const {
         auto key = std::string(name);
         auto it = dynamic_props_.find(key);
         if (it != dynamic_props_.end()) return it->second;
-        return {};
+        return Object{};
     }
 
     // Connect a method on this object to a method on another Dyn<T>.
@@ -898,7 +935,7 @@ public:
         auto key = std::string(name);
         auto slot = std::string(slot_name);
         auto* other_ptr = other;
-        invoke_hooks_[key].push_back([other_ptr, slot](std::any& r) {
+        invoke_hooks_[key].push_back([other_ptr, slot](Object& r) {
             // Forward the result to the other object's slot hooks.
             other_ptr->emit(slot, r);
         });
@@ -918,9 +955,9 @@ public:
                     if (name == std::string_view(nm)) {
                         auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
                         tm->hook_ctx = &invoke_hooks_[key];
-                        tm->after_call = +[](void* ctx, std::any& r) {
+                        tm->after_call = +[](void* ctx, Object& r) {
                             auto* v = static_cast<
-                                std::vector<std::function<void(std::any&)>>*>(
+                                std::vector<std::function<void(Object&)>>*>(
                                     ctx);
                             for (auto& cb : *v) cb(r);
                         };

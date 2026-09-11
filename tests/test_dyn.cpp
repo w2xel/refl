@@ -91,16 +91,16 @@ int main() {
 
     // --- connect (function call hook) ---
     int hook_result = 0;
-    rp.connect("sum", [&hook_result](std::any& r) {
-        hook_result = std::any_cast<int>(r);
+    rp.connect("sum", [&hook_result](refl::Object& r) {
+        hook_result = *r.template cast_ref<int>().value();
     });
     (void)rp->sum();
     CHECK(hook_result == 119, "connect hook should fire after sum() with result 119 (99+20)");
 
     // --- on_change (property change hook) ---
     int change_result = 0;
-    rp.on_change("x", [&change_result](std::any& v) {
-        change_result = std::any_cast<int>(v);
+    rp.on_change("x", [&change_result](refl::Object& v) {
+        change_result = *v.template cast_ref<int>().value();
     });
     rp->x = 42;
     CHECK(change_result == 42, "on_change hook should fire with new value 42");
@@ -226,11 +226,11 @@ int main() {
 
     // === multi-listener hooks ===
     int hook_a = 0, hook_b = 0;
-    rp2.connect("sum", [&hook_a](std::any& r) {
-        hook_a = std::any_cast<int>(r);
+    rp2.connect("sum", [&hook_a](refl::Object& r) {
+        hook_a = *r.template cast_ref<int>().value();
     });
-    rp2.connect("sum", [&hook_b](std::any& r) {
-        hook_b = std::any_cast<int>(r);
+    rp2.connect("sum", [&hook_b](refl::Object& r) {
+        hook_b = *r.template cast_ref<int>().value();
     });
     (void)rp2->sum();
     CHECK(hook_a == 3, "multi-listener hook A should fire with 3");
@@ -238,30 +238,30 @@ int main() {
 
     // === explicit emit ===
     int emit_result = 0;
-    rp2.connect("custom_signal", [&emit_result](std::any& v) {
-        emit_result = std::any_cast<int>(v);
+    rp2.connect("custom_signal", [&emit_result](refl::Object& v) {
+        emit_result = *v.template cast_ref<int>().value();
     });
-    rp2.emit("custom_signal", std::any(42));
+    rp2.emit("custom_signal", 42);
     CHECK(emit_result == 42, "emit should fire connected callbacks");
 
     // === dynamic properties ===
-    rp2.set_property("dynamic_val", std::any(123));
-    int dp_val = std::any_cast<int>(rp2.get_property("dynamic_val"));
+    rp2.set_property("dynamic_val", 123);
+    int dp_val = *rp2.get_property("dynamic_val").template cast_ref<int>().value();
     CHECK(dp_val == 123, "dynamic property should be 123");
 
     // dynamic property with on_change
     int dyn_change = 0;
-    rp2.on_change("dynamic_val", [&dyn_change](std::any& v) {
-        dyn_change = std::any_cast<int>(v);
+    rp2.on_change("dynamic_val", [&dyn_change](refl::Object& v) {
+        dyn_change = *v.template cast_ref<int>().value();
     });
-    rp2.set_property("dynamic_val", std::any(456));
+    rp2.set_property("dynamic_val", 456);
     CHECK(dyn_change == 456, "on_change should fire on dynamic property set");
 
     // === cross-object connect ===
     refl::Dyn<Point> rp3(10, 20);
     int cross_result = 0;
-    rp3.connect("sum", [&cross_result](std::any& r) {
-        cross_result = std::any_cast<int>(r);
+    rp3.connect("sum", [&cross_result](refl::Object& r) {
+        cross_result = *r.template cast_ref<int>().value();
     });
     // Connect rp2's "sum" to rp3's "sum" — when rp2->sum() fires,
     // rp3's hooks receive rp2's result (forwarded via emit).

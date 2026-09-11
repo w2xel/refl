@@ -10,10 +10,9 @@ executable(
   install: false,
 )
 
-# Dyn layer not yet updated for the ObjectRef/Object transport change.
-# executable(
-#   'dynamic_sample',
-#   'dynamic.cpp',
-#   include_directories: inc,
-#   install: false,
-# )
+executable(
+  'dynamic_sample',
+  'dynamic.cpp',
+  include_directories: inc,
+  install: false,
+)

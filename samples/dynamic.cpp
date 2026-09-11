@@ -42,11 +42,11 @@ int main() {
     // --- Dyn<T> dispatch struct: typed calls + hooks.
     std::printf("=== Dyn<Rect> dispatch (3, 4) ===\n");
     refl::Dyn<Rect> r(3, 4);
-    r.connect("resize", [](std::any&) {
+    r.connect("resize", [](refl::Object&) {
         std::printf("  hook: resize() was called\n");
     });
-    r.on_change("w", [](std::any& v) {
-        std::printf("  hook: w changed to %d\n", std::any_cast<int>(v));
+    r.on_change("w", [](refl::Object& v) {
+        std::printf("  hook: w changed to %d\n", *v.template cast_ref<int>().value());
     });
     r->resize(5, 6);
     std::printf("  after resize: w=%d h=%d\n", r.get().w, r.get().h);

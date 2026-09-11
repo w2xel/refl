@@ -432,12 +432,20 @@ public:
     Object(void* ptr, std::string_view class_name)
         : ptr_(ptr), class_name_(class_name) {}
 
-    // From a concrete object — infers class name at compile time.
-    // Non-owning: the caller must keep obj alive.
+    // From a concrete lvalue — non-owning borrow.
+    // The caller must keep obj alive.
     template <typename T>
         requires (not std::same_as<std::remove_cvref_t<T>, Object>)
     Object(T& obj) noexcept
         : ptr_(static_cast<void*>(std::addressof(obj)))
+        , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
+
+    // From a concrete rvalue — owning (moves into shared_ptr).
+    template <typename T>
+        requires (not std::same_as<std::remove_cvref_t<T>, Object>)
+    Object(T&& obj)
+        : owner_(std::make_shared<std::remove_cvref_t<T>>(std::move(obj)))
+        , ptr_(owner_.get())
         , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
 
     // Block temporaries from the template constructor (below) — but allow
