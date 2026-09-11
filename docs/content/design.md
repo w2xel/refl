@@ -23,20 +23,24 @@ auto construct = *my_class_class.find_constructor({"int", "int"});
 auto my_obj = *construct.call(1, 3);
 ```
 
-The returned `Object` is a type-erased, shared-ownership handle (backed by
-`std::shared_ptr<void>`) — you don't need to know the C++ type to construct
-or invoke methods.  Copies share ownership.  Functions are called on the
+The returned `Object` is a type-erased handle — it can be owning (backed by
+`std::shared_ptr<void>`, copies share ownership) or non-owning (a raw
+pointer borrow into a stack or heap object).  You don't need to know the
+C++ type to construct or invoke methods.  Functions are called on the
 `Object` directly:
 
 ```cpp
 auto fn = *my_class_class.find_function("some_method");
-std::any result = *fn.invoke(my_obj, arg1, arg2);
+auto result = *fn.invoke(my_obj, arg1, arg2);
+// result is an Object — extract via cast_safe (owning) or cast_ref (non-owning)
+auto val = result.cast_safe<ReturnType>().value();
 ```
 
 When you need the concrete type, use the safe cast, which checks the class
 name at runtime and returns a `std::shared_ptr<T>` that shares ownership
 with the Object — it succeeds for the object's own class and for any base
-class (upcast):
+class (upcast).  `cast_safe` only works on owning Objects; for non-owning
+Objects, use `cast_ref<T>()` which returns a raw `T*`:
 
 ```cpp
 auto result = my_obj.cast_safe<MyClass>();
@@ -47,13 +51,15 @@ Fields can be found by name and get/set through type-erased handles:
 
 ```cpp
 auto field = *my_class_class.find_field("x");
-std::any old = *field.get(my_obj);
-field.set(my_obj, std::any(42));
+auto old = *field.get(my_obj);          // returns Object (copy of the value)
+field.set(my_obj, 42);                 // typed set, no std::any needed
+auto ptr = *field.get_ref(my_obj);     // void* into the object (move-only OK)
 ```
 
 Note the dereferences — the return values are `std::expected`.
-Function results are returned as `std::any` — use `std::any_cast<T>` to
-extract (empty for void functions).
+Function and field results are returned as `Object` — use `cast_safe<T>()`
+(owning) or `cast_ref<T>()` (non-owning) to extract.  Void functions return
+an invalid `Object` (`.valid()` is false).
 
 ## Mechanism
 
@@ -86,32 +92,46 @@ Initial implementation. The API above is working:
 - `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
 - `Class::bases()` returns the direct base classes (name + byte offset within T).
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
-  type-erased, shared-ownership handle.  No template parameter needed.
+  type-erased, owning handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on any object —
-  an owned `Object` or a stack/concrete instance — both via `ObjectRef`
-  (implicit conversion).  Returns `std::expected<std::any, Error>`.
+  an owned `Object` or a stack/concrete instance (implicit conversion).
+  Returns `std::expected<Object, Error>`.
   Returns `Error::TypeError` if the object is not the function's class (or a
   derived class), `Error::NullHandle` if the handle is invalid.
-- `Field::get(obj)` and `Field::set(obj, std::any)` get/set the field on any
-  object (owned `Object` or stack/concrete instance, via `ObjectRef`).
-  `get` returns `std::expected<std::any, Error>`; `set` returns
-  `Error::ReadOnly` for read-only (const or bit-field) fields, and
-  `Error::TypeError` / `Error::NullHandle` as above.
+  Reference-returning functions (operator=, operator+=, fluent builders)
+  return an aliasing Object that keeps the original alive.
+- `Field::get(obj)` and `Field::set(obj, val)` get/set the field on any
+  object (owned `Object` or stack/concrete instance).
+  `get` returns `std::expected<Object, Error>` (a copy of the value);
+  `set` takes a typed value (no `std::any` needed) and returns
+  `Error::ReadOnly` for read-only (const, bit-field, or move-only) fields,
+  and `Error::TypeError` / `Error::NullHandle` as above.
+- `Field::get_ref(obj)` returns `std::expected<void*, Error>` — a non-owning
+  pointer into the field inside the object.  Works for all members including
+  move-only (unique_ptr).  The caller casts `void*` to the member type.
+- `Field::has_getter()` returns true if the field has a copy-based getter
+  (false for move-only members — use `get_ref` instead).
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
   (walks bases).
-  `StaticField::get()` returns `std::expected<std::any, Error>`; `StaticField::set(std::any)`
-  writes the static storage (no Object needed) and returns `std::expected<void, Error>`.
+  `StaticField::get()` returns `std::expected<Object, Error>`;
+  `StaticField::set(val)` writes the static storage (no Object needed)
+  and returns `std::expected<void, Error>`.
 - `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`
   (walks bases). `find_static_function("name", {"int"})` resolves overloads by param
   types. `find_static_functions("name")` returns all overloads.
   `StaticFunction::invoke(args...)` calls the function directly (no Object needed)
-  and returns `std::expected<std::any, Error>`.
+  and returns `std::expected<Object, Error>`.
 - `Class::constructors()` enumerates all registered constructors.
 - `Class::functions()` enumerates all registered member functions.
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
-  object's class or any of its bases (upcast).
+  object's class or any of its bases (upcast).  Only works on owning
+  Objects; returns `Error::NotCopyable` for non-owning Objects.
+- `Object::cast_ref<T>()` returns `std::expected<T*, Error>` — a raw pointer
+  for both owned and non-owning Objects.  The caller manages lifetime.
+- `Object::is_owned()` returns true if the Object owns its data (backed by
+  shared_ptr), false if it's a non-owning borrow.
 - `Object::is_class("Name")` checks whether the object is of the given class
   or a class derived from it.
 - `find_enum("Name")` returns `std::expected<Enum, Error>`.
@@ -119,15 +139,9 @@ Initial implementation. The API above is working:
   `std::expected<Enumerator, Error>`.
 - `list_all_classes()` and `list_all_enums()` enumerate registered names.
 - `Object::clone()` deep-copies the object through the type-erased handle.
-  Returns `Error::NotCopyable` if the class is not copy-constructible.
+  Returns `Error::NotCopyable` if the class is not copy-constructible or
+  the Object is non-owning.
 - `Object::to_string()` returns a debug string with the class name and address.
-- `ObjectRef` is a non-owning borrow (void* + string_view class name) that works
-  with both owned `Object` instances and stack/concrete objects.  `Object`
-  converts to `ObjectRef` implicitly (lvalues only — temporaries are deleted
-  to prevent dangling).  `Function::invoke`, `Field::get`, and `Field::set`
-  all take `ObjectRef` by value, so a single overload each serves owned,
-  const-owned, and stack objects.  `ObjectRef::is_class("Name")` works the
-  same as `Object::is_class`.
 
 Type identity uses the fully-qualified name (`display_string_of`), so two
 classes with the same unqualified name in different namespaces do not collide
@@ -136,8 +150,9 @@ in the pool or in `cast_safe`.  Global-scope types have no prefix
 (`find_class("ns::Point")`).
 
 Argument forwarding is checked at the call boundary: an argument-count
-mismatch returns `Error::ArityMismatch` and a `std::any` type mismatch returns
-`Error::TypeError` (caught internally — never thrown to the caller).  This
+mismatch returns `Error::ArityMismatch` and a type mismatch returns
+`Error::TypeError` (caught internally — never thrown to the caller).  Type
+checking uses compile-time `display_string_of` type names (no RTTI).  This
 applies to `Constructor::call`, `Function::invoke`, `StaticFunction::invoke`,
 `Field::set`, and `StaticField::set`.  Writing to a read-only field returns
 `Error::ReadOnly`; cloning a non-copy-constructible class returns
@@ -151,7 +166,9 @@ Limitations (marked with `ponytail:` in the source):
   `Field::get_ref()` to access them by pointer.  Registration no longer fails
   to compile for classes with move-only members.
 - Functions with reference return types (e.g. `operator=`, `operator+=`)
-  are invoked but the return is ignored (invalid `Object` returned).
+  return an aliasing Object that shares ownership with the original (for
+  owned objects) or a non-owning Object (for stack objects).  The caller
+  can use `cast_ref<T>()` to access the return value.
 - Deleted functions are skipped (not registered).
 - Multiple inheritance is supported — base-class pointer adjustment uses
   `offset_of` at registration time, accumulated through the base hierarchy.

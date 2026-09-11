@@ -32,9 +32,9 @@ return types work (`TypedMethod<int(int), double(double)>`).
 ## Hooks (Qt-style, after-only)
 
 ```cpp
-p.connect("sum", [](std::any& result) { ... });   // fires after sum()
-p.on_change("x", [](std::any& newval) { ... });   // fires after x = ...
-p.emit("custom", std::any(42));                   // fire connected callbacks
+p.connect("sum", [](refl::Object& result) { ... });   // fires after sum()
+p.on_change("x", [](refl::Object& newval) { ... });   // fires after x = ...
+p.emit("custom", 42);                                 // fire connected callbacks
 ```
 
 After-only observers — they see the result/value but cannot veto or modify.
