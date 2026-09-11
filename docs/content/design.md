@@ -211,6 +211,17 @@ Limitations:
   owned objects) or a non-owning Object (for stack objects).  The caller
   can use `cast_ref<T>()` to access the return value.
 - Deleted functions are skipped (not registered).
+- C++ name hiding is respected by `find_function`, `find_functions`,
+  `find_static_function`, `find_static_functions`, `all_functions()`, and
+  `all_static_functions()`.  If a derived class declares any function named
+  `X`, all base `X` overloads are hidden — they are not returned by any of
+  these methods.  This matches C++ semantics: hiding is name-based, not
+  signature-based (a derived `set(int)` hides a base `set(int,int)`).
+  `using Base::set;` declarations that un-hide base overloads are **not**
+  represented in the reflection metadata — the using-declaration does not
+  create a new function member, so the framework cannot detect it.  Base
+  overloads remain hidden even when a `using`-declaration makes them
+  callable in raw C++.
 - Multiple inheritance is supported — base-class pointer adjustment uses
   `offset_of` at registration time, accumulated through the base hierarchy.
   Only public inheritance is walked — protected and private bases are not

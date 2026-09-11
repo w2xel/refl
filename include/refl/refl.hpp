@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1410,6 +1411,17 @@ std::expected<R, Error> walk_bases(
     }
     return std::unexpected(Error::NotFound);
 }
+
+// Collect the set of function (or static-function) names defined directly
+// on a ClassInfo — used for C++ name-hiding: if a derived class declares
+// any function named X, all base X overloads are hidden.
+template <typename Member>
+std::set<std::string> own_names(const std::vector<Member>& members) {
+    std::set<std::string> names;
+    for (const auto& m : members)
+        names.insert(m.name);
+    return names;
+}
 }  // namespace detail
 
 inline std::expected<Constructor, Error> Class::find_constructor(
@@ -1460,27 +1472,41 @@ inline std::expected<Function, Error> Class::find_function(
     for (auto t : types)
         query.push_back(detail::normalize_type(t));
 
+    // C++ name hiding: if the derived class declares any function named
+    // `name`, all base overloads are hidden — don't walk bases.
+    bool name_exists = false;
     for (std::size_t i = 0; i < info_->functions.size(); ++i) {
-        const auto& fn = info_->functions[i];
-        if (fn.name == name && detail::match_signature(fn.param_types, query))
-            return Function(info_, i);
+        if (info_->functions[i].name == name) {
+            name_exists = true;
+            if (detail::match_signature(info_->functions[i].param_types, query))
+                return Function(info_, i);
+        }
     }
+    if (name_exists)
+        return std::unexpected(Error::NotFound);
+
     return detail::walk_bases<Function>(info_->bases,
         [name, types](const Class& b) { return b.find_function(name, types); });
 }
 
-// Find all overloads of a function by name.  Walks base classes — an
-// overload inherited from a base is included alongside the derived class's
-// own overloads (shadows accumulate, not replace).
+// Find all overloads of a function by name.  Walks base classes, but
+// respects C++ name hiding: if the derived class declares any function
+// named `name`, base overloads are hidden and not included.
 inline std::vector<Function> Class::find_functions(
     std::string_view name) const {
     std::vector<Function> results;
     if (!valid()) return results;
 
+    bool name_exists = false;
     for (std::size_t i = 0; i < info_->functions.size(); ++i) {
-        if (info_->functions[i].name == name)
+        if (info_->functions[i].name == name) {
+            name_exists = true;
             results.push_back(Function(info_, i));
+        }
     }
+    // Name hiding: don't walk bases if the derived class has this name.
+    if (name_exists) return results;
+
     for (const auto& b : info_->bases) {
         auto base = find_class(b.name);
         if (base) {
@@ -1495,13 +1521,18 @@ inline std::vector<FunctionInfo> Class::all_functions() const {
     std::vector<FunctionInfo> results;
     if (!valid()) return results;
 
+    // Collect this class's own function names (hides base overloads).
+    auto hidden = detail::own_names(info_->functions);
     for (const auto& f : info_->functions)
         results.push_back(f);
     for (const auto& b : info_->bases) {
         auto base = find_class(b.name);
         if (base) {
             auto more = base->all_functions();
-            results.insert(results.end(), more.begin(), more.end());
+            for (auto& fi : more) {
+                if (!hidden.count(fi.name))
+                    results.push_back(std::move(fi));
+            }
         }
     }
     return results;
@@ -1562,25 +1593,39 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
     for (auto t : types)
         query.push_back(detail::normalize_type(t));
 
+    // C++ name hiding: if the derived class declares any static function
+    // named `name`, all base overloads are hidden — don't walk bases.
+    bool name_exists = false;
     for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
-        const auto& sf = info_->static_functions[i];
-        if (sf.name == name && detail::match_signature(sf.param_types, query))
-            return StaticFunction(info_, i);
+        if (info_->static_functions[i].name == name) {
+            name_exists = true;
+            if (detail::match_signature(info_->static_functions[i].param_types, query))
+                return StaticFunction(info_, i);
+        }
     }
+    if (name_exists)
+        return std::unexpected(Error::NotFound);
+
     return detail::walk_bases<StaticFunction>(info_->bases,
         [name, types](const Class& b) { return b.find_static_function(name, types); });
 }
 
-// Find all overloads of a static function by name.  Walks base classes.
+// Find all overloads of a static function by name.  Walks base classes,
+// respecting C++ name hiding.
 inline std::vector<StaticFunction> Class::find_static_functions(
     std::string_view name) const {
     std::vector<StaticFunction> results;
     if (!valid()) return results;
 
+    bool name_exists = false;
     for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
-        if (info_->static_functions[i].name == name)
+        if (info_->static_functions[i].name == name) {
+            name_exists = true;
             results.push_back(StaticFunction(info_, i));
+        }
     }
+    if (name_exists) return results;
+
     for (const auto& b : info_->bases) {
         auto base = find_class(b.name);
         if (base) {
@@ -1595,13 +1640,17 @@ inline std::vector<StaticFunctionInfo> Class::all_static_functions() const {
     std::vector<StaticFunctionInfo> results;
     if (!valid()) return results;
 
+    auto hidden = detail::own_names(info_->static_functions);
     for (const auto& sf : info_->static_functions)
         results.push_back(sf);
     for (const auto& b : info_->bases) {
         auto base = find_class(b.name);
         if (base) {
             auto more = base->all_static_functions();
-            results.insert(results.end(), more.begin(), more.end());
+            for (auto& sfi : more) {
+                if (!hidden.count(sfi.name))
+                    results.push_back(std::move(sfi));
+            }
         }
     }
     return results;

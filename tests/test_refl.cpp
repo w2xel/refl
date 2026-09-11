@@ -196,6 +196,23 @@ private:
     int fn() const { return v * 77; }
 };
 
+// Name hiding with overloads: Derived declares set(int), which hides
+// BOTH Base::set(int) and Base::set(int,int) in C++.  The framework's
+// find_function, find_functions, and all_functions must respect this:
+// base set overloads are not reachable through Derived.
+struct HideBase {
+    int v;
+    HideBase() : v(0) {}
+    HideBase(int v) : v(v) {}
+    void set(int a) { v = a; }
+    void set(int a, int b) { v = a + b; }
+    int get() const { return v; }
+};
+struct HideDerived : HideBase {
+    HideDerived(int v) : HideBase(v) {}
+    void set(int a) { v = a * 100; }  // hides both Base::set overloads
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -224,6 +241,8 @@ private:
 [[maybe_unused]] static refl::Reg<VDerived> reg_vderived;
 [[maybe_unused]] static refl::Reg<NVBase> reg_nvbase;
 [[maybe_unused]] static refl::Reg<NVDerived> reg_nvderived;
+[[maybe_unused]] static refl::Reg<HideBase> reg_hide_base;
+[[maybe_unused]] static refl::Reg<HideDerived> reg_hide_derived;
 
 struct Wrong {};
 
@@ -905,6 +924,39 @@ int main() {
             break;
         }
     }
+
+    // === Name hiding with overloads ===
+    // HideDerived::set(int) hides both HideBase::set(int) and set(int,int).
+    auto hd_cls = *refl::find_class("HideDerived");
+    auto hd_obj = *hd_cls.find_constructor({"int"})->call(0);
+
+    // find_function("set", {"int"}) — finds Derived's set(int).
+    auto hd_set1 = hd_cls.find_function("set", {"int"});
+    CHECK(hd_set1.has_value(), "find_function('set',{'int'}) on HideDerived should find derived set(int)");
+
+    // find_function("set", {"int","int"}) — base's set(int,int) is HIDDEN.
+    auto hd_set2 = hd_cls.find_function("set", {"int", "int"});
+    CHECK(!hd_set2.has_value(), "find_function('set',{'int','int'}) on HideDerived should fail (hidden)");
+
+    // find_functions("set") — only Derived's set(int), not Base's two.
+    auto hd_overloads = hd_cls.find_functions("set");
+    CHECK(hd_overloads.size() == 1, "find_functions('set') on HideDerived should be 1 (only derived)");
+
+    // all_functions() — base's set overloads hidden, but get() still visible.
+    auto hd_all = hd_cls.all_functions();
+    int hd_set_count = 0;
+    bool hd_has_get = false;
+    for (const auto& fi : hd_all) {
+        if (fi.name == "set") ++hd_set_count;
+        if (fi.name == "get") hd_has_get = true;
+    }
+    CHECK(hd_set_count == 1, "all_functions() should have 1 set (derived only, base hidden)");
+    CHECK(hd_has_get, "all_functions() should include inherited get() (not hidden)");
+
+    // Invoke the derived set(int) to confirm it works.
+    (void)hd_set1->invoke(hd_obj, 3);
+    auto hd_p = hd_obj.cast_safe<HideDerived>().value();
+    CHECK(hd_p->v == 300, "derived set(3) should give 300 (3*100)");
 
     std::printf("refl core API test ok\n");
     return 0;
