@@ -566,15 +566,24 @@ prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
 // type-name mismatch — caught by checked_call and mapped to TypeError.
 // P is the spliced parameter type (e.g. [:std::meta::type_of(params[J]):]);
 // J is the argument index, passed at runtime.
+//
+// If the argument's class doesn't exactly match P, checks whether it's a
+// derived class of P and adjusts the pointer to the base subobject — the
+// same upcast that invoke does for the target object.
 template <typename P>
 auto extract_arg(const Object* args, std::size_t J) {
     using PBare = std::remove_cvref_t<P>;
     constexpr auto param_type = type_name<PBare>();
-    if (args[J].class_name() != param_type) throw std::bad_cast{};
+    void* src = args[J].raw();
+    if (args[J].class_name() != param_type) {
+        auto off = is_base_of_with_offset(args[J].class_name(), param_type);
+        if (!off) throw std::bad_cast{};
+        src = static_cast<char*>(src) + *off;
+    }
     if constexpr (std::is_rvalue_reference_v<P>)
-        return std::move(*static_cast<PBare*>(args[J].raw()));
+        return std::move(*static_cast<PBare*>(src));
     else
-        return *static_cast<PBare*>(args[J].raw());
+        return *static_cast<PBare*>(src);
 }
 
 template <typename T, std::meta::info Ctor>
@@ -1067,6 +1076,24 @@ public:
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<char*>(adj) + owner_->fields[idx_].offset;
+    }
+
+    // Typed get_ref — returns a typed pointer into the field inside the
+    // object.  Checks T against the field's stored type name at runtime.
+    // For all members including move-only.  The pointer is valid as long
+    // as the object is alive.
+    // Returns Error::TypeError if T doesn't match the field type or obj
+    // is not the field's class, Error::NullHandle if the handle is invalid.
+    template <typename T>
+    std::expected<T*, Error> get_ref(Object obj) const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        if (detail::type_name<T>() != owner_->fields[idx_].type)
+            return std::unexpected(Error::TypeError);
+        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return static_cast<T*>(static_cast<void*>(
+            static_cast<char*>(adj) + owner_->fields[idx_].offset));
     }
 
     // Set the field value.  Returns Error::ReadOnly if the field is

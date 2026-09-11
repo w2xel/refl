@@ -100,6 +100,8 @@ Initial implementation. The API above is working:
   derived class), `Error::NullHandle` if the handle is invalid.
   Reference-returning functions (operator=, operator+=, fluent builders)
   return an aliasing Object that keeps the original alive.
+  Arguments are also upcast: a function taking `Base&` can be invoked with
+  a `Derived` Object — the argument is adjusted to the base subobject.
 - `Field::get(obj)` and `Field::set(obj, val)` get/set the field on any
   object (owned `Object` or stack/concrete instance).
   `get` returns `std::expected<Object, Error>` (a copy of the value);
@@ -109,6 +111,10 @@ Initial implementation. The API above is working:
 - `Field::get_ref(obj)` returns `std::expected<void*, Error>` — a non-owning
   pointer into the field inside the object.  Works for all members including
   move-only (unique_ptr).  The caller casts `void*` to the member type.
+- `Field::get_ref<T>(obj)` returns `std::expected<T*, Error>` — a typed
+  pointer into the field.  Checks `T` against the field's type name at
+  runtime; returns `Error::TypeError` on mismatch.  For all members
+  including move-only.
 - `Field::has_getter()` returns true if the field has a copy-based getter
   (false for move-only members — use `get_ref` instead).
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`

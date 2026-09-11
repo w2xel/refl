@@ -88,6 +88,14 @@ struct AccessMixed : public PubBase, protected ProtBase, private PrivBase {
     AccessMixed(int p, int r, int i, int m) : PubBase(p), ProtBase(r), PrivBase(i), m(m) {}
 };
 
+// A function taking a base-class argument — used to test derived-to-base
+// argument conversion: passing a Point (derived) where Base is expected.
+struct Receiver {
+    int acc;
+    Receiver() : acc(0) {}
+    int add_base(Base b) { acc += b.base_val; return acc; }
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -104,6 +112,7 @@ struct AccessMixed : public PubBase, protected ProtBase, private PrivBase {
 [[maybe_unused]] static refl::Reg<ProtBase> reg_prot;
 [[maybe_unused]] static refl::Reg<PrivBase> reg_priv;
 [[maybe_unused]] static refl::Reg<AccessMixed> reg_access_mixed;
+[[maybe_unused]] static refl::Reg<Receiver> reg_receiver;
 
 struct Wrong {};
 
@@ -489,6 +498,37 @@ int main() {
     auto borrowed_ref = borrowed.cast_ref<Point>();
     CHECK(borrowed_ref.has_value(), "cast_ref on non-owning should succeed");
     CHECK(borrowed_ref.value()->x == 555, "borrowed ref x should be 555");
+
+    // === Derived-to-base argument conversion ===
+    // A function taking Base can be invoked with a Point (derived) —
+    // the argument is upcast to the Base subobject automatically.
+    auto recv_cls = *refl::find_class("Receiver");
+    auto recv = *recv_cls.find_constructor({})->call();
+    auto add_fn = *recv_cls.find_function("add_base");
+    // Point(1,3) calls Base(x) so base_val=1; add_base copies Base by value.
+    auto ab_ret = add_fn.invoke(recv, obj);
+    CHECK(ab_ret.has_value(), "invoke add_base with Point (derived) should succeed");
+    CHECK(*ab_ret->cast_safe<int>().value() == 1, "add_base should see base_val=1");
+    // Passing a genuine Base should still work (exact match path).
+    auto base_arg = *base_cls.find_constructor({"int"})->call(5);
+    auto ab2_ret = add_fn.invoke(recv, base_arg);
+    CHECK(ab2_ret.has_value(), "invoke add_base with Base (exact) should succeed");
+    CHECK(*ab2_ret->cast_safe<int>().value() == 6, "add_base should accumulate to 6");
+    // Passing an unrelated type should still fail.
+    auto bad_arg_ret = add_fn.invoke(recv, 3.14);
+    CHECK(!bad_arg_ret.has_value(), "invoke add_base with wrong type should fail");
+    CHECK(bad_arg_ret.error() == refl::Error::TypeError, "wrong arg type should be TypeError");
+
+    // === Typed get_ref ===
+    auto xf2 = *cls.find_field("x");
+    auto typed_ref = xf2.get_ref<int>(obj);
+    CHECK(typed_ref.has_value(), "typed get_ref<int> should succeed");
+    CHECK(*typed_ref.value() == 77, "typed get_ref x should be 77");
+    *typed_ref.value() = 888;
+    CHECK(p->x == 888, "after typed get_ref write, x should be 888");
+    auto typed_wrong = xf2.get_ref<double>(obj);
+    CHECK(!typed_wrong.has_value(), "typed get_ref<double> on int field should fail");
+    CHECK(typed_wrong.error() == refl::Error::TypeError, "wrong type get_ref should be TypeError");
 
     // === Operators ===
     auto vec_cls = *refl::find_class("Vec");
