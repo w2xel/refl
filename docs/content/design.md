@@ -92,12 +92,18 @@ Initial implementation. The API above is working:
   (walks base classes — inherited overloads accumulate alongside the derived
   class's own).
 - `Class::all_functions()` returns all functions across the full hierarchy as
-  `std::vector<FunctionInfo>` (by value, merged view).  Unlike `functions()`
-  which returns only this class's own members by reference, `all_functions()`
-  includes inherited functions.  Wrap any element in a `Function` via its
-  explicit constructor to invoke.
+  `std::vector<Function>` (by value, merged view).  Unlike `functions()`
+  which returns only this class's own members, `all_functions()`
+  includes inherited functions.  Elements are `Function` handles — call
+  `.invoke()` directly.
 - `Class::all_static_functions()` is the static-function equivalent of
-  `all_functions()`, returning `std::vector<StaticFunctionInfo>`.
+  `all_functions()`, returning `std::vector<StaticFunction>`.
+- `Class::all_fields()` returns all data fields across the full hierarchy
+  as `std::vector<Field>` (by value, merged view).  Unlike `fields()`
+  which returns only this class's own members, `all_fields()` includes
+  inherited fields.
+- `Class::all_static_fields()` is the static-field equivalent of
+  `all_fields()`, returning `std::vector<StaticField>`.
 - `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
 - `Class::bases()` returns the direct base classes (name + byte offset within T).
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
@@ -131,6 +137,11 @@ Initial implementation. The API above is working:
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
   (walks bases).
   `StaticField::get()` returns `std::expected<Object, Error>`;
+  `StaticField::get_ref()` returns `std::expected<void*, Error>` — a
+  non-owning pointer to the static storage (works for move-only members);
+  `StaticField::get_ref<T>()` is the typed variant (checks the type name at
+  runtime).  Both return `Error::ReadOnly` for const static members, which
+  may lack addressable storage (use `get()` to read by copy).
   `StaticField::set(val)` writes the static storage (no Object needed)
   and returns `std::expected<void, Error>`.
 - `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`
@@ -138,14 +149,19 @@ Initial implementation. The API above is working:
   types. `find_static_functions("name")` returns all overloads (walks bases).
   `StaticFunction::invoke(args...)` calls the function directly (no Object needed)
   and returns `std::expected<Object, Error>`.
-- `Class::constructors()` enumerates all registered constructors.
-- `Class::functions()` enumerates this class's own member functions
-  (by reference).  `Class::all_functions()` returns the full hierarchy
-  (by value).
-- Each `*Info` struct (`FunctionInfo`, `StaticFunctionInfo`, `FieldInfo`,
-  `StaticFieldInfo`, `ConstructorInfo`) carries an `owner` back-pointer to
-  its `ClassInfo` and an `index`.  Wrap any `*Info` into its handle type via
-  the explicit constructor (e.g. `Function(const FunctionInfo&)`) to invoke.
+- `Class::constructors()` enumerates all registered constructors as
+  `std::vector<Constructor>`.
+- `Class::functions()` enumerates this class's own member functions as
+  `std::vector<Function>`.  `Class::all_functions()` returns the full
+  hierarchy (by value).  `Class::fields()`, `Class::static_fields()`,
+  and `Class::static_functions()` likewise return handle vectors of their
+  own members; the `all_*` variants include inherited members across the
+  full hierarchy.
+- The `*Info` structs (`FunctionInfo`, `StaticFunctionInfo`, `FieldInfo`,
+  `StaticFieldInfo`, `ConstructorInfo`) are internal metadata stored in
+  `ClassInfo`.  The public API returns handle types (`Function`, `Field`,
+  etc.) that wrap them; call the handle methods (`name()`, `param_types()`,
+  `invoke()`, `get()`, etc.) directly.
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
@@ -234,5 +250,8 @@ Limitations:
   destructor are not registered.
 - Clone requires a copy constructor — non-copyable classes return
   `Error::NotCopyable`.
+- Enum values are stored as `long long`.  Enums with an unsigned underlying
+  type and values exceeding `LLONG_MAX` undergo an implementation-defined
+  conversion; the stored value may not match the true enumerator value.
 - Registration is static-init order dependent — `find_class` only works after
   `Reg<T>` has been instantiated (or `ensure_registered<T>()` called).

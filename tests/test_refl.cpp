@@ -418,6 +418,27 @@ int main() {
     CHECK(!set_max.has_value(), "set on readonly static should fail");
     CHECK(set_max.error() == refl::Error::ReadOnly, "should be ReadOnly");
 
+    // --- static field get_ref (typed + untyped) ---
+    // instance_count was set to 42 above; get_ref returns a pointer to the
+    // live static storage.
+    auto sf_ref = sf->get_ref();
+    CHECK(sf_ref.has_value(), "untyped get_ref on static field should succeed");
+    CHECK(*static_cast<int*>(sf_ref.value()) == 42, "get_ref should see 42");
+    *static_cast<int*>(sf_ref.value()) = 77;
+    CHECK(*sf->get()->cast_safe<int>().value() == 77, "after get_ref write, get should see 77");
+    auto sf_tref = sf->get_ref<int>();
+    CHECK(sf_tref.has_value(), "typed get_ref<int> on static field should succeed");
+    CHECK(*sf_tref.value() == 77, "typed get_ref should see 77");
+    auto sf_tref_wrong = sf->get_ref<double>();
+    CHECK(!sf_tref_wrong.has_value(), "typed get_ref<double> on int static field should fail");
+    CHECK(sf_tref_wrong.error() == refl::Error::TypeError, "should be TypeError");
+    // get_ref on a const static member returns ReadOnly (no addressable storage).
+    auto max_ref = maxf->get_ref();
+    CHECK(!max_ref.has_value(), "get_ref on const static should fail");
+    CHECK(max_ref.error() == refl::Error::ReadOnly, "const static get_ref should be ReadOnly");
+    // Restore for the get_instance_count check below.
+    (void)sf->set(42);
+
     // --- static member functions ---
     auto sf_count = cls.find_static_function("get_instance_count");
     CHECK(sf_count.has_value(), "find_static_function(\"get_instance_count\") should succeed");
@@ -440,7 +461,7 @@ int main() {
     const auto& fns = cls.functions();
     CHECK(fns.size() >= 3, "Point should have at least 3 member functions (sum, set, set)");
     bool has_sum = false;
-    for (const auto& f : fns) if (f.name == "sum") has_sum = true;
+    for (const auto& f : fns) if (f.name() == "sum") has_sum = true;
     CHECK(has_sum, "functions() should list sum");
 
     // --- find_static_function with param types ---
@@ -798,7 +819,7 @@ int main() {
           "conversion operator should NOT be registered");
     // No registered function may be the conversion.
     for (const auto& f : wc_cls.functions())
-        CHECK(f.name != "operator int", "no registered function may be the conversion");
+        CHECK(f.name() != "operator int", "no registered function may be the conversion");
 
     // === find_functions / find_static_functions walk bases ===
     auto p_overloads = cls.find_functions("base_method");
@@ -849,7 +870,7 @@ int main() {
     auto vd_cls = *refl::find_class("VDerived");
     bool vd_has_method = false;
     for (const auto& f : vd_cls.functions())
-        if (f.name == "method") vd_has_method = true;
+        if (f.name() == "method") vd_has_method = true;
     CHECK(!vd_has_method, "private override should not appear in VDerived::functions()");
     auto vd_method = vd_cls.find_function("method");
     CHECK(vd_method.has_value(), "find_function should find 'method' via base walk");
@@ -870,7 +891,7 @@ int main() {
     auto nvd_cls = *refl::find_class("NVDerived");
     bool nvd_has_fn = false;
     for (const auto& f : nvd_cls.functions())
-        if (f.name == "fn") nvd_has_fn = true;
+        if (f.name() == "fn") nvd_has_fn = true;
     CHECK(!nvd_has_fn, "private hide should not appear in NVDerived::functions()");
     auto nvd_fn = nvd_cls.find_function("fn");
     CHECK(nvd_fn.has_value(), "find_function should find 'fn' via base walk");
@@ -889,22 +910,50 @@ int main() {
 
     // Verify base_method is present in the merged view.
     bool all_has_base_method = false;
-    for (const auto& fi : all_fns)
-        if (fi.name == "base_method") all_has_base_method = true;
+    for (const auto& f : all_fns)
+        if (f.name() == "base_method") all_has_base_method = true;
     CHECK(all_has_base_method, "all_functions() should include inherited base_method");
 
-    // FunctionInfo -> Function conversion: wrap an info and invoke.
-    // Find base_method in the merged vector and invoke it.
-    for (const auto& fi : all_fns) {
-        if (fi.name == "base_method") {
-            refl::Function f(fi);
-            CHECK(f.valid(), "Function from FunctionInfo should be valid");
+    // Find base_method in the merged vector and invoke it directly.
+    for (const auto& f : all_fns) {
+        if (f.name() == "base_method") {
+            CHECK(f.valid(), "Function from all_functions() should be valid");
             auto ret = f.invoke(obj);
-            CHECK(ret.has_value(), "invoke via FunctionInfo-constructed Function should succeed");
-            CHECK(*ret->cast_safe<int>().value() == 2, "base_method via all_functions + conversion should be 2");
+            CHECK(ret.has_value(), "invoke via all_functions() Function should succeed");
+            CHECK(*ret->cast_safe<int>().value() == 2, "base_method via all_functions() should be 2");
             break;
         }
     }
+
+    // === all_fields(): merged view across hierarchy ===
+    // Point has x, y, coords, id (4 own); Base has base_val (1 inherited).
+    CHECK(cls.fields().size() == 4, "fields() should have 4 (x, y, coords, id)");
+    auto all_flds = cls.all_fields();
+    CHECK(all_flds.size() == 5, "all_fields() should have 5 (4 own + 1 inherited from Base)");
+    bool all_has_base_val = false;
+    for (const auto& f : all_flds)
+        if (f.name() == "base_val") all_has_base_val = true;
+    CHECK(all_has_base_val, "all_fields() should include inherited base_val");
+    // Invoke get on the inherited field via the merged view.
+    for (const auto& f : all_flds) {
+        if (f.name() == "base_val") {
+            CHECK(f.valid(), "Field from all_fields() should be valid");
+            auto v = f.get(obj);
+            CHECK(v.has_value(), "get via all_fields() Field should succeed");
+            CHECK(*v->cast_safe<int>().value() == 1, "base_val via all_fields() should be 1");
+            break;
+        }
+    }
+
+    // === all_static_fields(): merged view across hierarchy ===
+    // Point has instance_count, max_instances (2 own); Base has none.
+    CHECK(cls.static_fields().size() == 2, "static_fields() should have 2");
+    auto all_sflds = cls.all_static_fields();
+    CHECK(all_sflds.size() == 2, "all_static_fields() should have 2 (none inherited)");
+    bool all_has_max = false;
+    for (const auto& f : all_sflds)
+        if (f.name() == "max_instances") all_has_max = true;
+    CHECK(all_has_max, "all_static_fields() should include max_instances");
 
     // === all_static_functions(): merged view across hierarchy ===
     // StaticChild has none; StaticBase has sbval (1 inherited).
@@ -913,14 +962,12 @@ int main() {
     auto all_sfns = sc_cls2.all_static_functions();
     CHECK(all_sfns.size() == 1, "all_static_functions() should have 1 (sbval from StaticBase)");
 
-    // StaticFunctionInfo -> StaticFunction conversion: wrap and invoke.
-    for (const auto& sfi : all_sfns) {
-        if (sfi.name == "sbval") {
-            refl::StaticFunction sf(sfi);
-            CHECK(sf.valid(), "StaticFunction from StaticFunctionInfo should be valid");
+    for (const auto& sf : all_sfns) {
+        if (sf.name() == "sbval") {
+            CHECK(sf.valid(), "StaticFunction from all_static_functions() should be valid");
             auto ret = sf.invoke();
-            CHECK(ret.has_value(), "invoke via StaticFunctionInfo-constructed StaticFunction should succeed");
-            CHECK(*ret->cast_safe<int>().value() == 7, "sbval via all_static_functions + conversion should be 7");
+            CHECK(ret.has_value(), "invoke via all_static_functions() StaticFunction should succeed");
+            CHECK(*ret->cast_safe<int>().value() == 7, "sbval via all_static_functions() should be 7");
             break;
         }
     }
@@ -946,9 +993,9 @@ int main() {
     auto hd_all = hd_cls.all_functions();
     int hd_set_count = 0;
     bool hd_has_get = false;
-    for (const auto& fi : hd_all) {
-        if (fi.name == "set") ++hd_set_count;
-        if (fi.name == "get") hd_has_get = true;
+    for (const auto& f : hd_all) {
+        if (f.name() == "set") ++hd_set_count;
+        if (f.name() == "get") hd_has_get = true;
     }
     CHECK(hd_set_count == 1, "all_functions() should have 1 set (derived only, base hidden)");
     CHECK(hd_has_get, "all_functions() should include inherited get() (not hidden)");

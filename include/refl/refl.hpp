@@ -93,14 +93,9 @@ using StaticSetterFn  = void  (*)(const Object* val);
 using StaticInvokerFn = Object (*)(const Object* args);
 using CloneFn         = std::shared_ptr<void> (*)(void* obj);
 
-// Forward declaration — *Info structs carry a back-pointer to their owner.
-struct ClassInfo;
-
 struct ConstructorInfo {
     std::vector<std::string> param_types;
     FactoryFn factory;
-    const ClassInfo* owner = nullptr;  // set by Registrar after pool insertion
-    std::size_t index = 0;             // position within ClassInfo::constructors
 };
 
 struct FunctionInfo {
@@ -108,8 +103,6 @@ struct FunctionInfo {
     std::vector<std::string> param_types;
     std::string return_type;
     InvokerFn invoker;
-    const ClassInfo* owner = nullptr;
-    std::size_t index = 0;
 };
 
 struct StaticFunctionInfo {
@@ -117,8 +110,6 @@ struct StaticFunctionInfo {
     std::vector<std::string> param_types;
     std::string return_type;
     StaticInvokerFn invoker;
-    const ClassInfo* owner = nullptr;
-    std::size_t index = 0;
 };
 
 struct FieldInfo {
@@ -127,17 +118,14 @@ struct FieldInfo {
     std::ptrdiff_t offset;  // byte offset of member within T (for get_ref)
     GetterFn getter;        // nullptr if move-only
     SetterFn setter;        // nullptr for const / bit-field / move-only
-    const ClassInfo* owner = nullptr;
-    std::size_t index = 0;
 };
 
 struct StaticFieldInfo {
     std::string name;
     std::string type;
+    void* address;             // address of the static storage (for get_ref)
     StaticGetterFn getter;
     StaticSetterFn setter;  // nullptr for const members
-    const ClassInfo* owner = nullptr;
-    std::size_t index = 0;
 };
 
 struct BaseInfo {
@@ -184,31 +172,10 @@ inline std::mutex& pool_mutex() {
     return m;
 }
 
-// Stamp owner back-pointer and index on every member-info vector after
-// the ClassInfo is placed in the pool (where its address is stable).
-// This lets any *Info (original or copy) be wrapped into a handle.
-namespace detail {
-template <typename T>
-void stamp_owner(std::vector<T>& vec, const ClassInfo* owner) {
-    for (std::size_t i = 0; i < vec.size(); ++i) {
-        vec[i].owner = owner;
-        vec[i].index = i;
-    }
-}
-inline void stamp_all(ClassInfo& ci) {
-    stamp_owner(ci.constructors, &ci);
-    stamp_owner(ci.fields, &ci);
-    stamp_owner(ci.static_fields, &ci);
-    stamp_owner(ci.functions, &ci);
-    stamp_owner(ci.static_functions, &ci);
-}
-}  // namespace detail
-
 struct Registrar {
     explicit Registrar(const ClassInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        auto& stored = class_pool()[info.name] = info;
-        detail::stamp_all(stored);
+        class_pool()[info.name] = info;
     }
 };
 
@@ -846,6 +813,19 @@ ClassInfo RegistrarHolder<T>::make_info() {
             using MemberType = [:std::meta::type_of(m):];
             using MemberBare = std::remove_cvref_t<MemberType>;
 
+            // Capture the address for get_ref.  const static members may
+            // lack an out-of-line definition (static const int with an
+            // in-class initializer is a declaration, not a definition),
+            // so taking their address is an odr-use that can fail to link.
+            // Skip them — get_ref returns Error::ReadOnly; get() (copy)
+            // still works for reading the value.
+            if constexpr (!std::is_const_v<MemberType>) {
+                fi.address = const_cast<void*>(
+                    static_cast<const void*>(&[:m:]));
+            } else {
+                fi.address = nullptr;
+            }
+
             if constexpr (std::is_copy_constructible_v<MemberBare>) {
                 fi.getter = &detail::static_getter<T, m>;
             } else {
@@ -988,8 +968,6 @@ public:
     Constructor() = default;
     Constructor(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
-    explicit Constructor(const ConstructorInfo& ci)
-        : owner_(ci.owner), idx_(ci.index) {}
 
     const std::vector<std::string>& param_types() const {
         return owner_->constructors[idx_].param_types;
@@ -1025,8 +1003,6 @@ public:
     Function() = default;
     Function(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
-    explicit Function(const FunctionInfo& fi)
-        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1072,8 +1048,6 @@ public:
     Field() = default;
     Field(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
-    explicit Field(const FieldInfo& fi)
-        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
@@ -1153,8 +1127,6 @@ public:
     StaticField() = default;
     StaticField(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
-    explicit StaticField(const StaticFieldInfo& fi)
-        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
@@ -1168,6 +1140,33 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!has_getter()) return std::unexpected(Error::NotCopyable);
         return detail::checked_call(owner_->static_fields[idx_].getter);
+    }
+
+    // Get a non-owning pointer to the static storage — works for all
+    // non-const members including move-only.  The pointer is valid for the
+    // program's lifetime (static storage).  The caller casts void* to the
+    // member type.  Returns Error::ReadOnly for const members (which may
+    // lack addressable storage), Error::NullHandle if the handle is invalid.
+    std::expected<void*, Error> get_ref() const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        auto* addr = owner_->static_fields[idx_].address;
+        if (!addr) return std::unexpected(Error::ReadOnly);
+        return addr;
+    }
+
+    // Typed get_ref — returns a typed pointer to the static storage.
+    // Checks T against the field's stored type name at runtime.  For all
+    // non-const members including move-only.  Returns Error::TypeError if
+    // T doesn't match the field type, Error::ReadOnly for const members,
+    // Error::NullHandle if the handle is invalid.
+    template <typename T>
+    std::expected<T*, Error> get_ref() const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (detail::type_name<T>() != owner_->static_fields[idx_].type)
+            return std::unexpected(Error::TypeError);
+        auto* addr = owner_->static_fields[idx_].address;
+        if (!addr) return std::unexpected(Error::ReadOnly);
+        return static_cast<T*>(addr);
     }
 
     // Set the static field value.  Returns Error::ReadOnly if the field
@@ -1197,8 +1196,6 @@ public:
     StaticFunction() = default;
     StaticFunction(const ClassInfo* owner, std::size_t idx)
         : owner_(owner), idx_(idx) {}
-    explicit StaticFunction(const StaticFunctionInfo& fi)
-        : owner_(fi.owner), idx_(fi.index) {}
 
     const std::string& name() const { return owner_->static_functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1283,24 +1280,39 @@ public:
         return info_->bases;
     }
 
-    const std::vector<FieldInfo>& fields() const {
-        return info_->fields;
+    std::vector<Field> fields() const {
+        std::vector<Field> result;
+        for (std::size_t i = 0; i < info_->fields.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
-    const std::vector<StaticFieldInfo>& static_fields() const {
-        return info_->static_fields;
+    std::vector<StaticField> static_fields() const {
+        std::vector<StaticField> result;
+        for (std::size_t i = 0; i < info_->static_fields.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
-    const std::vector<StaticFunctionInfo>& static_functions() const {
-        return info_->static_functions;
+    std::vector<StaticFunction> static_functions() const {
+        std::vector<StaticFunction> result;
+        for (std::size_t i = 0; i < info_->static_functions.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
-    const std::vector<ConstructorInfo>& constructors() const {
-        return info_->constructors;
+    std::vector<Constructor> constructors() const {
+        std::vector<Constructor> result;
+        for (std::size_t i = 0; i < info_->constructors.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
-    const std::vector<FunctionInfo>& functions() const {
-        return info_->functions;
+    std::vector<Function> functions() const {
+        std::vector<Function> result;
+        for (std::size_t i = 0; i < info_->functions.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
     std::expected<Constructor, Error> find_constructor(
@@ -1321,15 +1333,24 @@ public:
     std::vector<Function> find_functions(std::string_view name) const;
 
     // All functions across the full hierarchy (this class + bases).
-    // Returns FunctionInfo by value (merged view), unlike functions()
-    // which returns a reference to this class's own members only.
-    // Wrap any element in a Function via its explicit constructor to invoke.
-    std::vector<FunctionInfo> all_functions() const;
+    // Returns Function handles by value (merged view), unlike functions()
+    // which returns only this class's own members.
+    std::vector<Function> all_functions() const;
 
     std::expected<Field, Error> find_field(std::string_view name) const;
 
+    // All fields across the full hierarchy (this class + bases).
+    // Returns Field handles by value (merged view), unlike fields()
+    // which returns only this class's own members.
+    std::vector<Field> all_fields() const;
+
     // Find a static data member by name.  Walks base classes.
     std::expected<StaticField, Error> find_static_field(std::string_view name) const;
+
+    // All static fields across the full hierarchy (this class + bases).
+    // Returns StaticField handles by value (merged view), unlike
+    // static_fields() which returns only this class's own members.
+    std::vector<StaticField> all_static_fields() const;
 
     // Find a static member function by name.  Walks base classes.
     std::expected<StaticFunction, Error> find_static_function(std::string_view name) const;
@@ -1344,8 +1365,8 @@ public:
     std::vector<StaticFunction> find_static_functions(std::string_view name) const;
 
     // All static functions across the full hierarchy (this class + bases).
-    // Returns StaticFunctionInfo by value (merged view).
-    std::vector<StaticFunctionInfo> all_static_functions() const;
+    // Returns StaticFunction handles by value (merged view).
+    std::vector<StaticFunction> all_static_functions() const;
 
     bool valid() const { return info_ != nullptr; }
     explicit operator bool() const { return valid(); }
@@ -1463,6 +1484,26 @@ inline std::expected<Field, Error> Class::find_field(
         [name](const Class& b) { return b.find_field(name); });
 }
 
+inline std::vector<Field> Class::all_fields() const {
+    std::vector<Field> results;
+    if (!valid()) return results;
+
+    auto hidden = detail::own_names(info_->fields);
+    for (std::size_t i = 0; i < info_->fields.size(); ++i)
+        results.emplace_back(info_, i);
+    for (const auto& b : info_->bases) {
+        auto base = find_class(b.name);
+        if (base) {
+            auto more = base->all_fields();
+            for (auto& f : more) {
+                if (!hidden.count(f.name()))
+                    results.push_back(std::move(f));
+            }
+        }
+    }
+    return results;
+}
+
 inline std::expected<Function, Error> Class::find_function(
     std::string_view name,
     std::initializer_list<std::string_view> types) const {
@@ -1517,21 +1558,21 @@ inline std::vector<Function> Class::find_functions(
     return results;
 }
 
-inline std::vector<FunctionInfo> Class::all_functions() const {
-    std::vector<FunctionInfo> results;
+inline std::vector<Function> Class::all_functions() const {
+    std::vector<Function> results;
     if (!valid()) return results;
 
     // Collect this class's own function names (hides base overloads).
     auto hidden = detail::own_names(info_->functions);
-    for (const auto& f : info_->functions)
-        results.push_back(f);
+    for (std::size_t i = 0; i < info_->functions.size(); ++i)
+        results.emplace_back(info_, i);
     for (const auto& b : info_->bases) {
         auto base = find_class(b.name);
         if (base) {
             auto more = base->all_functions();
-            for (auto& fi : more) {
-                if (!hidden.count(fi.name))
-                    results.push_back(std::move(fi));
+            for (auto& f : more) {
+                if (!hidden.count(f.name()))
+                    results.push_back(std::move(f));
             }
         }
     }
@@ -1570,6 +1611,26 @@ inline std::expected<StaticField, Error> Class::find_static_field(
     }
     return detail::walk_bases<StaticField>(info_->bases,
         [name](const Class& b) { return b.find_static_field(name); });
+}
+
+inline std::vector<StaticField> Class::all_static_fields() const {
+    std::vector<StaticField> results;
+    if (!valid()) return results;
+
+    auto hidden = detail::own_names(info_->static_fields);
+    for (std::size_t i = 0; i < info_->static_fields.size(); ++i)
+        results.emplace_back(info_, i);
+    for (const auto& b : info_->bases) {
+        auto base = find_class(b.name);
+        if (base) {
+            auto more = base->all_static_fields();
+            for (auto& sf : more) {
+                if (!hidden.count(sf.name()))
+                    results.push_back(std::move(sf));
+            }
+        }
+    }
+    return results;
 }
 
 inline std::expected<StaticFunction, Error> Class::find_static_function(
@@ -1636,20 +1697,20 @@ inline std::vector<StaticFunction> Class::find_static_functions(
     return results;
 }
 
-inline std::vector<StaticFunctionInfo> Class::all_static_functions() const {
-    std::vector<StaticFunctionInfo> results;
+inline std::vector<StaticFunction> Class::all_static_functions() const {
+    std::vector<StaticFunction> results;
     if (!valid()) return results;
 
     auto hidden = detail::own_names(info_->static_functions);
-    for (const auto& sf : info_->static_functions)
-        results.push_back(sf);
+    for (std::size_t i = 0; i < info_->static_functions.size(); ++i)
+        results.emplace_back(info_, i);
     for (const auto& b : info_->bases) {
         auto base = find_class(b.name);
         if (base) {
             auto more = base->all_static_functions();
-            for (auto& sfi : more) {
-                if (!hidden.count(sfi.name))
-                    results.push_back(std::move(sfi));
+            for (auto& sf : more) {
+                if (!hidden.count(sf.name()))
+                    results.push_back(std::move(sf));
             }
         }
     }
