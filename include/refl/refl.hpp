@@ -24,8 +24,6 @@
 #include <cctype>
 #include <cstdint>
 #include <expected>
-#include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,19 +50,6 @@ enum class Error {
 
 // Forward declarations — needed for function pointer type aliases below.
 class Object;
-
-inline std::string_view to_string(Error e) {
-    switch (e) {
-    case Error::NotFound:       return "NotFound";
-    case Error::NullHandle:    return "NullHandle";
-    case Error::TypeError:     return "TypeError";
-    case Error::ArityMismatch:  return "ArityMismatch";
-    case Error::ReadOnly:       return "ReadOnly";
-    case Error::NotOwned:       return "NotOwned";
-    case Error::NotCopyable:    return "NotCopyable";
-    }
-    return "Unknown";
-}
 
 // ---------------------------------------------------------------------------
 // Type-erased function pointer signatures for factories, invokers, getters,
@@ -1062,7 +1047,7 @@ public:
 
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
-    bool is_readonly() const { return owner_->fields[idx_].is_const; }
+    bool is_const() const { return owner_->fields[idx_].is_const; }
     bool has_getter() const { return owner_->fields[idx_].getter != nullptr; }
     bool has_setter() const { return owner_->fields[idx_].setter != nullptr; }
 
@@ -1144,7 +1129,7 @@ public:
 
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
-    bool is_readonly() const { return owner_->static_fields[idx_].is_const; }
+    bool is_const() const { return owner_->static_fields[idx_].is_const; }
     bool has_getter() const { return owner_->static_fields[idx_].getter != nullptr; }
     bool has_setter() const { return owner_->static_fields[idx_].setter != nullptr; }
 

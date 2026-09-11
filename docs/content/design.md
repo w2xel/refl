@@ -138,7 +138,10 @@ Initial implementation. The API above is working:
   (false for move-only members — use `get_ref` instead).
   `Field::has_setter()` returns true if the field has a setter (false for
   const or not move-assignable members).
-  `Field::is_readonly()` returns true if the field is const-qualified.
+  `Field::is_const()` returns true if the field is const-qualified.  This
+  reports the const qualifier only, not writability: a non-const member that
+  is not move-assignable (e.g. `std::mutex`) is not const yet has no setter —
+  use `has_setter()` to check writability.
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
   (walks bases).
   `StaticField::get()` returns `std::expected<Object, Error>`;
@@ -251,6 +254,10 @@ Limitations:
   create a new function member, so the framework cannot detect it.  Base
   overloads remain hidden even when a `using`-declaration makes them
   callable in raw C++.
+- Name hiding applies to data members as well as functions.  If a derived
+  class declares a field named `X`, the base's `X` is hidden: `find_field("X")`
+  returns the derived's field and `all_fields()` lists it once (the base's
+  `X` is not included).  Other base fields remain visible.
 - Multiple inheritance is supported — base-class pointer adjustment uses
   `offset_of` at registration time, accumulated through the base hierarchy.
   Only public inheritance is walked — protected and private bases are not
@@ -265,6 +272,12 @@ Limitations:
   `operator+=`, `operator=`, etc.) are registered as functions, findable by
   name (`"operator+"`, `"operator=="`, etc.).  Conversion operators and the
   destructor are not registered.
+- `constexpr` and `consteval` member functions are reflected like ordinary
+  functions (they are registered and invokable at runtime).  Template member
+  functions are **not** reflected — the compiler does not surface them as
+  invokable members, so they are absent from `functions()` and
+  `find_function`.  This is silent: registration does not fail, the template
+  member simply does not appear.
 - Clone requires a copy constructor — non-copyable classes return
   `Error::NotCopyable`.
 - Enum values are stored as `long long`.  Enums with an unsigned underlying

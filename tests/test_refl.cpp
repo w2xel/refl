@@ -239,6 +239,12 @@ struct DiamBottom : DiamLeft, DiamRight {
     DiamBottom(int l, int r) : DiamLeft(l), DiamRight(r) {}
 };
 
+// Field name hiding: a derived class redeclaring a field of the same name
+// shadows the base field.  find_field and all_fields must return the
+// derived's field (not the base's), and the base's other fields stay visible.
+struct FieldHideBase { int x = 1; int y = 2; };
+struct FieldHideDer : FieldHideBase { int x = 99; };
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -273,6 +279,8 @@ struct DiamBottom : DiamLeft, DiamRight {
 [[maybe_unused]] static refl::Reg<DiamLeft> reg_diam_left;
 [[maybe_unused]] static refl::Reg<DiamRight> reg_diam_right;
 [[maybe_unused]] static refl::Reg<DiamBottom> reg_diam_bottom;
+[[maybe_unused]] static refl::Reg<FieldHideBase> reg_field_hide_base;
+[[maybe_unused]] static refl::Reg<FieldHideDer> reg_field_hide_der;
 
 struct Wrong {};
 
@@ -377,7 +385,7 @@ int main() {
 
     // --- readonly field ---
     auto idf = *cls.find_field("id");
-    CHECK(idf.is_readonly(), "id should be readonly");
+    CHECK(idf.is_const(), "id should be const");
     auto set_id = idf.set(obj, 99);
     CHECK(!set_id.has_value(), "set on readonly should fail");
     CHECK(set_id.error() == refl::Error::ReadOnly, "should be ReadOnly");
@@ -432,7 +440,7 @@ int main() {
     auto sf = cls.find_static_field("instance_count");
     CHECK(sf.has_value(), "find_static_field(\"instance_count\") should succeed");
     CHECK(sf->name() == "instance_count", "static field name");
-    CHECK(!sf->is_readonly(), "instance_count should not be readonly");
+    CHECK(!sf->is_const(), "instance_count should not be const");
     // Point(1,3) was constructed once, so instance_count should be 1
     CHECK(*sf->get()->cast_safe<int>().value() == 1, "instance_count should be 1");
 
@@ -442,7 +450,7 @@ int main() {
     // readonly static field (const)
     auto maxf = cls.find_static_field("max_instances");
     CHECK(maxf.has_value(), "find_static_field(\"max_instances\") should succeed");
-    CHECK(maxf->is_readonly(), "max_instances should be readonly (const)");
+    CHECK(maxf->is_const(), "max_instances should be const");
     CHECK(*maxf->get()->cast_safe<int>().value() == 100, "max_instances should be 100");
     auto set_max = maxf->set(200);
     CHECK(!set_max.has_value(), "set on readonly static should fail");
@@ -811,7 +819,7 @@ int main() {
     auto mo_obj = *mo_cls.find_constructor({"int"})->call(42);
     auto mo_ptr_field = *mo_cls.find_field("ptr");
     CHECK(!mo_ptr_field.has_getter(), "unique_ptr field has no copy getter");
-    CHECK(!mo_ptr_field.is_readonly(), "unique_ptr field is not const (has move setter)");
+    CHECK(!mo_ptr_field.is_const(), "unique_ptr field is not const (has move setter)");
     CHECK(mo_ptr_field.has_setter(), "unique_ptr field has a move setter");
     // get is unavailable (move-only member, no copy getter).
     auto mo_get = mo_ptr_field.get(mo_obj);
@@ -1110,24 +1118,52 @@ int main() {
     CHECK(!null_enum.find_enumerator("x").has_value(), "invalid Enum find_enumerator should fail");
     CHECK(null_enum.find_enumerator("x").error() == refl::Error::NullHandle, "should be NullHandle");
 
-    // === is_readonly semantics: const vs non-const vs move-only ===
-    // const member: readonly=true, has_setter=false, has_getter=true (copyable)
-    CHECK(idf.is_readonly(), "const int member should be readonly");
+    // === is_const semantics: const vs non-const vs move-only ===
+    // is_const reports the const qualifier, not writability — a non-const
+    // but non-move-assignable member is not const yet has no setter.
+    // const member: is_const=true, has_setter=false, has_getter=true (copyable)
+    CHECK(idf.is_const(), "const int member should be const");
     CHECK(!idf.has_setter(), "const int member should have no setter");
     CHECK(idf.has_getter(), "const int member should have a getter");
-    // non-const plain member: readonly=false, has_setter=true
-    CHECK(!xf.is_readonly(), "non-const int member should not be readonly");
+    // non-const plain member: is_const=false, has_setter=true
+    CHECK(!xf.is_const(), "non-const int member should not be const");
     CHECK(xf.has_setter(), "non-const int member should have a setter");
-    // move-only move-assignable member: readonly=false (not const), has_setter=true
-    CHECK(!mo_ptr_field.is_readonly(), "unique_ptr member should not be readonly (not const)");
+    // move-only move-assignable member: is_const=false (not const), has_setter=true
+    CHECK(!mo_ptr_field.is_const(), "unique_ptr member should not be const");
     CHECK(mo_ptr_field.has_setter(), "unique_ptr member should have a move setter");
     CHECK(!mo_ptr_field.has_getter(), "unique_ptr member should have no copy getter");
-    // const static member: readonly=true
-    CHECK(maxf->is_readonly(), "const static member should be readonly");
+    // const static member: is_const=true
+    CHECK(maxf->is_const(), "const static member should be const");
     CHECK(!maxf->has_setter(), "const static member should have no setter");
-    // non-const static member: readonly=false
-    CHECK(!sf->is_readonly(), "non-const static member should not be readonly");
+    // non-const static member: is_const=false
+    CHECK(!sf->is_const(), "non-const static member should not be const");
     CHECK(sf->has_setter(), "non-const static member should have a setter");
+
+    // === Field name hiding: derived field shadows base field of same name ===
+    auto fh_cls = *refl::find_class("FieldHideDer");
+    // all_fields: x appears once (the derived's), y is still visible from base.
+    auto fh_all = fh_cls.all_fields();
+    int fh_x_count = 0;
+    bool fh_has_y = false;
+    for (const auto& f : fh_all) {
+        if (f.name() == "x") ++fh_x_count;
+        if (f.name() == "y") fh_has_y = true;
+    }
+    CHECK(fh_x_count == 1, "all_fields() should have 1 x (derived shadows base)");
+    CHECK(fh_has_y, "all_fields() should still include base's y");
+
+    // find_field("x") returns the derived's field (value 99), not the base's (1).
+    auto fh_xf = fh_cls.find_field("x");
+    CHECK(fh_xf.has_value(), "find_field x should succeed");
+    auto fh_obj = *fh_cls.find_constructor({})->call();
+    auto fh_g = fh_xf->get(fh_obj);
+    CHECK(fh_g.has_value(), "get x should succeed");
+    CHECK(*fh_g->cast_safe<int>().value() == 99, "shadowed x should be derived's (99)");
+
+    // y is inherited and unaffected.
+    auto fh_yf = fh_cls.find_field("y");
+    CHECK(fh_yf.has_value(), "find_field y should succeed (inherited, not hidden)");
+    CHECK(*fh_yf->get(fh_obj)->cast_safe<int>().value() == 2, "y should be base's (2)");
 
     std::printf("refl core API test ok\n");
     return 0;
