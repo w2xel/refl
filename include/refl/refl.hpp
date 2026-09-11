@@ -760,11 +760,14 @@ ClassInfo RegistrarHolder<T>::make_info() {
 
     // Data members — generate getter/setter for each.  Store the byte
     // offset for get_ref (works for all members, including move-only).
+    // Only public members are reflected, matching the public-base filter
+    // on bases_of — the framework reflects the public interface.
     static constexpr auto data_members = std::define_static_array(
         std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto m : data_members) {
-        // Skip bit-fields — pointer-to-member is not valid for them.
-        if constexpr (!std::meta::is_bit_field(m)) {
+        // Skip bit-fields and non-public members.
+        if constexpr (!std::meta::is_bit_field(m) &&
+                      std::meta::is_public(m)) {
             FieldInfo fi;
             fi.name = std::string(std::meta::identifier_of(m));
             fi.type = std::string(
@@ -795,40 +798,45 @@ ClassInfo RegistrarHolder<T>::make_info() {
     }
 
     // Static data members — generate static getter/setter for each.
+    // Only public members are reflected (same policy as non-static above).
     static constexpr auto static_data = std::define_static_array(
         std::meta::static_data_members_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto m : static_data) {
-        StaticFieldInfo fi;
-        fi.name = std::string(std::meta::identifier_of(m));
-        fi.type = std::string(
-            std::meta::display_string_of(std::meta::type_of(m)));
+        if constexpr (std::meta::is_public(m)) {
+            StaticFieldInfo fi;
+            fi.name = std::string(std::meta::identifier_of(m));
+            fi.type = std::string(
+                std::meta::display_string_of(std::meta::type_of(m)));
 
-        using MemberType = [:std::meta::type_of(m):];
-        using MemberBare = std::remove_cvref_t<MemberType>;
+            using MemberType = [:std::meta::type_of(m):];
+            using MemberBare = std::remove_cvref_t<MemberType>;
 
-        if constexpr (std::is_copy_constructible_v<MemberBare>) {
-            fi.getter = &detail::static_getter<T, m>;
-        } else {
-            fi.getter = nullptr;
+            if constexpr (std::is_copy_constructible_v<MemberBare>) {
+                fi.getter = &detail::static_getter<T, m>;
+            } else {
+                fi.getter = nullptr;
+            }
+
+            if constexpr (std::is_const_v<MemberType> ||
+                          !std::is_copy_constructible_v<MemberBare>) {
+                fi.setter = nullptr;
+            } else {
+                fi.setter = &detail::static_setter<T, m>;
+            }
+
+            info.static_fields.push_back(std::move(fi));
         }
-
-        if constexpr (std::is_const_v<MemberType> ||
-                      !std::is_copy_constructible_v<MemberBare>) {
-            fi.setter = nullptr;
-        } else {
-            fi.setter = &detail::static_setter<T, m>;
-        }
-
-        info.static_fields.push_back(std::move(fi));
     }
 
-    // All members — filter for constructors and named functions.
+    // All members — filter for public constructors and named functions.
+    // Non-public members are excluded (same policy as data members above).
     static constexpr auto all_members = std::define_static_array(
         std::meta::members_of(^^T, std::meta::access_context::unchecked()));
 
     template for (constexpr auto m : all_members) {
         if constexpr (std::meta::is_constructor(m) &&
-                      !std::meta::is_deleted(m)) {
+                      !std::meta::is_deleted(m) &&
+                      std::meta::is_public(m)) {
             static constexpr auto params = std::define_static_array(
                 std::meta::parameters_of(m));
             constexpr std::size_t n = params.size();
@@ -862,6 +870,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             }
         } else if constexpr (std::meta::is_function(m) &&
                             !std::meta::is_deleted(m) &&
+                            std::meta::is_public(m) &&
                             (std::meta::has_identifier(m) ||
                              std::meta::is_operator_function(m))) {
             static constexpr auto fparams = std::define_static_array(

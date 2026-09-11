@@ -184,6 +184,11 @@ contradict the codebase's own stance on implicit conversions.
 Limitations:
 
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
+- Only public members are reflected — protected and private data members,
+  static data members, member functions, and static member functions are not
+  registered.  This matches the public-base filter on inheritance: the framework
+  reflects the public interface, not the implementation.  Public constructors
+  are registered; private/protected constructors are not.
 - Const data members (static and non-static) are read-only (getter only, no setter).
 - Move-only data members (e.g. `unique_ptr`) have no getter or setter — use
   `Field::get_ref()` to access them by pointer.  Registration no longer fails

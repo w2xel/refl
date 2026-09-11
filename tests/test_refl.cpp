@@ -129,6 +129,31 @@ struct WithConv {
     int get() const { return v; }
 };
 
+// Private/protected members must NOT be reflected — only public members
+// are registered, matching the public-base filter on bases_of.
+class Priv {
+public:
+    Priv() : pub(0) {}
+    int pub;
+    int pub_method() const { return pub * 2; }
+    static int pub_static;
+    static int pub_static_fn() { return 99; }
+protected:
+    int prot_field;
+    int prot_method() const { return prot_field; }
+    static int prot_static;
+    static int prot_static_fn() { return 0; }
+private:
+    int priv_field;
+    int priv_method() const { return priv_field; }
+    static int priv_static;
+    static int priv_static_fn() { return 0; }
+};
+
+int Priv::pub_static = 0;
+int Priv::prot_static = 0;
+int Priv::priv_static = 0;
+
 // Base with a static member function — for find_static_functions base-walk.
 struct StaticBase {
     static int sbval() { return 7; }
@@ -162,6 +187,7 @@ struct StaticChild : StaticBase {
 [[maybe_unused]] static refl::Reg<WithConv> reg_with_conv;
 [[maybe_unused]] static refl::Reg<StaticBase> reg_static_base;
 [[maybe_unused]] static refl::Reg<StaticChild> reg_static_child;
+[[maybe_unused]] static refl::Reg<Priv> reg_priv_members;
 
 struct Wrong {};
 
@@ -737,6 +763,29 @@ int main() {
     CHECK(cr.value()->x == 11, "const-borrow copy x should be 11");
     CHECK(cr.value()->y == 22, "const-borrow copy y should be 22");
     CHECK(const_pt.x == 11, "original const object must be unchanged");
+
+    // === Private/protected members are excluded ===
+    auto priv_cls = *refl::find_class("Priv");
+    CHECK(priv_cls.fields().size() == 1, "Priv should have 1 public field (pub)");
+    CHECK(priv_cls.find_field("pub").has_value(), "public field pub should be findable");
+    CHECK(!priv_cls.find_field("prot_field").has_value(), "protected field must not be reflected");
+    CHECK(!priv_cls.find_field("priv_field").has_value(), "private field must not be reflected");
+
+    CHECK(priv_cls.static_fields().size() == 1, "Priv should have 1 public static field");
+    CHECK(priv_cls.find_static_field("pub_static").has_value(), "public static field should be findable");
+    CHECK(!priv_cls.find_static_field("prot_static").has_value(), "protected static field must not be reflected");
+    CHECK(!priv_cls.find_static_field("priv_static").has_value(), "private static field must not be reflected");
+
+    CHECK(priv_cls.find_function("pub_method").has_value(), "public method should be findable");
+    CHECK(!priv_cls.find_function("prot_method").has_value(), "protected method must not be reflected");
+    CHECK(!priv_cls.find_function("priv_method").has_value(), "private method must not be reflected");
+
+    CHECK(priv_cls.find_static_function("pub_static_fn").has_value(), "public static fn should be findable");
+    CHECK(!priv_cls.find_static_function("prot_static_fn").has_value(), "protected static fn must not be reflected");
+    CHECK(!priv_cls.find_static_function("priv_static_fn").has_value(), "private static fn must not be reflected");
+
+    // Public default constructor is still registered.
+    CHECK(priv_cls.find_constructor({}).has_value(), "public default ctor should be registered");
 
     std::printf("refl core API test ok\n");
     return 0;
