@@ -556,7 +556,7 @@ public:
 private:
     std::shared_ptr<void> owner_;
     void* ptr_ = nullptr;
-    // Borrows static storage: type_name<T>() (consteval) or a pool string.
+    // Borrows static storage: always type_name<T>() (consteval).
     std::string_view class_name_;
 
     friend class Function;
@@ -710,7 +710,7 @@ void setter(void* obj, const Object* val) {
     target->*ptr = std::move(*static_cast<MemberBare*>(src));
 }
 
-template <typename T, std::meta::info Member>
+template <std::meta::info Member>
 Object static_getter() {
     using MemberType = [:std::meta::type_of(Member):];
     using StorageType = std::remove_const_t<std::remove_reference_t<MemberType>>;
@@ -733,7 +733,7 @@ Object static_getter() {
     }
 }
 
-template <typename T, std::meta::info Member>
+template <std::meta::info Member>
 void static_setter(const Object* val) {
     auto* ptr = &[:Member:];
     using MemberType = [:std::meta::type_of(Member):];
@@ -754,7 +754,7 @@ std::shared_ptr<void> clone(void* obj) {
     return std::make_shared<T>(*src);
 }
 
-template <typename T, std::meta::info Fn>
+template <std::meta::info Fn>
 Object static_invoker(const Object* args) {
     auto fn = &[:Fn:];
     static constexpr auto params = std::define_static_array(
@@ -897,7 +897,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             }
 
             if constexpr (std::is_copy_constructible_v<MemberBare>) {
-                fi.getter = &detail::static_getter<T, m>;
+                fi.getter = &detail::static_getter<m>;
             } else {
                 fi.getter = nullptr;
             }
@@ -906,7 +906,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                           !std::is_move_assignable_v<MemberBare>) {
                 fi.setter = nullptr;
             } else {
-                fi.setter = &detail::static_setter<T, m>;
+                fi.setter = &detail::static_setter<m>;
             }
 
             info.static_fields.push_back(std::move(fi));
@@ -980,7 +980,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 fi.name = fname;
                 fi.return_type = std::string(
                     std::meta::display_string_of(std::meta::return_type_of(m)));
-                fi.invoker = &detail::static_invoker<T, m>;
+                fi.invoker = &detail::static_invoker<m>;
                 template for (constexpr auto p : fparams) {
                     fi.param_types.emplace_back(
                         detail::normalize_type(
@@ -1341,9 +1341,12 @@ public:
         return info_ ? info_->name : empty;
     }
 
-    const std::vector<EnumeratorInfo>& enumerators() const {
-        static const std::vector<EnumeratorInfo> empty;
-        return info_ ? info_->enumerators : empty;
+    std::vector<Enumerator> enumerators() const {
+        std::vector<Enumerator> result;
+        if (!valid()) return result;
+        for (std::size_t i = 0; i < info_->enumerators.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
     std::expected<Enumerator, Error> find_enumerator(std::string_view name) const;

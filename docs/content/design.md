@@ -183,7 +183,13 @@ Initial implementation. The API above is working:
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
   object's class or any of its bases (upcast).  Only works on owning
-  Objects; returns `Error::NotOwned` for non-owning Objects.
+  Objects; returns `Error::NotOwned` for non-owning Objects.  Downcasts
+  (T is a derived class of the object's class) are **not** supported:
+  `class_name_` is a compile-time type tag (`type_name<T>()`), not RTTI,
+  so the framework cannot tell whether an Object whose known type is
+  `Base` is actually a `Derived` at runtime.  A safe downcast would
+  require either `dynamic_cast`/`typeid` (the design avoids RTTI) or a
+  virtual type tag on reflected classes (not required by the framework).
 - `Object::cast_ref<T>()` returns `std::expected<T*, Error>` — a raw pointer
   for both owned and non-owning Objects.  The caller manages lifetime.
 - `Object::is_owned()` returns true if the Object owns its data (backed by
@@ -316,6 +322,11 @@ Limitations:
   simply does not appear).  Template member functions are **not** reflected
   either — the compiler does not surface them as invokable members, so they
   are absent from `functions()` and `find_function`.  This is likewise silent.
+  Const-qualified overloads (e.g. `void foo()` vs `void foo() const`) are
+  indistinguishable: `FunctionInfo` stores no const-qualifier flag, so both
+  register with the same name and signature.  `find_function("foo")` returns
+  whichever was registered first; there is no way to select the const
+  overload by signature.
 - Clone requires a copy constructor — non-copyable classes return
   `Error::NotCopyable`.
 - Enum values are stored as `long long`.  Enums with an unsigned underlying

@@ -490,7 +490,7 @@ class Dyn {
                                           && std::meta::identifier_of(m)
                                               == nm_sv) {
                                 dispatch_.[:field:].invoker =
-                                    &detail::static_invoker<T, m>;
+                                    &detail::static_invoker<m>;
                             }
                         }
                     } else if constexpr (detail::is_typed_static_property_v<
@@ -507,10 +507,10 @@ class Dyn {
                                 using MT = [:std::meta::type_of(m):];
                                 if constexpr (!std::is_const_v<MT>) {
                                     dispatch_.[:field:].setter =
-                                        &detail::static_setter<T, m>;
+                                        &detail::static_setter<m>;
                                 }
                                 dispatch_.[:field:].getter =
-                                    &detail::static_getter<T, m>;
+                                    &detail::static_getter<m>;
                             }
                         }
                     } else {

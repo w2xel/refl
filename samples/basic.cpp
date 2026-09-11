@@ -82,7 +82,7 @@ int main() {
     auto e = *refl::find_enum("ShapeType");
     std::printf("enum: %s\n", e.name().c_str());
     for (const auto& en : e.enumerators())
-        std::printf("  %s = %lld\n", en.name.c_str(), en.value);
+        std::printf("  %s = %lld\n", en.name().c_str(), en.value());
     auto sq = e.find_enumerator("Square");
     std::printf("  Square = %lld\n", sq->value());
 
