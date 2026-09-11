@@ -553,6 +553,7 @@ public:
 private:
     std::shared_ptr<void> owner_;
     void* ptr_ = nullptr;
+    // Borrows static storage: type_name<T>() (consteval) or a pool string.
     std::string_view class_name_;
 
     friend class Function;
@@ -1647,6 +1648,8 @@ template <typename Handle, typename Info>
 std::expected<Handle, Error> find_named(const ClassInfo* C,
     std::string_view name,
     const std::vector<Info> ClassInfo::* vec) {
+    // Own members are read without the lock — ClassInfo is immutable after
+    // registration.  The base walk dereferences the pool, so it locks.
     for (std::size_t i = 0; i < (C->*vec).size(); ++i)
         if ((C->*vec)[i].name == name)
             return Handle(C, i);  // own hides bases
