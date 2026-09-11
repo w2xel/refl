@@ -246,6 +246,26 @@ make_arg_anys(Args&&... args) {
     };
 }
 
+// Arity-check forwarded args against the member's param count and build
+// the std::any arg array in the caller-provided storage.  Returns the
+// pointer into storage (nullptr for zero args) or an ArityMismatch error.
+// The returned pointer is valid as long as `storage` is alive.
+template <std::size_t N, typename... Args>
+std::expected<const std::any*, Error>
+prepare_args(std::array<std::any, N>& storage,
+             std::size_t param_count, Args&&... args) {
+    static_assert(N == sizeof...(Args),
+                  "storage size must match argument count");
+    if (sizeof...(Args) != param_count)
+        return std::unexpected(Error::ArityMismatch);
+    if constexpr (sizeof...(Args) == 0) {
+        return nullptr;
+    } else {
+        storage = make_arg_anys(std::forward<Args>(args)...);
+        return storage.data();
+    }
+}
+
 // Compile-time fully-qualified type name for pool keys and safe-cast checks.
 // display_string_of yields the qualified name (e.g. "ns::Point"), so two
 // classes with the same unqualified name in different namespaces no longer
@@ -390,69 +410,22 @@ std::any static_invoker(const std::any* args) {
 // The invokers, factory, getters, and setters above forward arguments as
 // std::any.  An arity mismatch indexes the any array out of bounds (UB),
 // and a type mismatch inside std::any_cast throws std::bad_any_cast.  The
-// helpers below wrap the raw calls so the runtime handles report a clean
+// helper below wraps the raw calls so the runtime handles report a clean
 // Error instead of crashing or throwing across the C boundary.
 
-inline std::expected<std::shared_ptr<void>, Error>
-checked_factory(FactoryFn fn, const std::any* args) {
+// Call fn(args...) and translate std::bad_any_cast into Error::TypeError.
+// Works for any callable returning std::any, std::shared_ptr<void>, or
+// void (deduced via decltype).
+template <typename Fn, typename... CallArgs>
+auto checked_call(Fn&& fn, CallArgs&&... args)
+    -> std::expected<decltype(fn(std::forward<CallArgs>(args)...)), Error> {
     try {
-        return fn(args);
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
-}
-
-inline std::expected<std::any, Error>
-checked_invoke(InvokerFn fn, void* obj, const std::any* args) {
-    try {
-        return fn(obj, args);
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
-}
-
-inline std::expected<std::any, Error>
-checked_static_invoke(StaticInvokerFn fn, const std::any* args) {
-    try {
-        return fn(args);
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
-}
-
-inline std::expected<std::any, Error>
-checked_get(GetterFn fn, void* obj) {
-    try {
-        return fn(obj);
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
-}
-
-inline std::expected<std::any, Error>
-checked_static_get(StaticGetterFn fn) {
-    try {
-        return fn();
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
-}
-
-inline std::expected<void, Error>
-checked_static_set(StaticSetterFn fn, std::any val) {
-    try {
-        fn(std::move(val));
-        return {};
-    } catch (const std::bad_any_cast&) {
-        return std::unexpected(Error::TypeError);
-    }
-}
-
-inline std::expected<void, Error>
-checked_set(SetterFn fn, void* obj, std::any val) {
-    try {
-        fn(obj, std::move(val));
-        return {};
+        if constexpr (std::is_void_v<decltype(fn(std::forward<CallArgs>(args)...))>) {
+            fn(std::forward<CallArgs>(args)...);
+            return {};
+        } else {
+            return fn(std::forward<CallArgs>(args)...);
+        }
     } catch (const std::bad_any_cast&) {
         return std::unexpected(Error::TypeError);
     }
@@ -845,13 +818,12 @@ public:
     std::expected<Object, Error> call(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& ci = owner_->constructors[idx_];
-        if (sizeof...(Args) != ci.param_types.size())
-            return std::unexpected(Error::ArityMismatch);
+        std::array<std::any, sizeof...(Args)> arg_anys;
+        auto args_ptr = detail::prepare_args(arg_anys, ci.param_types.size(),
+                                             std::forward<Args>(args)...);
+        if (!args_ptr) return std::unexpected(args_ptr.error());
 
-        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
-
-        auto result = detail::checked_factory(ci.factory, args_ptr);
+        auto result = detail::checked_call(ci.factory, *args_ptr);
         if (!result) return std::unexpected(result.error());
         return Object(std::move(*result), owner_->name);
     }
@@ -888,13 +860,31 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         const auto& fi = owner_->functions[idx_];
-        if (sizeof...(Args) != fi.param_types.size())
-            return std::unexpected(Error::ArityMismatch);
-        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
+        std::array<std::any, sizeof...(Args)> arg_anys;
+        auto args_ptr = detail::prepare_args(arg_anys, fi.param_types.size(),
+                                             std::forward<Args>(args)...);
+        if (!args_ptr) return std::unexpected(args_ptr.error());
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_invoke(fi.invoker, adj, args_ptr);
+        return detail::checked_call(fi.invoker, adj, *args_ptr);
+    }
+
+    // Invoke on a const Object — same as above, for const-correct call sites.
+    // The underlying object is accessed through shared_ptr<void> (mutable
+    // storage), so invoking through a const handle is safe.
+    template <typename... Args>
+    std::expected<std::any, Error> invoke(const Object& obj, Args&&... args) const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        const auto& fi = owner_->functions[idx_];
+        std::array<std::any, sizeof...(Args)> arg_anys;
+        auto args_ptr = detail::prepare_args(arg_anys, fi.param_types.size(),
+                                             std::forward<Args>(args)...);
+        if (!args_ptr) return std::unexpected(args_ptr.error());
+        void* adj = adjust_to_base(const_cast<Object&>(obj).raw(),
+                                   obj.class_name(), owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return detail::checked_call(fi.invoker, adj, *args_ptr);
     }
 
     // Invoke on a concrete type — for when you have the real object already.
@@ -905,14 +895,14 @@ public:
     std::expected<std::any, Error> invoke(T& obj, Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& fi = owner_->functions[idx_];
-        if (sizeof...(Args) != fi.param_types.size())
-            return std::unexpected(Error::ArityMismatch);
-        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
+        std::array<std::any, sizeof...(Args)> arg_anys;
+        auto args_ptr = detail::prepare_args(arg_anys, fi.param_types.size(),
+                                             std::forward<Args>(args)...);
+        if (!args_ptr) return std::unexpected(args_ptr.error());
         constexpr auto tname = detail::type_name<T>();
         void* adj = adjust_to_base(static_cast<void*>(&obj), tname, owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_invoke(fi.invoker, adj, args_ptr);
+        return detail::checked_call(fi.invoker, adj, *args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -941,7 +931,7 @@ public:
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_get(owner_->fields[idx_].getter, adj);
+        return detail::checked_call(owner_->fields[idx_].getter, adj);
     }
 
     std::expected<std::any, Error> get(const Object& obj) const {
@@ -950,7 +940,7 @@ public:
         void* adj = adjust_to_base(const_cast<Object&>(obj).raw(),
                                    obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_get(owner_->fields[idx_].getter, adj);
+        return detail::checked_call(owner_->fields[idx_].getter, adj);
     }
 
     // Set the field value on an Object.  Returns Error::ReadOnly if
@@ -964,8 +954,8 @@ public:
         if (is_readonly()) return std::unexpected(Error::ReadOnly);
         void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
-        return detail::checked_set(owner_->fields[idx_].setter,
-                                   adj, std::move(val));
+        return detail::checked_call(owner_->fields[idx_].setter,
+                                    adj, std::move(val));
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -990,7 +980,7 @@ public:
     // is invalid.
     std::expected<std::any, Error> get() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        return detail::checked_static_get(owner_->static_fields[idx_].getter);
+        return detail::checked_call(owner_->static_fields[idx_].getter);
     }
 
     // Set the static field value.  Returns Error::ReadOnly if the field
@@ -999,8 +989,8 @@ public:
     std::expected<void, Error> set(std::any val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (is_readonly()) return std::unexpected(Error::ReadOnly);
-        return detail::checked_static_set(owner_->static_fields[idx_].setter,
-                                          std::move(val));
+        return detail::checked_call(owner_->static_fields[idx_].setter,
+                                    std::move(val));
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1033,11 +1023,11 @@ public:
     std::expected<std::any, Error> invoke(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& sf = owner_->static_functions[idx_];
-        if (sizeof...(Args) != sf.param_types.size())
-            return std::unexpected(Error::ArityMismatch);
-        auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-        const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
-        return detail::checked_static_invoke(sf.invoker, args_ptr);
+        std::array<std::any, sizeof...(Args)> arg_anys;
+        auto args_ptr = detail::prepare_args(arg_anys, sf.param_types.size(),
+                                             std::forward<Args>(args)...);
+        if (!args_ptr) return std::unexpected(args_ptr.error());
+        return detail::checked_call(sf.invoker, *args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }

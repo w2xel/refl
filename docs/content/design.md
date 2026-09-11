@@ -141,6 +141,8 @@ Limitations (marked with `ponytail:` in the source):
 - Const data members (static and non-static) are read-only (getter only, no setter).
 - Multiple inheritance is supported — base-class pointer adjustment uses
   `offset_of` at registration time, accumulated through the base hierarchy.
+  Virtual inheritance is not supported (`offset_of` is not constant for
+  virtual bases); virtual base hierarchies will fail to register correctly.
 - Clone requires a copy constructor — non-copyable classes return
   `Error::NotCopyable`.
 - Registration is static-init order dependent — `find_class` only works after
