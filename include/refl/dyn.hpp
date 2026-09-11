@@ -19,6 +19,7 @@
 
 #include <refl/refl.hpp>
 
+#include <any>
 namespace refl {
 // ---------------------------------------------------------------------------
 // TypedMethod<Sigs...> — variadic callable, one template arg per overload

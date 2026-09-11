@@ -5,7 +5,6 @@
 //
 // Returns non-zero (fails meson test) on any assertion failure.
 #include <refl/refl.hpp>
-#include <any>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -478,6 +477,18 @@ int main() {
     auto stack_sum = cls.find_function("sum")->invoke(stack_point);
     CHECK(stack_sum.has_value(), "invoke on stack object should succeed");
     CHECK(*stack_sum->cast_safe<int>().value() == 755, "stack invoke sum should be 755 (555+200)");
+
+    // === NotOwned vs NotCopyable ===
+    // cast_safe on a non-owning (borrowed) Object returns NotOwned, not
+    // NotCopyable — the object isn't uncopyable, it just isn't owned.
+    refl::Object borrowed(stack_point);
+    auto borrowed_cast = borrowed.cast_safe<Point>();
+    CHECK(!borrowed_cast.has_value(), "cast_safe on non-owning should fail");
+    CHECK(borrowed_cast.error() == refl::Error::NotOwned, "non-owning cast should be NotOwned");
+    // cast_ref still works on a non-owning Object.
+    auto borrowed_ref = borrowed.cast_ref<Point>();
+    CHECK(borrowed_ref.has_value(), "cast_ref on non-owning should succeed");
+    CHECK(borrowed_ref.value()->x == 555, "borrowed ref x should be 555");
 
     // === Operators ===
     auto vec_cls = *refl::find_class("Vec");

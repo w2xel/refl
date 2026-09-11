@@ -127,7 +127,7 @@ Initial implementation. The API above is working:
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
   object's class or any of its bases (upcast).  Only works on owning
-  Objects; returns `Error::NotCopyable` for non-owning Objects.
+  Objects; returns `Error::NotOwned` for non-owning Objects.
 - `Object::cast_ref<T>()` returns `std::expected<T*, Error>` — a raw pointer
   for both owned and non-owning Objects.  The caller manages lifetime.
 - `Object::is_owned()` returns true if the Object owns its data (backed by
@@ -139,8 +139,8 @@ Initial implementation. The API above is working:
   `std::expected<Enumerator, Error>`.
 - `list_all_classes()` and `list_all_enums()` enumerate registered names.
 - `Object::clone()` deep-copies the object through the type-erased handle.
-  Returns `Error::NotCopyable` if the class is not copy-constructible or
-  the Object is non-owning.
+  Returns `Error::NotOwned` if the Object is non-owning, `Error::NotCopyable`
+  if the class is not copy-constructible.
 - `Object::to_string()` returns a debug string with the class name and address.
 
 Type identity uses the fully-qualified name (`display_string_of`), so two

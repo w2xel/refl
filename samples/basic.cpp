@@ -4,7 +4,6 @@
 // function invocation, safe cast, overloaded function resolution, inherited
 // member access, and enum reflection.
 #include <refl/refl.hpp>
-#include <any>
 #include <cstdio>
 
 struct Shape {

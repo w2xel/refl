@@ -19,7 +19,6 @@
 #pragma once
 
 #include <meta>
-#include <any>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -45,6 +44,7 @@ enum class Error {
     TypeError,
     ArityMismatch,   // argument count doesn't match the member's param count
     ReadOnly,        // write to a const / bit-field member
+    NotOwned,        // cast_safe / clone on a non-owning (borrowed) Object
     NotCopyable,     // clone of a non-copy-constructible class / get on move-only
 };
 
@@ -58,6 +58,7 @@ inline std::string_view to_string(Error e) {
     case Error::TypeError:     return "TypeError";
     case Error::ArityMismatch:  return "ArityMismatch";
     case Error::ReadOnly:       return "ReadOnly";
+    case Error::NotOwned:       return "NotOwned";
     case Error::NotCopyable:    return "NotCopyable";
     }
     return "Unknown";
@@ -466,12 +467,12 @@ public:
     }
 
     // Owning cast — returns a shared_ptr<T> that keeps the object alive.
-    // Only works for owned Objects.  Returns Error::NotCopyable for
+    // Only works for owned Objects.  Returns Error::NotOwned for
     // non-owning Objects (use cast_ref instead).
     template <typename T>
     std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!is_owned()) return std::unexpected(Error::NotCopyable);
+        if (!is_owned()) return std::unexpected(Error::NotOwned);
         const auto tname = detail::type_name<T>();
         auto off = is_base_of_with_offset(class_name_, tname);
         if (!off) return std::unexpected(Error::TypeError);
@@ -494,7 +495,7 @@ public:
 
     std::expected<Object, Error> clone() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!is_owned()) return std::unexpected(Error::NotCopyable);
+        if (!is_owned()) return std::unexpected(Error::NotOwned);
         std::lock_guard<std::mutex> lk(pool_mutex());
         auto it = class_pool().find(std::string(class_name_));
         if (it == class_pool().end() || !it->second.clone)
@@ -560,6 +561,22 @@ prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
     }
 }
 
+// Unbox one Object argument against its compile-time parameter type P.
+// Lvalue params copy, rvalue-ref params move.  Throws bad_cast on a
+// type-name mismatch — caught by checked_call and mapped to TypeError.
+// P is the spliced parameter type (e.g. [:std::meta::type_of(params[J]):]);
+// J is the argument index, passed at runtime.
+template <typename P>
+auto extract_arg(const Object* args, std::size_t J) {
+    using PBare = std::remove_cvref_t<P>;
+    constexpr auto param_type = type_name<PBare>();
+    if (args[J].class_name() != param_type) throw std::bad_cast{};
+    if constexpr (std::is_rvalue_reference_v<P>)
+        return std::move(*static_cast<PBare*>(args[J].raw()));
+    else
+        return *static_cast<PBare*>(args[J].raw());
+}
+
 template <typename T, std::meta::info Ctor>
 Object factory(const Object* args) {
     static constexpr auto params = std::define_static_array(
@@ -568,13 +585,7 @@ Object factory(const Object* args) {
 
     auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
         using P = [:std::meta::type_of(params[J]):];
-        using PBare = std::remove_cvref_t<P>;
-        constexpr auto param_type = type_name<PBare>();
-        if (args[J].class_name() != param_type) throw std::bad_cast{};
-        if constexpr (std::is_rvalue_reference_v<P>)
-            return std::move(*static_cast<PBare*>(args[J].raw()));
-        else
-            return *static_cast<PBare*>(args[J].raw());
+        return extract_arg<P>(args, J);
     };
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
@@ -600,13 +611,7 @@ Object invoker(const std::shared_ptr<void>& owner, void* obj,
 
     auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
         using P = [:std::meta::type_of(params[J]):];
-        using PBare = std::remove_cvref_t<P>;
-        constexpr auto param_type = type_name<PBare>();
-        if (args[J].class_name() != param_type) throw std::bad_cast{};
-        if constexpr (std::is_rvalue_reference_v<P>)
-            return std::move(*static_cast<PBare*>(args[J].raw()));
-        else
-            return *static_cast<PBare*>(args[J].raw());
+        return extract_arg<P>(args, J);
     };
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
@@ -697,13 +702,7 @@ Object static_invoker(const Object* args) {
 
     auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) {
         using P = [:std::meta::type_of(params[J]):];
-        using PBare = std::remove_cvref_t<P>;
-        constexpr auto param_type = type_name<PBare>();
-        if (args[J].class_name() != param_type) throw std::bad_cast{};
-        if constexpr (std::is_rvalue_reference_v<P>)
-            return std::move(*static_cast<PBare*>(args[J].raw()));
-        else
-            return *static_cast<PBare*>(args[J].raw());
+        return extract_arg<P>(args, J);
     };
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
