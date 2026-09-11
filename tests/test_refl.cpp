@@ -213,6 +213,32 @@ struct HideDerived : HideBase {
     void set(int a) { v = a * 100; }  // hides both Base::set overloads
 };
 
+// Diamond inheritance: DiamBottom inherits from both DiamLeft and DiamRight,
+// which both inherit from DiamBase.  Without dedup, all_functions/all_fields
+// would list DiamBase's members twice (once per path).
+struct DiamBase {
+    int v;
+    static int dsval;
+    DiamBase() : v(0) {}
+    DiamBase(int v) : v(v) {}
+    int dfn() const { return v; }
+    static int dsfn() { return dsval; }
+};
+int DiamBase::dsval = 77;
+
+struct DiamLeft : DiamBase {
+    DiamLeft() {}
+    DiamLeft(int v) : DiamBase(v) {}
+};
+struct DiamRight : DiamBase {
+    DiamRight() {}
+    DiamRight(int v) : DiamBase(v) {}
+};
+struct DiamBottom : DiamLeft, DiamRight {
+    DiamBottom() {}
+    DiamBottom(int l, int r) : DiamLeft(l), DiamRight(r) {}
+};
+
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Point> reg_point;
 [[maybe_unused]] static refl::Reg<Color> reg_color;
@@ -243,6 +269,10 @@ struct HideDerived : HideBase {
 [[maybe_unused]] static refl::Reg<NVDerived> reg_nvderived;
 [[maybe_unused]] static refl::Reg<HideBase> reg_hide_base;
 [[maybe_unused]] static refl::Reg<HideDerived> reg_hide_derived;
+[[maybe_unused]] static refl::Reg<DiamBase> reg_diam_base;
+[[maybe_unused]] static refl::Reg<DiamLeft> reg_diam_left;
+[[maybe_unused]] static refl::Reg<DiamRight> reg_diam_right;
+[[maybe_unused]] static refl::Reg<DiamBottom> reg_diam_bottom;
 
 struct Wrong {};
 
@@ -354,7 +384,7 @@ int main() {
 
     // --- inheritance ---
     CHECK(cls.bases().size() == 1, "Point should have 1 base");
-    CHECK(cls.bases()[0].name == "Base", "base should be Base");
+    CHECK(cls.bases()[0].name() == "Base", "base should be Base");
 
     // inherited field from Base
     auto base_field = cls.find_field("base_val");
@@ -776,28 +806,29 @@ int main() {
     CHECK(set_exact.has_value(), "field set with exact Base value should succeed");
     CHECK(holder_b->b.base_val == 7, "after exact set, base_val should be 7");
 
-    // === Move-only member: get_ref is the only access path ===
+    // === Move-only member: move-assignable set works, get is not available ===
     auto mo_cls = *refl::find_class("MoveOnly");
     auto mo_obj = *mo_cls.find_constructor({"int"})->call(42);
     auto mo_ptr_field = *mo_cls.find_field("ptr");
     CHECK(!mo_ptr_field.has_getter(), "unique_ptr field has no copy getter");
-    CHECK(mo_ptr_field.is_readonly(), "unique_ptr field is read-only (no setter)");
-    // get/set are unavailable for move-only members.
+    CHECK(!mo_ptr_field.is_readonly(), "unique_ptr field is not const (has move setter)");
+    CHECK(mo_ptr_field.has_setter(), "unique_ptr field has a move setter");
+    // get is unavailable (move-only member, no copy getter).
     auto mo_get = mo_ptr_field.get(mo_obj);
     CHECK(!mo_get.has_value(), "get on move-only field should fail");
     CHECK(mo_get.error() == refl::Error::NotCopyable, "should be NotCopyable");
+    // set SUCCEEDS — unique_ptr is move-assignable.
     auto mo_set = mo_ptr_field.set(mo_obj, std::make_unique<int>(9));
-    CHECK(!mo_set.has_value(), "set on move-only field should fail");
-    CHECK(mo_set.error() == refl::Error::ReadOnly, "should be ReadOnly");
-    // Untyped get_ref (void*) — the headline path for move-only members.
+    CHECK(mo_set.has_value(), "set on move-only move-assignable field should succeed");
+    // Verify the value changed via get_ref.
+    auto mo_tref = mo_ptr_field.get_ref<std::unique_ptr<int>>(mo_obj);
+    CHECK(mo_tref.has_value(), "typed get_ref<unique_ptr<int>> should succeed");
+    CHECK(**mo_tref.value() == 9, "after set, move-only field should be 9");
+    // Untyped get_ref (void*) — still works for direct access.
     auto mo_ref = mo_ptr_field.get_ref(mo_obj);
     CHECK(mo_ref.has_value(), "untyped get_ref on move-only field should succeed");
     auto* uptr = static_cast<std::unique_ptr<int>*>(mo_ref.value());
-    CHECK(**uptr == 42, "move-only field value via get_ref should be 42");
-    // Typed get_ref on the move-only member.
-    auto mo_tref = mo_ptr_field.get_ref<std::unique_ptr<int>>(mo_obj);
-    CHECK(mo_tref.has_value(), "typed get_ref<unique_ptr<int>> should succeed");
-    CHECK(**mo_tref.value() == 42, "typed get_ref value should be 42");
+    CHECK(**uptr == 9, "move-only field value via get_ref should be 9 after set");
     auto mo_tref_wrong = mo_ptr_field.get_ref<int>(mo_obj);
     CHECK(!mo_tref_wrong.has_value(), "typed get_ref<int> on unique_ptr field should fail");
     CHECK(mo_tref_wrong.error() == refl::Error::TypeError, "should be TypeError");
@@ -1004,6 +1035,99 @@ int main() {
     (void)hd_set1->invoke(hd_obj, 3);
     auto hd_p = hd_obj.cast_safe<HideDerived>().value();
     CHECK(hd_p->v == 300, "derived set(3) should give 300 (3*100)");
+
+    // === Diamond inheritance: dedup in all_functions / all_fields ===
+    // DiamBottom -> {DiamLeft, DiamRight} -> DiamBase.
+    // DiamBase has field v, function dfn, static dsval, static dsfn.
+    // Without dedup, each appears twice (once per path to DiamBase).
+    auto db_cls = *refl::find_class("DiamBottom");
+
+    auto db_all_fns = db_cls.all_functions();
+    int db_dfn_count = 0;
+    for (const auto& f : db_all_fns)
+        if (f.name() == "dfn") ++db_dfn_count;
+    CHECK(db_dfn_count == 1, "all_functions() should have 1 dfn (diamond dedup)");
+
+    auto db_all_flds = db_cls.all_fields();
+    int db_v_count = 0;
+    for (const auto& f : db_all_flds)
+        if (f.name() == "v") ++db_v_count;
+    CHECK(db_v_count == 1, "all_fields() should have 1 v (diamond dedup)");
+
+    auto db_all_sflds = db_cls.all_static_fields();
+    int db_dsval_count = 0;
+    for (const auto& f : db_all_sflds)
+        if (f.name() == "dsval") ++db_dsval_count;
+    CHECK(db_dsval_count == 1, "all_static_fields() should have 1 dsval (diamond dedup)");
+
+    auto db_all_sfns = db_cls.all_static_functions();
+    int db_dsfn_count = 0;
+    for (const auto& f : db_all_sfns)
+        if (f.name() == "dsfn") ++db_dsfn_count;
+    CHECK(db_dsfn_count == 1, "all_static_functions() should have 1 dsfn (diamond dedup)");
+
+    // find_functions / find_static_functions also dedup.
+    CHECK(db_cls.find_functions("dfn").size() == 1, "find_functions('dfn') should be 1 (diamond dedup)");
+    CHECK(db_cls.find_static_functions("dsfn").size() == 1, "find_static_functions('dsfn') should be 1 (diamond dedup)");
+
+    // The deduped dfn is callable (adjusts to first DiamBase subobject).
+    auto db_obj = *db_cls.find_constructor({})->call();
+    auto db_fn = db_cls.find_function("dfn");
+    CHECK(db_fn.has_value(), "find_function('dfn') should succeed via base walk");
+    // DiamLeft and DiamRight were default-constructed, so v=0 on both paths.
+    auto db_ret = db_fn->invoke(db_obj);
+    CHECK(db_ret.has_value(), "invoke dfn on DiamBottom should succeed");
+    CHECK(*db_ret->cast_safe<int>().value() == 0, "dfn should be 0 (default-constructed)");
+
+    // === Base handle: bases() returns Base handles, not raw structs ===
+    auto db_bases = db_cls.bases();
+    CHECK(db_bases.size() == 2, "DiamBottom should have 2 bases");
+    CHECK(db_bases[0].name() == "DiamLeft", "first base should be DiamLeft");
+    CHECK(db_bases[1].name() == "DiamRight", "second base should be DiamRight");
+    CHECK(db_bases[0].valid(), "Base handle should be valid");
+    CHECK(db_bases[0].offset() >= 0, "Base offset should be non-negative");
+    // Point has 1 base.
+    CHECK(cls.bases()[0].name() == "Base", "Point base name via handle");
+
+    // === Null-safety: default-constructed Class/Enum ===
+    refl::Class null_cls;
+    CHECK(!null_cls.valid(), "default Class should be invalid");
+    CHECK(null_cls.name().empty(), "invalid Class name() should return empty string");
+    CHECK(null_cls.bases().empty(), "invalid Class bases() should return empty vector");
+    CHECK(null_cls.fields().empty(), "invalid Class fields() should return empty vector");
+    CHECK(null_cls.functions().empty(), "invalid Class functions() should return empty vector");
+    CHECK(null_cls.static_fields().empty(), "invalid Class static_fields() should return empty");
+    CHECK(null_cls.static_functions().empty(), "invalid Class static_functions() should return empty");
+    CHECK(null_cls.constructors().empty(), "invalid Class constructors() should return empty");
+    CHECK(!null_cls.find_function("x").has_value(), "invalid Class find_function should fail");
+    CHECK(null_cls.find_function("x").error() == refl::Error::NullHandle, "should be NullHandle");
+    CHECK(null_cls.all_functions().empty(), "invalid Class all_functions() should return empty");
+
+    refl::Enum null_enum;
+    CHECK(!null_enum.valid(), "default Enum should be invalid");
+    CHECK(null_enum.name().empty(), "invalid Enum name() should return empty string");
+    CHECK(null_enum.enumerators().empty(), "invalid Enum enumerators() should return empty");
+    CHECK(!null_enum.find_enumerator("x").has_value(), "invalid Enum find_enumerator should fail");
+    CHECK(null_enum.find_enumerator("x").error() == refl::Error::NullHandle, "should be NullHandle");
+
+    // === is_readonly semantics: const vs non-const vs move-only ===
+    // const member: readonly=true, has_setter=false, has_getter=true (copyable)
+    CHECK(idf.is_readonly(), "const int member should be readonly");
+    CHECK(!idf.has_setter(), "const int member should have no setter");
+    CHECK(idf.has_getter(), "const int member should have a getter");
+    // non-const plain member: readonly=false, has_setter=true
+    CHECK(!xf.is_readonly(), "non-const int member should not be readonly");
+    CHECK(xf.has_setter(), "non-const int member should have a setter");
+    // move-only move-assignable member: readonly=false (not const), has_setter=true
+    CHECK(!mo_ptr_field.is_readonly(), "unique_ptr member should not be readonly (not const)");
+    CHECK(mo_ptr_field.has_setter(), "unique_ptr member should have a move setter");
+    CHECK(!mo_ptr_field.has_getter(), "unique_ptr member should have no copy getter");
+    // const static member: readonly=true
+    CHECK(maxf->is_readonly(), "const static member should be readonly");
+    CHECK(!maxf->has_setter(), "const static member should have no setter");
+    // non-const static member: readonly=false
+    CHECK(!sf->is_readonly(), "non-const static member should not be readonly");
+    CHECK(sf->has_setter(), "non-const static member should have a setter");
 
     std::printf("refl core API test ok\n");
     return 0;

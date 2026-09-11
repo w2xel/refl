@@ -105,7 +105,9 @@ Initial implementation. The API above is working:
 - `Class::all_static_fields()` is the static-field equivalent of
   `all_fields()`, returning `std::vector<StaticField>`.
 - `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
-- `Class::bases()` returns the direct base classes (name + byte offset within T).
+- `Class::bases()` returns the direct base classes as `std::vector<Base>`
+  handles — `Base::name()` and `Base::offset()` give the base class name
+  and byte offset within T.
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
   type-erased, owning handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on any object —
@@ -121,7 +123,7 @@ Initial implementation. The API above is working:
   object (owned `Object` or stack/concrete instance).
   `get` returns `std::expected<Object, Error>` (a copy of the value);
   `set` takes a typed value (no `std::any` needed) and returns
-  `Error::ReadOnly` for read-only (const, bit-field, or move-only) fields,
+  `Error::ReadOnly` for read-only (const or not move-assignable) fields,
   and `Error::TypeError` / `Error::NullHandle` as above.
   Like `invoke`, `set` upcasts a derived-class value to a base-class field
   (the value is adjusted to the base subobject before copying).
@@ -134,6 +136,9 @@ Initial implementation. The API above is working:
   including move-only.
 - `Field::has_getter()` returns true if the field has a copy-based getter
   (false for move-only members — use `get_ref` instead).
+  `Field::has_setter()` returns true if the field has a setter (false for
+  const or not move-assignable members).
+  `Field::is_readonly()` returns true if the field is const-qualified.
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
   (walks bases).
   `StaticField::get()` returns `std::expected<Object, Error>`;
@@ -210,6 +215,11 @@ comparison (no RTTI), and the project compiles with `-Wconversion
 -Wsign-conversion`, so silent widening at the reflection boundary would
 contradict the codebase's own stance on implicit conversions.
 
+All `Class` and `Enum` accessor methods are null-safe: calling `fields()`,
+`functions()`, `bases()`, `name()`, etc. on a default-constructed (invalid)
+handle returns an empty vector or empty string rather than crashing.  The
+`find_*` methods return `Error::NullHandle`.
+
 Limitations:
 
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
@@ -219,9 +229,12 @@ Limitations:
   reflects the public interface, not the implementation.  Public constructors
   are registered; private/protected constructors are not.
 - Const data members (static and non-static) are read-only (getter only, no setter).
-- Move-only data members (e.g. `unique_ptr`) have no getter or setter — use
-  `Field::get_ref()` to access them by pointer.  Registration no longer fails
-  to compile for classes with move-only members.
+- Move-only data members (e.g. `unique_ptr`) have no copy getter (getter copies
+  into a `shared_ptr`) but DO have a setter if move-assignable — `Field::set()`
+  move-assigns the value.  Use `Field::get_ref()` for direct pointer access.
+  Registration no longer fails to compile for classes with move-only members.
+  Members that are neither copy-constructible nor move-assignable have neither
+  getter nor setter — use `get_ref` for read access.
 - Functions with reference return types (e.g. `operator=`, `operator+=`)
   return an aliasing Object that shares ownership with the original (for
   owned objects) or a non-owning Object (for stack objects).  The caller
@@ -244,6 +257,10 @@ Limitations:
   stored, so `find_function`, `find_field`, `is_class`, and `cast_safe` skip
   them.  Virtual inheritance is not supported (`offset_of` is not constant for
   virtual bases); virtual base hierarchies will fail to register correctly.
+  Diamond inheritance (a shared base reached via two paths) is deduplicated
+  in `all_functions()`, `all_fields()`, `all_static_fields()`, `all_static_functions()`,
+  `find_functions()`, and `find_static_functions()` — each member from the
+  shared base appears once, not once per path.
 - Overloaded operators (`operator+`, `operator==`, `operator[]`, `operator()`,
   `operator+=`, `operator=`, etc.) are registered as functions, findable by
   name (`"operator+"`, `"operator=="`, etc.).  Conversion operators and the

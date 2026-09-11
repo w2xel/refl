@@ -41,7 +41,7 @@ int main() {
     auto cls = *refl::find_class("Rect");
     std::printf("class: %s\n", cls.name().c_str());
     std::printf("  bases:");
-    for (const auto& b : cls.bases()) std::printf(" %s", b.name.c_str());
+    for (const auto& b : cls.bases()) std::printf(" %s", b.name().c_str());
     std::printf("\n");
 
     // Construct.

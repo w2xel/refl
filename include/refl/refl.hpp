@@ -19,6 +19,7 @@
 #pragma once
 
 #include <meta>
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -116,8 +117,9 @@ struct FieldInfo {
     std::string name;
     std::string type;
     std::ptrdiff_t offset;  // byte offset of member within T (for get_ref)
-    GetterFn getter;        // nullptr if move-only
-    SetterFn setter;        // nullptr for const / bit-field / move-only
+    GetterFn getter;        // nullptr if move-only (not copy-constructible)
+    SetterFn setter;        // nullptr for const / not move-assignable
+    bool is_const;          // true for const-qualified members
 };
 
 struct StaticFieldInfo {
@@ -125,7 +127,8 @@ struct StaticFieldInfo {
     std::string type;
     void* address;             // address of the static storage (for get_ref)
     StaticGetterFn getter;
-    StaticSetterFn setter;  // nullptr for const members
+    StaticSetterFn setter;  // nullptr for const / not move-assignable
+    bool is_const;          // true for const-qualified members
 };
 
 struct BaseInfo {
@@ -280,6 +283,7 @@ inline bool match_signature(
 // Forward declarations.
 // ---------------------------------------------------------------------------
 class Class;
+class Base;
 class Constructor;
 class Function;
 class Field;
@@ -779,6 +783,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
             using MemberType = [:std::meta::type_of(m):];
             using MemberBare = std::remove_cvref_t<MemberType>;
 
+            fi.is_const = std::is_const_v<MemberType>;
+
             // Getter: only for copy-constructible members (getter copies
             // into a shared_ptr).  Move-only members are get_ref-only.
             if constexpr (std::is_copy_constructible_v<MemberBare>) {
@@ -787,9 +793,11 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 fi.getter = nullptr;
             }
 
-            // Setter: skip const and non-copy-constructible members.
+            // Setter: skip const members and non-move-assignable members.
+            // The setter move-assigns, so copy-constructibility is not
+            // required — unique_ptr and other move-only types are settable.
             if constexpr (std::is_const_v<MemberType> ||
-                          !std::is_copy_constructible_v<MemberBare>) {
+                          !std::is_move_assignable_v<MemberBare>) {
                 fi.setter = nullptr;
             } else {
                 fi.setter = &detail::setter<T, m>;
@@ -813,6 +821,8 @@ ClassInfo RegistrarHolder<T>::make_info() {
             using MemberType = [:std::meta::type_of(m):];
             using MemberBare = std::remove_cvref_t<MemberType>;
 
+            fi.is_const = std::is_const_v<MemberType>;
+
             // Capture the address for get_ref.  const static members may
             // lack an out-of-line definition (static const int with an
             // in-class initializer is a declaration, not a definition),
@@ -833,7 +843,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             }
 
             if constexpr (std::is_const_v<MemberType> ||
-                          !std::is_copy_constructible_v<MemberBare>) {
+                          !std::is_move_assignable_v<MemberBare>) {
                 fi.setter = nullptr;
             } else {
                 fi.setter = &detail::static_setter<T, m>;
@@ -1039,6 +1049,7 @@ public:
     explicit operator bool() const { return valid(); }
 
 private:
+    friend class Class;
     const ClassInfo* owner_ = nullptr;
     std::size_t idx_ = 0;
 };
@@ -1051,8 +1062,9 @@ public:
 
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
-    bool is_readonly() const { return owner_->fields[idx_].setter == nullptr; }
+    bool is_readonly() const { return owner_->fields[idx_].is_const; }
     bool has_getter() const { return owner_->fields[idx_].getter != nullptr; }
+    bool has_setter() const { return owner_->fields[idx_].setter != nullptr; }
 
     // Get the field value (copy).  Returns Error::TypeError if obj is not
     // the field's class, Error::NullHandle if the handle is invalid,
@@ -1097,15 +1109,16 @@ public:
             static_cast<char*>(adj) + owner_->fields[idx_].offset));
     }
 
-    // Set the field value.  Returns Error::ReadOnly if the field is
-    // read-only (const, bit-field, or move-only), Error::TypeError if obj
-    // is not the field's class or the value's type doesn't match or derive
-    // from the field type, Error::NullHandle if the Field handle is invalid.
+    // Set the field value (move-assigns).  Returns Error::ReadOnly if the
+    // field has no setter (const or not move-assignable), Error::TypeError
+    // if obj is not the field's class or the value's type doesn't match or
+    // derive from the field type, Error::NullHandle if the Field handle is
+    // invalid.
     template <typename V>
     std::expected<void, Error> set(Object obj, V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
-        if (is_readonly()) return std::unexpected(Error::ReadOnly);
+        if (!has_setter()) return std::unexpected(Error::ReadOnly);
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         std::decay_t<V> storage(std::forward<V>(val));
@@ -1118,6 +1131,7 @@ public:
     explicit operator bool() const { return valid(); }
 
 private:
+    friend class Class;
     const ClassInfo* owner_ = nullptr;
     std::size_t idx_ = 0;
 };
@@ -1130,8 +1144,9 @@ public:
 
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
-    bool is_readonly() const { return owner_->static_fields[idx_].setter == nullptr; }
+    bool is_readonly() const { return owner_->static_fields[idx_].is_const; }
     bool has_getter() const { return owner_->static_fields[idx_].getter != nullptr; }
+    bool has_setter() const { return owner_->static_fields[idx_].setter != nullptr; }
 
     // Get the static field value (copy).  Returns Error::NullHandle if
     // the handle is invalid, Error::NotCopyable if the field has no
@@ -1169,14 +1184,14 @@ public:
         return static_cast<T*>(addr);
     }
 
-    // Set the static field value.  Returns Error::ReadOnly if the field
-    // is read-only (const or move-only), Error::TypeError if the value's
-    // type doesn't match or derive from the field type, Error::NullHandle
-    // if the handle is invalid.
+    // Set the static field value (move-assigns).  Returns Error::ReadOnly if
+    // the field has no setter (const or not move-assignable), Error::TypeError
+    // if the value's type doesn't match or derive from the field type,
+    // Error::NullHandle if the handle is invalid.
     template <typename V>
     std::expected<void, Error> set(V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (is_readonly()) return std::unexpected(Error::ReadOnly);
+        if (!has_setter()) return std::unexpected(Error::ReadOnly);
         std::decay_t<V> storage(std::forward<V>(val));
         Object val_ref(&storage, detail::type_name<std::decay_t<V>>());
         return detail::checked_call(owner_->static_fields[idx_].setter,
@@ -1187,6 +1202,7 @@ public:
     explicit operator bool() const { return valid(); }
 
 private:
+    friend class Class;
     const ClassInfo* owner_ = nullptr;
     std::size_t idx_ = 0;
 };
@@ -1227,6 +1243,7 @@ public:
     explicit operator bool() const { return valid(); }
 
 private:
+    friend class Class;
     const ClassInfo* owner_ = nullptr;
     std::size_t idx_ = 0;
 };
@@ -1253,10 +1270,14 @@ public:
     Enum() = default;
     explicit Enum(const EnumInfo* info) : info_(info) {}
 
-    const std::string& name() const { return info_->name; }
+    const std::string& name() const {
+        static const std::string empty;
+        return info_ ? info_->name : empty;
+    }
 
     const std::vector<EnumeratorInfo>& enumerators() const {
-        return info_->enumerators;
+        static const std::vector<EnumeratorInfo> empty;
+        return info_ ? info_->enumerators : empty;
     }
 
     std::expected<Enumerator, Error> find_enumerator(std::string_view name) const;
@@ -1269,19 +1290,44 @@ private:
     const EnumInfo* info_ = nullptr;
 };
 
+class Base {
+public:
+    Base() = default;
+    Base(const ClassInfo* owner, std::size_t idx)
+        : owner_(owner), idx_(idx) {}
+
+    const std::string& name() const { return owner_->bases[idx_].name; }
+    std::ptrdiff_t offset() const { return owner_->bases[idx_].offset; }
+
+    bool valid() const { return owner_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+
+private:
+    const ClassInfo* owner_ = nullptr;
+    std::size_t idx_ = 0;
+};
+
 class Class {
 public:
     Class() = default;
     explicit Class(const ClassInfo* info) : info_(info) {}
 
-    const std::string& name() const { return info_->name; }
+    const std::string& name() const {
+        static const std::string empty;
+        return info_ ? info_->name : empty;
+    }
 
-    const std::vector<BaseInfo>& bases() const {
-        return info_->bases;
+    std::vector<Base> bases() const {
+        std::vector<Base> result;
+        if (!valid()) return result;
+        for (std::size_t i = 0; i < info_->bases.size(); ++i)
+            result.emplace_back(info_, i);
+        return result;
     }
 
     std::vector<Field> fields() const {
         std::vector<Field> result;
+        if (!valid()) return result;
         for (std::size_t i = 0; i < info_->fields.size(); ++i)
             result.emplace_back(info_, i);
         return result;
@@ -1289,6 +1335,7 @@ public:
 
     std::vector<StaticField> static_fields() const {
         std::vector<StaticField> result;
+        if (!valid()) return result;
         for (std::size_t i = 0; i < info_->static_fields.size(); ++i)
             result.emplace_back(info_, i);
         return result;
@@ -1296,6 +1343,7 @@ public:
 
     std::vector<StaticFunction> static_functions() const {
         std::vector<StaticFunction> result;
+        if (!valid()) return result;
         for (std::size_t i = 0; i < info_->static_functions.size(); ++i)
             result.emplace_back(info_, i);
         return result;
@@ -1303,6 +1351,7 @@ public:
 
     std::vector<Constructor> constructors() const {
         std::vector<Constructor> result;
+        if (!valid()) return result;
         for (std::size_t i = 0; i < info_->constructors.size(); ++i)
             result.emplace_back(info_, i);
         return result;
@@ -1310,6 +1359,7 @@ public:
 
     std::vector<Function> functions() const {
         std::vector<Function> result;
+        if (!valid()) return result;
         for (std::size_t i = 0; i < info_->functions.size(); ++i)
             result.emplace_back(info_, i);
         return result;
@@ -1372,6 +1422,17 @@ public:
     explicit operator bool() const { return valid(); }
 
 private:
+    // Remove duplicate handles produced by diamond inheritance — the same
+    // (ClassInfo*, idx) pair can appear via two base paths.  Order-preserving.
+    template <typename Handle>
+    static void dedup_handles(std::vector<Handle>& v) {
+        std::set<std::pair<const ClassInfo*, std::size_t>> seen;
+        v.erase(std::remove_if(v.begin(), v.end(),
+            [&seen](const Handle& h) {
+                return !seen.insert({h.owner_, h.idx_}).second;
+            }), v.end());
+    }
+
     const ClassInfo* info_ = nullptr;
 };
 
@@ -1501,6 +1562,7 @@ inline std::vector<Field> Class::all_fields() const {
             }
         }
     }
+    dedup_handles(results);
     return results;
 }
 
@@ -1555,6 +1617,7 @@ inline std::vector<Function> Class::find_functions(
             results.insert(results.end(), more.begin(), more.end());
         }
     }
+    dedup_handles(results);
     return results;
 }
 
@@ -1576,6 +1639,7 @@ inline std::vector<Function> Class::all_functions() const {
             }
         }
     }
+    dedup_handles(results);
     return results;
 }
 
@@ -1630,6 +1694,7 @@ inline std::vector<StaticField> Class::all_static_fields() const {
             }
         }
     }
+    dedup_handles(results);
     return results;
 }
 
@@ -1694,6 +1759,7 @@ inline std::vector<StaticFunction> Class::find_static_functions(
             results.insert(results.end(), more.begin(), more.end());
         }
     }
+    dedup_handles(results);
     return results;
 }
 
@@ -1714,6 +1780,7 @@ inline std::vector<StaticFunction> Class::all_static_functions() const {
             }
         }
     }
+    dedup_handles(results);
     return results;
 }
 
