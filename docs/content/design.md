@@ -107,7 +107,10 @@ Initial implementation. The API above is working:
 - `Class::find_field("name")` returns `std::expected<Field, Error>` (walks bases).
 - `Class::bases()` returns the direct base classes as `std::vector<Base>`
   handles — `Base::name()` and `Base::offset()` give the base class name
-  and byte offset within T.
+  and byte offset within T.  `Base::as_class()` returns the registered
+  `Class` handle for the base.  `Class::all_bases()` returns the transitive
+  bases (the full inheritance graph), deduplicated by name so a
+  diamond-shared base appears once.
 - `Constructor::call(args...)` returns `std::expected<Object, Error>` — a
   type-erased, owning handle.  No template parameter needed.
 - `Function::invoke(obj, args...)` calls the member function on any object —
@@ -128,12 +131,15 @@ Initial implementation. The API above is working:
   Like `invoke`, `set` upcasts a derived-class value to a base-class field
   (the value is adjusted to the base subobject before copying).
 - `Field::get_ref(obj)` returns `std::expected<void*, Error>` — a non-owning
-  pointer into the field inside the object.  Works for all members including
-  move-only (unique_ptr).  The caller casts `void*` to the member type.
+  pointer into the field inside the object.  Works for all non-const members
+  including move-only (unique_ptr).  The caller casts `void*` to the member
+  type.  Returns `Error::ReadOnly` for const members — a writable `void*`
+  into a const member would let the caller cast away const.  Use the typed
+  `get_ref<const T>()` for const members (it returns a `const T*`).
 - `Field::get_ref<T>(obj)` returns `std::expected<T*, Error>` — a typed
   pointer into the field.  Checks `T` against the field's type name at
   runtime; returns `Error::TypeError` on mismatch.  For all members
-  including move-only.
+  including move-only and const (pass `const T` for const members).
 - `Field::has_getter()` returns true if the field has a copy-based getter
   (false for move-only members — use `get_ref` instead).
   `Field::has_setter()` returns true if the field has a setter (false for
@@ -144,12 +150,15 @@ Initial implementation. The API above is working:
   use `has_setter()` to check writability.
 - `Class::find_static_field("name")` returns `std::expected<StaticField, Error>`
   (walks bases).
-  `StaticField::get()` returns `std::expected<Object, Error>`;
+  `StaticField::get()` returns `std::expected<Object, Error>`.  For const
+  static members `get()` reads the compile-time constant initializer (no
+  odr-use of the storage, so it links even when the member has only an
+  in-class initializer and no out-of-line definition).
   `StaticField::get_ref()` returns `std::expected<void*, Error>` — a
   non-owning pointer to the static storage (works for move-only members);
   `StaticField::get_ref<T>()` is the typed variant (checks the type name at
   runtime).  Both return `Error::ReadOnly` for const static members, which
-  may lack addressable storage (use `get()` to read by copy).
+  lack addressable storage in this framework (use `get()` to read by copy).
   `StaticField::set(val)` writes the static storage (no Object needed)
   and returns `std::expected<void, Error>`.
 - `Class::find_static_function("name")` returns `std::expected<StaticFunction, Error>`
@@ -264,10 +273,22 @@ Limitations:
   stored, so `find_function`, `find_field`, `is_class`, and `cast_safe` skip
   them.  Virtual inheritance is not supported (`offset_of` is not constant for
   virtual bases); virtual base hierarchies will fail to register correctly.
-  Diamond inheritance (a shared base reached via two paths) is deduplicated
-  in `all_functions()`, `all_fields()`, `all_static_fields()`, `all_static_functions()`,
-  `find_functions()`, and `find_static_functions()` — each member from the
-  shared base appears once, not once per path.
+  Diamond inheritance (a shared base reached via two paths) is treated like
+  C++: an unqualified lookup of an ambiguous member is **not resolved** — the
+  singular `find_function`/`find_field`/`find_static_field`/`find_static_function`
+  return `Error::Ambiguous`, and the plural `all_functions()`, `all_fields()`,
+  `all_static_fields()`, `all_static_functions()`, `find_functions()`, and
+  `find_static_functions()` omit the member entirely (no silent first-path
+  pick).  The signature-disambiguating `find_function(name, types)` is still
+  `Ambiguous` — C++ resolves name-lookup ambiguity before overload resolution.
+  Two different sibling bases that each declare the same name are likewise
+  `Ambiguous` for the singular lookup; each declaration (uniquely reachable)
+  is still listed by the plural views and is individually invokable.
+- `Class::all_bases()` returns the transitive base classes, deduplicated by
+  name so a diamond-shared base appears once.  `Base::as_class()` returns the
+  registered `Class` handle for a base (invalid if the base was never `Reg<T>`'d).
+- `Class::find_constructor` does **not** walk bases — constructors are not
+  inherited (only the class's own public constructors are registered/searched).
 - Overloaded operators (`operator+`, `operator==`, `operator[]`, `operator()`,
   `operator+=`, `operator=`, etc.) are registered as functions, findable by
   name (`"operator+"`, `"operator=="`, etc.).  Conversion operators and the
@@ -284,4 +305,8 @@ Limitations:
   type and values exceeding `LLONG_MAX` undergo an implementation-defined
   conversion; the stored value may not match the true enumerator value.
 - Registration is static-init order dependent — `find_class` only works after
-  `Reg<T>` has been instantiated (or `ensure_registered<T>()` called).
+  `Reg<T>` has been instantiated (or `ensure_registered<T>()` called).  The
+  global pool holds each `ClassInfo`/`EnumInfo` in a `unique_ptr`, so
+  `Class`/`Field`/`Function`/... handles (which point into the pool) stay
+  valid even if a later `ensure_registered<T>()` grows the pool and rehashes
+  it — registration may safely happen at runtime after lookups have started.

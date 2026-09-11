@@ -86,6 +86,11 @@ int main() {
     auto sq = e.find_enumerator("Square");
     std::printf("  Square = %lld\n", sq->value());
 
+    // Value-to-enum: look up an enumerator by its integer value, then read
+    // the name back (round-trip a runtime value to an enumerator name).
+    auto by_val = e.find_enumerator(3);
+    std::printf("  value 3 = %s\n", by_val->name().c_str());
+
     // Clone (deep copy through type-erased handle).
     auto cloned = *obj.clone();
     std::printf("  clone: %s\n", cloned.to_string().c_str());

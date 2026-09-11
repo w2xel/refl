@@ -213,6 +213,14 @@ struct HideDerived : HideBase {
     void set(int a) { v = a * 100; }  // hides both Base::set overloads
 };
 
+// Inherited overloads without name hiding: DerivedInherit does NOT declare
+// set, so both HideBase::set(int) and set(int,int) are inherited as overloads
+// in the same subobject — NOT ambiguous.  find_function("set") returns the
+// first; find_function("set", {"int","int"}) resolves to the second.
+struct DerivedInherit : HideBase {
+    DerivedInherit(int v) : HideBase(v) {}
+};
+
 // Diamond inheritance: DiamBottom inherits from both DiamLeft and DiamRight,
 // which both inherit from DiamBase.  Without dedup, all_functions/all_fields
 // would list DiamBase's members twice (once per path).
@@ -275,6 +283,7 @@ struct FieldHideDer : FieldHideBase { int x = 99; };
 [[maybe_unused]] static refl::Reg<NVDerived> reg_nvderived;
 [[maybe_unused]] static refl::Reg<HideBase> reg_hide_base;
 [[maybe_unused]] static refl::Reg<HideDerived> reg_hide_derived;
+[[maybe_unused]] static refl::Reg<DerivedInherit> reg_derived_inherit;
 [[maybe_unused]] static refl::Reg<DiamBase> reg_diam_base;
 [[maybe_unused]] static refl::Reg<DiamLeft> reg_diam_left;
 [[maybe_unused]] static refl::Reg<DiamRight> reg_diam_right;
@@ -1044,48 +1053,72 @@ int main() {
     auto hd_p = hd_obj.cast_safe<HideDerived>().value();
     CHECK(hd_p->v == 300, "derived set(3) should give 300 (3*100)");
 
-    // === Diamond inheritance: dedup in all_functions / all_fields ===
+    // === Inherited overloads (no name hiding) are NOT ambiguous ===
+    // DerivedInherit does not declare set, so it inherits both set(int)
+    // and set(int,int) from HideBase.  Both live in the same subobject,
+    // so find_function("set") returns the first (not Ambiguous), and
+    // find_function("set", {"int","int"}) resolves to the second.
+    auto di_cls = *refl::find_class("DerivedInherit");
+    auto di_obj = *di_cls.find_constructor({"int"})->call(0);
+    auto di_set = di_cls.find_function("set");
+    CHECK(di_set.has_value(), "find_function('set') on DerivedInherit should succeed (inherited overloads, not ambiguous)");
+    auto di_set2 = di_cls.find_function("set", {"int", "int"});
+    CHECK(di_set2.has_value(), "find_function('set',{'int','int'}) on DerivedInherit should resolve to 2-param overload");
+    CHECK(di_set2->param_types().size() == 2, "2-param set should have 2 params");
+    auto di_overloads = di_cls.find_functions("set");
+    CHECK(di_overloads.size() == 2, "find_functions('set') on DerivedInherit should be 2 (both inherited overloads)");
+    // Invoke both inherited overloads.
+    (void)di_set->invoke(di_obj, 5);
+    auto di_rp = di_obj.cast_safe<DerivedInherit>().value();
+    CHECK(di_rp->v == 5, "inherited set(5) should give 5");
+    (void)di_set2->invoke(di_obj, 10, 20);
+    CHECK(di_rp->v == 30, "inherited set(10,20) should give 30 (10+20)");
+
+    // === Diamond inheritance: ambiguous members are not returned ===
     // DiamBottom -> {DiamLeft, DiamRight} -> DiamBase.
     // DiamBase has field v, function dfn, static dsval, static dsfn.
-    // Without dedup, each appears twice (once per path to DiamBase).
+    // Each is reachable via two base subobjects (a diamond), so an
+    // unqualified C++ lookup would be ambiguous.  The framework matches
+    // C++: the singular find_* return Error::Ambiguous and the plural
+    // all_*/find_<member>s omit them entirely (no silent first-path pick).
     auto db_cls = *refl::find_class("DiamBottom");
 
     auto db_all_fns = db_cls.all_functions();
     int db_dfn_count = 0;
     for (const auto& f : db_all_fns)
         if (f.name() == "dfn") ++db_dfn_count;
-    CHECK(db_dfn_count == 1, "all_functions() should have 1 dfn (diamond dedup)");
+    CHECK(db_dfn_count == 0, "all_functions() should omit ambiguous dfn (diamond)");
 
     auto db_all_flds = db_cls.all_fields();
     int db_v_count = 0;
     for (const auto& f : db_all_flds)
         if (f.name() == "v") ++db_v_count;
-    CHECK(db_v_count == 1, "all_fields() should have 1 v (diamond dedup)");
+    CHECK(db_v_count == 0, "all_fields() should omit ambiguous v (diamond)");
 
     auto db_all_sflds = db_cls.all_static_fields();
     int db_dsval_count = 0;
     for (const auto& f : db_all_sflds)
         if (f.name() == "dsval") ++db_dsval_count;
-    CHECK(db_dsval_count == 1, "all_static_fields() should have 1 dsval (diamond dedup)");
+    CHECK(db_dsval_count == 0, "all_static_fields() should omit ambiguous dsval (diamond)");
 
     auto db_all_sfns = db_cls.all_static_functions();
     int db_dsfn_count = 0;
     for (const auto& f : db_all_sfns)
         if (f.name() == "dsfn") ++db_dsfn_count;
-    CHECK(db_dsfn_count == 1, "all_static_functions() should have 1 dsfn (diamond dedup)");
+    CHECK(db_dsfn_count == 0, "all_static_functions() should omit ambiguous dsfn (diamond)");
 
-    // find_functions / find_static_functions also dedup.
-    CHECK(db_cls.find_functions("dfn").size() == 1, "find_functions('dfn') should be 1 (diamond dedup)");
-    CHECK(db_cls.find_static_functions("dsfn").size() == 1, "find_static_functions('dsfn') should be 1 (diamond dedup)");
+    // find_functions / find_static_functions omit ambiguous overloads.
+    CHECK(db_cls.find_functions("dfn").empty(), "find_functions('dfn') should be empty (diamond ambiguous)");
+    CHECK(db_cls.find_static_functions("dsfn").empty(), "find_static_functions('dsfn') should be empty (diamond ambiguous)");
 
-    // The deduped dfn is callable (adjusts to first DiamBase subobject).
-    auto db_obj = *db_cls.find_constructor({})->call();
-    auto db_fn = db_cls.find_function("dfn");
-    CHECK(db_fn.has_value(), "find_function('dfn') should succeed via base walk");
-    // DiamLeft and DiamRight were default-constructed, so v=0 on both paths.
-    auto db_ret = db_fn->invoke(db_obj);
-    CHECK(db_ret.has_value(), "invoke dfn on DiamBottom should succeed");
-    CHECK(*db_ret->cast_safe<int>().value() == 0, "dfn should be 0 (default-constructed)");
+    // find_function / find_field / find_static_* report Ambiguous.
+    CHECK(db_cls.find_function("dfn").error() == refl::Error::Ambiguous, "find_function('dfn') should be Ambiguous");
+    CHECK(db_cls.find_field("v").error() == refl::Error::Ambiguous, "find_field('v') should be Ambiguous");
+    CHECK(db_cls.find_static_field("dsval").error() == refl::Error::Ambiguous, "find_static_field('dsval') should be Ambiguous");
+    CHECK(db_cls.find_static_function("dsfn").error() == refl::Error::Ambiguous, "find_static_function('dsfn') should be Ambiguous");
+    // The signature-disambiguated lookups are still ambiguous at the
+    // name-lookup stage (C++ resolves ambiguity before overload resolution).
+    CHECK(db_cls.find_function("dfn", {}).error() == refl::Error::Ambiguous, "find_function('dfn',{}) should be Ambiguous");
 
     // === Base handle: bases() returns Base handles, not raw structs ===
     auto db_bases = db_cls.bases();
@@ -1094,8 +1127,36 @@ int main() {
     CHECK(db_bases[1].name() == "DiamRight", "second base should be DiamRight");
     CHECK(db_bases[0].valid(), "Base handle should be valid");
     CHECK(db_bases[0].offset() >= 0, "Base offset should be non-negative");
+    // Base::as_class() yields the registered Class for the base.
+    auto db_left_cls = db_bases[0].as_class();
+    CHECK(db_left_cls.valid(), "Base::as_class() should be valid for a registered base");
+    CHECK(db_left_cls.name() == "DiamLeft", "as_class() name should be DiamLeft");
     // Point has 1 base.
     CHECK(cls.bases()[0].name() == "Base", "Point base name via handle");
+
+    // === all_bases(): transitive, deduped by name ===
+    // DiamBottom -> {DiamLeft, DiamRight} -> DiamBase.  all_bases lists
+    // DiamLeft, DiamRight, DiamBase (DiamBase once despite two paths).
+    auto db_all_bases = db_cls.all_bases();
+    CHECK(db_all_bases.size() == 3, "DiamBottom all_bases() should be 3 (DiamLeft, DiamRight, DiamBase)");
+    int db_diambase_count = 0;
+    for (const auto& b : db_all_bases)
+        if (b.name() == "DiamBase") ++db_diambase_count;
+    CHECK(db_diambase_count == 1, "all_bases() should list DiamBase once (dedup)");
+    // Deep -> Mid -> {Left, Right}: all_bases transitive across 3 levels.
+    auto deep_all_bases = refl::find_class("Deep")->all_bases();
+    CHECK(deep_all_bases.size() == 3, "Deep all_bases() should be 3 (Mid, Left, Right)");
+    bool deep_has_mid = false, deep_has_left = false, deep_has_right = false;
+    for (const auto& b : deep_all_bases) {
+        if (b.name() == "Mid") deep_has_mid = true;
+        if (b.name() == "Left") deep_has_left = true;
+        if (b.name() == "Right") deep_has_right = true;
+    }
+    CHECK(deep_has_mid && deep_has_left && deep_has_right, "Deep all_bases() should include Mid, Left, Right");
+    // Invalid Class -> empty all_bases().
+    refl::Class nullc;
+    CHECK(nullc.all_bases().empty(), "invalid Class all_bases() should be empty");
+
 
     // === Null-safety: default-constructed Class/Enum ===
     refl::Class null_cls;
@@ -1125,6 +1186,12 @@ int main() {
     CHECK(idf.is_const(), "const int member should be const");
     CHECK(!idf.has_setter(), "const int member should have no setter");
     CHECK(idf.has_getter(), "const int member should have a getter");
+    // untyped get_ref on a const non-static member returns ReadOnly (a
+    // writable void* into a const member would let the caller cast away
+    // const).  The typed get_ref<const T>() is the safe path.
+    auto idf_ref = idf.get_ref(obj);
+    CHECK(!idf_ref.has_value(), "untyped get_ref on const non-static member should fail");
+    CHECK(idf_ref.error() == refl::Error::ReadOnly, "const non-static get_ref should be ReadOnly");
     // non-const plain member: is_const=false, has_setter=true
     CHECK(!xf.is_const(), "non-const int member should not be const");
     CHECK(xf.has_setter(), "non-const int member should have a setter");

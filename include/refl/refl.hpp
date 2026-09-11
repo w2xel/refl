@@ -46,6 +46,7 @@ enum class Error {
     ReadOnly,        // write to a const / bit-field member
     NotOwned,        // cast_safe / clone on a non-owning (borrowed) Object
     NotCopyable,     // clone of a non-copy-constructible class / get on move-only
+    Ambiguous,       // name resolves to 2+ base subobjects (diamond / multi-base)
 };
 
 // Forward declarations — needed for function pointer type aliases below.
@@ -144,14 +145,20 @@ struct EnumInfo {
 
 // ---------------------------------------------------------------------------
 // Global class and enum pools — Meyers singletons to avoid SIOF.
+//
+// Values are held in unique_ptr so that Class/Field/Function/... handles
+// (which store const ClassInfo* / const EnumInfo* into the pool) remain
+// valid across rehashes: a runtime ensure_registered<T>() after lookups
+// have started can grow the unordered_map, but the heap-allocated info
+// objects never move.
 // ---------------------------------------------------------------------------
-inline std::unordered_map<std::string, ClassInfo>& class_pool() {
-    static std::unordered_map<std::string, ClassInfo> pool;
+inline std::unordered_map<std::string, std::unique_ptr<ClassInfo>>& class_pool() {
+    static std::unordered_map<std::string, std::unique_ptr<ClassInfo>> pool;
     return pool;
 }
 
-inline std::unordered_map<std::string, EnumInfo>& enum_pool() {
-    static std::unordered_map<std::string, EnumInfo> pool;
+inline std::unordered_map<std::string, std::unique_ptr<EnumInfo>>& enum_pool() {
+    static std::unordered_map<std::string, std::unique_ptr<EnumInfo>> pool;
     return pool;
 }
 
@@ -163,18 +170,18 @@ inline std::mutex& pool_mutex() {
 struct Registrar {
     explicit Registrar(const ClassInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        class_pool()[info.name] = info;
+        class_pool()[info.name] = std::make_unique<ClassInfo>(std::move(info));
     }
 };
 
 struct EnumRegistrar {
     explicit EnumRegistrar(const EnumInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        enum_pool()[info.name] = info;
+        enum_pool()[info.name] = std::make_unique<EnumInfo>(std::move(info));
     }
 };
 
-// Forward declaration — defined later, used by walk_bases.
+// Forward declaration — defined later, used by the base-hierarchy helpers.
 class Class;
 std::expected<Class, Error> find_class(std::string_view name);
 
@@ -289,12 +296,36 @@ base_offset_unlocked(std::string_view derived_name, std::string_view base_name) 
     if (derived_name == base_name) return 0;
     auto it = class_pool().find(std::string(derived_name));
     if (it == class_pool().end()) return std::nullopt;
-    for (const auto& b : it->second.bases) {
+    for (const auto& b : it->second->bases) {
         if (b.name == base_name) return b.offset;
         auto deeper = base_offset_unlocked(b.name, base_name);
         if (deeper) return b.offset + *deeper;
     }
     return std::nullopt;
+}
+
+// Collect every distinct byte offset from `derived_name` to `base_name`,
+// one per path through the base hierarchy.  Used for ambiguity detection:
+// more than one distinct offset means the base subobject is reached via
+// two paths (a diamond), so an unqualified lookup is ambiguous (C++ would
+// reject it).  Offsets are deduped so empty-base-optimisation merges that
+// land on the same address count as one subobject.
+//
+// ponytail: walks all paths, O(2^n) in pathological diamond lattices; fine
+// for realistic hierarchies.  Virtual inheritance is unsupported (offset_of
+// is not constant for virtual bases), matching the rest of the framework.
+inline std::set<std::ptrdiff_t>
+base_path_offsets_unlocked(std::string_view derived_name, std::string_view base_name) {
+    std::set<std::ptrdiff_t> offsets;
+    if (derived_name == base_name) { offsets.insert(0); return offsets; }
+    auto it = class_pool().find(std::string(derived_name));
+    if (it == class_pool().end()) return offsets;
+    for (const auto& b : it->second->bases) {
+        if (b.name == base_name) offsets.insert(b.offset);
+        for (auto o : base_path_offsets_unlocked(b.name, base_name))
+            offsets.insert(b.offset + o);
+    }
+    return offsets;
 }
 
 // Check whether `base_name` is a base class of `derived_name` by walking
@@ -315,6 +346,14 @@ is_base_of_with_offset(std::string_view derived_name, std::string_view base_name
 inline bool is_base_of(std::string_view derived_name, std::string_view base_name) {
     std::lock_guard<std::mutex> lk(pool_mutex());
     return is_base_of_unlocked(derived_name, base_name);
+}
+
+// Number of distinct base-subobject paths from `derived_name` to
+// `base_name`.  >1 means a diamond (ambiguous unqualified lookup).
+inline std::size_t
+base_path_count(std::string_view derived_name, std::string_view base_name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    return base_path_offsets_unlocked(derived_name, base_name).size();
 }
 
 // Adjust a pointer from a most-derived object to a base subobject.
@@ -487,9 +526,9 @@ public:
         if (!is_owned()) return std::unexpected(Error::NotOwned);
         std::lock_guard<std::mutex> lk(pool_mutex());
         auto it = class_pool().find(std::string(class_name_));
-        if (it == class_pool().end() || !it->second.clone)
+        if (it == class_pool().end() || !it->second->clone)
             return std::unexpected(Error::NotCopyable);
-        auto copied = it->second.clone(ptr_);
+        auto copied = it->second->clone(ptr_);
         return Object(std::move(copied), class_name_);
     }
 
@@ -651,11 +690,25 @@ void setter(void* obj, const Object* val) {
 
 template <typename T, std::meta::info Member>
 Object static_getter() {
-    auto* ptr = &[:Member:];
     using MemberType = [:std::meta::type_of(Member):];
     using StorageType = std::remove_const_t<std::remove_reference_t<MemberType>>;
-    return Object(std::make_shared<StorageType>(*ptr),
-                 type_name<StorageType>());
+    if constexpr (std::is_const_v<MemberType>) {
+        // const static member: read the compile-time constant value rather
+        // than odr-using the storage.  A const static with only an in-class
+        // initializer (e.g. `static const int x = 100;`) is a declaration,
+        // not a definition — taking its address (as `&[:Member:]` does)
+        // is an odr-use that can fail to link without an out-of-line
+        // definition.  constant_of yields a reflection of the constant
+        // initializer; splicing it produces the value with no address taken.
+        // get_ref still returns ReadOnly for these (no addressable storage);
+        // get() copies the value out.
+        return Object(std::make_shared<StorageType>(
+            [:std::meta::constant_of(Member):]), type_name<StorageType>());
+    } else {
+        auto* ptr = &[:Member:];
+        return Object(std::make_shared<StorageType>(*ptr),
+                     type_name<StorageType>());
+    }
 }
 
 template <typename T, std::meta::info Member>
@@ -735,9 +788,9 @@ ClassInfo RegistrarHolder<T>::make_info() {
     info.name = std::string(std::meta::display_string_of(^^T));
 
     // Base classes — store name + byte offset within T.
-    // Only public bases are stored, so walk_bases (used by find_function,
-    // find_field, is_class, cast_safe, etc.) naturally skips protected
-    // and private inheritance.
+    // Only public bases are stored, so the base-hierarchy helpers (used by
+    // find_function, find_field, is_class, cast_safe, etc.) naturally skip
+    // protected and private inheritance.
     static constexpr auto bases = std::define_static_array(
         std::meta::bases_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto b : bases) {
@@ -1064,13 +1117,17 @@ public:
     }
 
     // Get a non-owning pointer to the field inside the object — works
-    // for all members including move-only.  The pointer is valid as long
-    // as the object is alive.  The caller casts void* to the member type.
-    // Returns Error::TypeError if obj is not the field's class,
-    // Error::NullHandle if the handle is invalid.
+    // for all non-const members including move-only.  The pointer is valid
+    // as long as the object is alive.  The caller casts void* to the
+    // member type.  Returns Error::ReadOnly for const members (a writable
+    // void* into a const member would let the caller cast away const),
+    // Error::TypeError if obj is not the field's class, Error::NullHandle
+    // if the handle is invalid.  Use the typed get_ref<T>() for const
+    // members — it returns a const T* and so is safe to expose.
     std::expected<void*, Error> get_ref(Object obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        if (is_const()) return std::unexpected(Error::ReadOnly);
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<char*>(adj) + owner_->fields[idx_].offset;
@@ -1284,10 +1341,15 @@ public:
     const std::string& name() const { return owner_->bases[idx_].name; }
     std::ptrdiff_t offset() const { return owner_->bases[idx_].offset; }
 
+    // The Class handle for this base (invalid if the base class is not
+    // registered — e.g. it was never Reg<T>'d).
+    Class as_class() const;
+
     bool valid() const { return owner_ != nullptr; }
     explicit operator bool() const { return valid(); }
 
 private:
+    friend class Class;
     const ClassInfo* owner_ = nullptr;
     std::size_t idx_ = 0;
 };
@@ -1309,6 +1371,11 @@ public:
             result.emplace_back(info_, i);
         return result;
     }
+
+    // All base classes across the full hierarchy (transitive), deduplicated
+    // by name so a diamond-shared base appears once.  Unlike bases(), which
+    // returns only the direct bases, this walks the whole inheritance graph.
+    std::vector<Base> all_bases() const;
 
     std::vector<Field> fields() const {
         std::vector<Field> result;
@@ -1355,11 +1422,14 @@ public:
 
     // Find a function by name.  If multiple overloads exist, returns the
     // first match.  Walks base classes if not found in this class.
+    // Returns Error::Ambiguous if the name resolves to 2+ base subobjects.
     std::expected<Function, Error> find_function(std::string_view name) const;
 
     // Find a function by name and parameter type names.  This disambiguates
     // overloads.  Matching uses the same normalization as find_constructor
     // (ignores const, ref, whitespace).  Walks base classes.
+    // Returns Error::Ambiguous if the name is ambiguous before overload
+    // resolution (C++ resolves name-lookup ambiguity first).
     std::expected<Function, Error> find_function(
         std::string_view name,
         std::initializer_list<std::string_view> types) const;
@@ -1418,6 +1488,20 @@ private:
             }), v.end());
     }
 
+    // Drop handles whose declaring class is reachable from `derived` via
+    // more than one base-subobject path (a diamond).  An unqualified C++
+    // lookup of such a member is ambiguous, so the framework does not
+    // return it.  Caller must hold pool_mutex.
+    template <typename Handle>
+    static void exclude_ambiguous(std::vector<Handle>& v,
+                                 std::string_view derived) {
+        v.erase(std::remove_if(v.begin(), v.end(),
+            [derived](const Handle& h) {
+                return detail::base_path_offsets_unlocked(
+                    derived, h.owner_->name).size() > 1;
+            }), v.end());
+    }
+
     const ClassInfo* info_ = nullptr;
 };
 
@@ -1430,7 +1514,7 @@ inline std::expected<Class, Error> find_class(std::string_view name) {
     auto it = class_pool().find(std::string(name));
     if (it == class_pool().end())
         return std::unexpected(Error::NotFound);
-    return Class(&it->second);
+    return Class(it->second.get());
 }
 
 // Enumerate all registered class names.
@@ -1449,7 +1533,7 @@ inline std::expected<Enum, Error> find_enum(std::string_view name) {
     auto it = enum_pool().find(std::string(name));
     if (it == enum_pool().end())
         return std::unexpected(Error::NotFound);
-    return Enum(&it->second);
+    return Enum(it->second.get());
 }
 
 // Enumerate all registered enum names.
@@ -1462,26 +1546,39 @@ inline std::vector<std::string> list_all_enums() {
     return names;
 }
 
-// Walk the base-class hierarchy, calling `finder(base_class)` on each
-// base until one returns a value.  Returns the first hit or Error::NotFound.
+// ---------------------------------------------------------------------------
+// Base-hierarchy lookup helpers.
+//
+// find_named / find_named_sig / find_all_named / collect_all implement the
+// shared lookup policy used by every Class::find_<member> and all_<member>:
+//
+//   * C++ name hiding — if a class declares a name, its own bases' same-name
+//     members are not searched (the name hides deeper overloads).
+//   * Ambiguity — if a name resolves to two or more base subobjects (a
+//     diamond, or the same name in two sibling bases), an unqualified
+//     lookup is ambiguous: the singular find_* return Error::Ambiguous and
+//     the plural all_*/find_<member>s omit the member entirely, matching
+//     C++ (which rejects the unqualified access as ambiguous).
+//
+// Ambiguity is decided by the number of distinct byte-offset paths from the
+// derived class to the declaring class (base_path_offsets_unlocked); >1 is
+// a diamond.  Two different sibling bases each declaring the name also yield
+// 2+ subobjects and are reported as ambiguous for singular lookups, but
+// each declaration (uniquely reachable) is still listed by the plural views.
+// ---------------------------------------------------------------------------
 namespace detail {
-template <typename R, typename Finder>
-std::expected<R, Error> walk_bases(
-    const std::vector<BaseInfo>& bases,
-    Finder&& finder) {
-    for (const auto& b : bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto result = finder(*base);
-            if (result) return result;
-        }
-    }
-    return std::unexpected(Error::NotFound);
+
+// Indices in `v` whose `.name == name`.
+template <typename Info>
+std::vector<std::size_t> own_indices(const std::vector<Info>& v,
+                                     std::string_view name) {
+    std::vector<std::size_t> out;
+    for (std::size_t i = 0; i < v.size(); ++i)
+        if (v[i].name == name) out.push_back(i);
+    return out;
 }
 
-// Collect the set of function (or static-function) names defined directly
-// on a ClassInfo — used for C++ name-hiding: if a derived class declares
-// any function named X, all base X overloads are hidden.
+// Set of names defined directly on this class — used for name hiding.
 template <typename Member>
 std::set<std::string> own_names(const std::vector<Member>& members) {
     std::set<std::string> names;
@@ -1489,12 +1586,166 @@ std::set<std::string> own_names(const std::vector<Member>& members) {
         names.insert(m.name);
     return names;
 }
+
+// Recursively collect (declaring ClassInfo*, idx) for members named `name`
+// in C's base hierarchy, respecting name hiding: a base that declares `name`
+// hides the same name in its own bases (we don't descend into them);
+// sibling bases are all searched (their declarations may be ambiguous).
+// Caller must hold pool_mutex.
+template <typename Info>
+void collect_base_named(const ClassInfo* C, std::string_view name,
+    const std::vector<Info> ClassInfo::* vec,
+    std::vector<std::pair<const ClassInfo*, std::size_t>>& out) {
+    for (const auto& b : C->bases) {
+        auto it = class_pool().find(b.name);
+        if (it == class_pool().end()) continue;
+        const ClassInfo* bc = it->second.get();
+        auto idxs = own_indices(bc->*vec, name);
+        if (!idxs.empty()) {
+            for (auto i : idxs) out.emplace_back(bc, i);
+        } else {
+            collect_base_named(bc, name, vec, out);
+        }
+    }
+}
+
+// Dedup (ClassInfo*, idx) pairs — a diamond reaches the same declaration
+// via two paths.  Order-preserving.
+inline void dedup_decl(
+    std::vector<std::pair<const ClassInfo*, std::size_t>>& v) {
+    std::set<std::pair<const ClassInfo*, std::size_t>> seen;
+    v.erase(std::remove_if(v.begin(), v.end(),
+        [&seen](const auto& p) { return !seen.insert(p).second; }), v.end());
+}
+
+// Number of distinct base subobjects that offer `name` in C's hierarchy.
+// Multiple overloads in the same base share one subobject, so they count
+// once.  >1 means an unqualified lookup is ambiguous (diamond or siblings).
+// Caller must hold pool_mutex.
+inline std::size_t subobject_count(
+    const ClassInfo* C,
+    const std::vector<std::pair<const ClassInfo*, std::size_t>>& decls) {
+    std::set<std::string> classes;
+    for (const auto& [ci, idx] : decls)
+        classes.insert(ci->name);
+    std::size_t total = 0;
+    for (const auto& cn : classes)
+        total += base_path_offsets_unlocked(C->name, cn).size();
+    return total;
+}
+
+// Singular lookup by name.  Own members hide bases.  Among base hits, the
+// number of distinct base subobjects offering the name is checked: >=2 →
+// Ambiguous; otherwise return the first declaration (first overload).
+template <typename Handle, typename Info>
+std::expected<Handle, Error> find_named(const ClassInfo* C,
+    std::string_view name,
+    const std::vector<Info> ClassInfo::* vec) {
+    for (std::size_t i = 0; i < (C->*vec).size(); ++i)
+        if ((C->*vec)[i].name == name)
+            return Handle(C, i);  // own hides bases
+
+    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        collect_base_named(C, name, vec, decls);
+        dedup_decl(decls);
+        if (subobject_count(C, decls) >= 2) return std::unexpected(Error::Ambiguous);
+        if (!decls.empty()) return Handle(decls[0].first, decls[0].second);
+    }
+    return std::unexpected(Error::NotFound);
+}
+
+// Singular lookup by name + parameter-type signature.  Own members hide
+// bases (if any own member has the name, base overloads are hidden even
+// when none matches the signature).  Ambiguity is decided over the whole
+// name-lookup set (before overload resolution), matching C++.  Among base
+// hits, the first signature match is returned.
+template <typename Handle, typename Info>
+std::expected<Handle, Error> find_named_sig(const ClassInfo* C,
+    std::string_view name,
+    std::initializer_list<std::string_view> types,
+    const std::vector<Info> ClassInfo::* vec) {
+    std::vector<std::string> query;
+    for (auto t : types) query.push_back(normalize_type(t));
+
+    bool name_exists = false;
+    for (std::size_t i = 0; i < (C->*vec).size(); ++i) {
+        if ((C->*vec)[i].name == name) {
+            name_exists = true;
+            if (match_signature((C->*vec)[i].param_types, query))
+                return Handle(C, i);
+        }
+    }
+    if (name_exists) return std::unexpected(Error::NotFound);
+
+    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        collect_base_named(C, name, vec, decls);
+        dedup_decl(decls);
+        if (subobject_count(C, decls) >= 2) return std::unexpected(Error::Ambiguous);
+        for (const auto& [ci, idx] : decls)
+            if (match_signature((ci->*vec)[idx].param_types, query))
+                return Handle(ci, idx);
+    }
+    return std::unexpected(Error::NotFound);
+}
+
+// Plural lookup by name: all overloads of `name` across the hierarchy.
+// Own members hide bases.  Diamond-ambiguous declarations (path count >1)
+// are omitted.  Returns handles by value.
+template <typename Handle, typename Info>
+std::vector<Handle> find_all_named(const ClassInfo* C,
+    std::string_view name,
+    const std::vector<Info> ClassInfo::* vec) {
+    std::vector<Handle> results;
+    for (std::size_t i = 0; i < (C->*vec).size(); ++i)
+        if ((C->*vec)[i].name == name)
+            results.emplace_back(C, i);
+    if (!results.empty()) return results;  // own hides bases
+
+    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        collect_base_named(C, name, vec, decls);
+        dedup_decl(decls);
+        std::erase_if(decls, [&](const auto& p) {
+            return base_path_offsets_unlocked(C->name, p.first->name).size() > 1;
+        });
+    }
+    for (const auto& [ci, idx] : decls)
+        results.emplace_back(ci, idx);
+    return results;
+}
+
+// Collect every member across the hierarchy (all names), respecting name
+// hiding (a class's own names hide same-name members in its bases).
+// Caller must hold pool_mutex.
+template <typename Handle, typename Info>
+void collect_all_unlocked(const ClassInfo* C,
+    const std::vector<Info> ClassInfo::* vec,
+    std::vector<Handle>& results) {
+    auto hidden = own_names(C->*vec);
+    for (std::size_t i = 0; i < (C->*vec).size(); ++i)
+        results.emplace_back(C, i);
+    for (const auto& b : C->bases) {
+        auto it = class_pool().find(b.name);
+        if (it == class_pool().end()) continue;
+        std::vector<Handle> more;
+        collect_all_unlocked<Handle, Info>(it->second.get(), vec, more);
+        for (auto& h : more)
+            if (!hidden.count(h.name()))
+                results.push_back(std::move(h));
+    }
+}
 }  // namespace detail
 
 inline std::expected<Constructor, Error> Class::find_constructor(
     std::initializer_list<std::string_view> types) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
+    // Constructors are not inherited — only this class's own constructors
+    // are searched (unlike find_function/find_field, which walk bases).
     std::vector<std::string> query;
     for (auto t : types)
         query.push_back(detail::normalize_type(t));
@@ -1509,45 +1760,27 @@ inline std::expected<Constructor, Error> Class::find_constructor(
 inline std::expected<Function, Error> Class::find_function(
     std::string_view name) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
-    for (std::size_t i = 0; i < info_->functions.size(); ++i) {
-        if (info_->functions[i].name == name)
-            return Function(info_, i);
-    }
-    return detail::walk_bases<Function>(info_->bases,
-        [name](const Class& b) { return b.find_function(name); });
+    return detail::find_named<Function, FunctionInfo>(
+        info_, name, &ClassInfo::functions);
 }
 
 inline std::expected<Field, Error> Class::find_field(
     std::string_view name) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
-    for (std::size_t i = 0; i < info_->fields.size(); ++i) {
-        if (info_->fields[i].name == name)
-            return Field(info_, i);
-    }
-    return detail::walk_bases<Field>(info_->bases,
-        [name](const Class& b) { return b.find_field(name); });
+    return detail::find_named<Field, FieldInfo>(
+        info_, name, &ClassInfo::fields);
 }
 
 inline std::vector<Field> Class::all_fields() const {
     std::vector<Field> results;
     if (!valid()) return results;
-
-    auto hidden = detail::own_names(info_->fields);
-    for (std::size_t i = 0; i < info_->fields.size(); ++i)
-        results.emplace_back(info_, i);
-    for (const auto& b : info_->bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto more = base->all_fields();
-            for (auto& f : more) {
-                if (!hidden.count(f.name()))
-                    results.push_back(std::move(f));
-            }
-        }
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        detail::collect_all_unlocked<Field, FieldInfo>(
+            info_, &ClassInfo::fields, results);
+        dedup_handles(results);
+        exclude_ambiguous(results, info_->name);
     }
-    dedup_handles(results);
     return results;
 }
 
@@ -1555,76 +1788,27 @@ inline std::expected<Function, Error> Class::find_function(
     std::string_view name,
     std::initializer_list<std::string_view> types) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
-    std::vector<std::string> query;
-    for (auto t : types)
-        query.push_back(detail::normalize_type(t));
-
-    // C++ name hiding: if the derived class declares any function named
-    // `name`, all base overloads are hidden — don't walk bases.
-    bool name_exists = false;
-    for (std::size_t i = 0; i < info_->functions.size(); ++i) {
-        if (info_->functions[i].name == name) {
-            name_exists = true;
-            if (detail::match_signature(info_->functions[i].param_types, query))
-                return Function(info_, i);
-        }
-    }
-    if (name_exists)
-        return std::unexpected(Error::NotFound);
-
-    return detail::walk_bases<Function>(info_->bases,
-        [name, types](const Class& b) { return b.find_function(name, types); });
+    return detail::find_named_sig<Function, FunctionInfo>(
+        info_, name, types, &ClassInfo::functions);
 }
 
-// Find all overloads of a function by name.  Walks base classes, but
-// respects C++ name hiding: if the derived class declares any function
-// named `name`, base overloads are hidden and not included.
 inline std::vector<Function> Class::find_functions(
     std::string_view name) const {
-    std::vector<Function> results;
-    if (!valid()) return results;
-
-    bool name_exists = false;
-    for (std::size_t i = 0; i < info_->functions.size(); ++i) {
-        if (info_->functions[i].name == name) {
-            name_exists = true;
-            results.push_back(Function(info_, i));
-        }
-    }
-    // Name hiding: don't walk bases if the derived class has this name.
-    if (name_exists) return results;
-
-    for (const auto& b : info_->bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto more = base->find_functions(name);
-            results.insert(results.end(), more.begin(), more.end());
-        }
-    }
-    dedup_handles(results);
-    return results;
+    if (!valid()) return {};
+    return detail::find_all_named<Function, FunctionInfo>(
+        info_, name, &ClassInfo::functions);
 }
 
 inline std::vector<Function> Class::all_functions() const {
     std::vector<Function> results;
     if (!valid()) return results;
-
-    // Collect this class's own function names (hides base overloads).
-    auto hidden = detail::own_names(info_->functions);
-    for (std::size_t i = 0; i < info_->functions.size(); ++i)
-        results.emplace_back(info_, i);
-    for (const auto& b : info_->bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto more = base->all_functions();
-            for (auto& f : more) {
-                if (!hidden.count(f.name()))
-                    results.push_back(std::move(f));
-            }
-        }
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        detail::collect_all_unlocked<Function, FunctionInfo>(
+            info_, &ClassInfo::functions, results);
+        dedup_handles(results);
+        exclude_ambiguous(results, info_->name);
     }
-    dedup_handles(results);
     return results;
 }
 
@@ -1653,119 +1837,87 @@ inline std::expected<Enumerator, Error> Enum::find_enumerator(
 inline std::expected<StaticField, Error> Class::find_static_field(
     std::string_view name) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
-    for (std::size_t i = 0; i < info_->static_fields.size(); ++i) {
-        if (info_->static_fields[i].name == name)
-            return StaticField(info_, i);
-    }
-    return detail::walk_bases<StaticField>(info_->bases,
-        [name](const Class& b) { return b.find_static_field(name); });
+    return detail::find_named<StaticField, StaticFieldInfo>(
+        info_, name, &ClassInfo::static_fields);
 }
 
 inline std::vector<StaticField> Class::all_static_fields() const {
     std::vector<StaticField> results;
     if (!valid()) return results;
-
-    auto hidden = detail::own_names(info_->static_fields);
-    for (std::size_t i = 0; i < info_->static_fields.size(); ++i)
-        results.emplace_back(info_, i);
-    for (const auto& b : info_->bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto more = base->all_static_fields();
-            for (auto& sf : more) {
-                if (!hidden.count(sf.name()))
-                    results.push_back(std::move(sf));
-            }
-        }
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        detail::collect_all_unlocked<StaticField, StaticFieldInfo>(
+            info_, &ClassInfo::static_fields, results);
+        dedup_handles(results);
+        exclude_ambiguous(results, info_->name);
     }
-    dedup_handles(results);
     return results;
 }
 
 inline std::expected<StaticFunction, Error> Class::find_static_function(
     std::string_view name) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
-    for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
-        if (info_->static_functions[i].name == name)
-            return StaticFunction(info_, i);
-    }
-    return detail::walk_bases<StaticFunction>(info_->bases,
-        [name](const Class& b) { return b.find_static_function(name); });
+    return detail::find_named<StaticFunction, StaticFunctionInfo>(
+        info_, name, &ClassInfo::static_functions);
 }
 
 inline std::expected<StaticFunction, Error> Class::find_static_function(
     std::string_view name,
     std::initializer_list<std::string_view> types) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
-
-    std::vector<std::string> query;
-    for (auto t : types)
-        query.push_back(detail::normalize_type(t));
-
-    // C++ name hiding: if the derived class declares any static function
-    // named `name`, all base overloads are hidden — don't walk bases.
-    bool name_exists = false;
-    for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
-        if (info_->static_functions[i].name == name) {
-            name_exists = true;
-            if (detail::match_signature(info_->static_functions[i].param_types, query))
-                return StaticFunction(info_, i);
-        }
-    }
-    if (name_exists)
-        return std::unexpected(Error::NotFound);
-
-    return detail::walk_bases<StaticFunction>(info_->bases,
-        [name, types](const Class& b) { return b.find_static_function(name, types); });
+    return detail::find_named_sig<StaticFunction, StaticFunctionInfo>(
+        info_, name, types, &ClassInfo::static_functions);
 }
 
-// Find all overloads of a static function by name.  Walks base classes,
-// respecting C++ name hiding.
 inline std::vector<StaticFunction> Class::find_static_functions(
     std::string_view name) const {
-    std::vector<StaticFunction> results;
-    if (!valid()) return results;
-
-    bool name_exists = false;
-    for (std::size_t i = 0; i < info_->static_functions.size(); ++i) {
-        if (info_->static_functions[i].name == name) {
-            name_exists = true;
-            results.push_back(StaticFunction(info_, i));
-        }
-    }
-    if (name_exists) return results;
-
-    for (const auto& b : info_->bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto more = base->find_static_functions(name);
-            results.insert(results.end(), more.begin(), more.end());
-        }
-    }
-    dedup_handles(results);
-    return results;
+    if (!valid()) return {};
+    return detail::find_all_named<StaticFunction, StaticFunctionInfo>(
+        info_, name, &ClassInfo::static_functions);
 }
 
 inline std::vector<StaticFunction> Class::all_static_functions() const {
     std::vector<StaticFunction> results;
     if (!valid()) return results;
+    {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        detail::collect_all_unlocked<StaticFunction, StaticFunctionInfo>(
+            info_, &ClassInfo::static_functions, results);
+        dedup_handles(results);
+        exclude_ambiguous(results, info_->name);
+    }
+    return results;
+}
 
-    auto hidden = detail::own_names(info_->static_functions);
-    for (std::size_t i = 0; i < info_->static_functions.size(); ++i)
-        results.emplace_back(info_, i);
-    for (const auto& b : info_->bases) {
-        auto base = find_class(b.name);
-        if (base) {
-            auto more = base->all_static_functions();
-            for (auto& sf : more) {
-                if (!hidden.count(sf.name()))
-                    results.push_back(std::move(sf));
+inline Class Base::as_class() const {
+    if (!valid()) return Class{};
+    auto c = find_class(owner_->bases[idx_].name);
+    return c.value_or(Class{});
+}
+
+// All base classes across the full inheritance graph (transitive),
+// deduplicated by name so a diamond-shared base appears once.
+// Order: direct bases first, then their bases (depth-first).
+inline std::vector<Base> Class::all_bases() const {
+    std::vector<Base> results;
+    if (!valid()) return results;
+    std::set<std::string> seen;
+    // Recursively append bases, deduping by name.  Uses (owner_, idx) where
+    // owner_ is the *derived* class that lists this base — so each Base
+    // handle reports the correct per-derivation offset.
+    auto walk = [&](auto& self, const ClassInfo* C) -> void {
+        for (std::size_t i = 0; i < C->bases.size(); ++i) {
+            const auto& b = C->bases[i];
+            if (seen.insert(b.name).second) {
+                results.emplace_back(C, i);
+                auto it = class_pool().find(b.name);
+                if (it != class_pool().end())
+                    self(self, it->second.get());
             }
         }
-    }
-    dedup_handles(results);
+    };
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    walk(walk, info_);
     return results;
 }
 
