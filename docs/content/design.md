@@ -164,6 +164,16 @@ applies to `Constructor::call`, `Function::invoke`, `StaticFunction::invoke`,
 `Error::ReadOnly`; cloning a non-copy-constructible class returns
 `Error::NotCopyable`.
 
+Type matching at the call boundary is exact: the argument's class name
+(compile-time `display_string_of`) must equal the parameter type name, or
+be a class derived from it (the argument is then upcast to the base
+subobject).  Implicit primitive conversions are not performed — passing an
+`int` to a `long` parameter returns `Error::TypeError`, not a widened
+call.  This is deliberate: the framework checks type identity via string
+comparison (no RTTI), and the project compiles with `-Wconversion
+-Wsign-conversion`, so silent widening at the reflection boundary would
+contradict the codebase's own stance on implicit conversions.
+
 Limitations (marked with `ponytail:` in the source):
 
 - Bit-field data members are skipped (pointer-to-member is not valid for them).
