@@ -1,18 +1,21 @@
-// refl — C++26 compile-time-reflection-based runtime reflection framework.
+// refl — C++26 compile-time-reflection-based runtime reflection framework (core).
 //
-// Wrap a class as Refl<MyClass> so it registers in a global pool queryable at
-// runtime via find_class("MyClass").  From a Class handle you can find
-// constructors, member functions, and data fields by name or parameter-type
-// name, then construct objects, invoke functions, and get/set fields through
-// the returned handles.
+// Register a type T with refl::Reg<T> (or refl::ensure_registered<T>()) so it
+// enters a global pool queryable at runtime via find_class("T").  From a
+// Class handle you can find constructors, member functions, and data fields
+// by name or parameter-type name, then construct objects, invoke functions,
+// and get/set fields through the returned handles.
 //
 // The framework is type-erased at the call boundary: Constructor::call
-// returns an Object (an owning, type-erased handle) rather than a typed
-// Refl<T>.  You only need to know the concrete type when you explicitly
-// cast an Object to get at its members directly.
+// returns an Object (an owning, type-erased handle).  You only need to know
+// the concrete type when you explicitly cast an Object to get at its
+// members directly.
 //
 // Lookups return std::expected<T, Error> — dereference with operator* or
 // check has_value()/error(), as shown in the design docs.
+//
+// The typed dispatch / dynamic-implementation layer (Dyn<T>) lives in
+// refl/dyn.hpp and includes this header.
 #pragma once
 
 #include <meta>
@@ -26,7 +29,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -39,21 +41,21 @@ namespace refl {
 // ---------------------------------------------------------------------------
 enum class Error {
     NotFound,
-    BadSignature,
     NullHandle,
     TypeError,
+    ArityMismatch,   // argument count doesn't match the member's param count
+    ReadOnly,        // write to a const / bit-field member
+    NotCopyable,     // clone of a non-copy-constructible class
 };
-// ponytail: BadSignature is overloaded for two distinct failure modes —
-// write to a read-only (const or bit-field) field, and clone of a
-// non-copy-constructible class. Split into separate enumerators if a caller
-// ever needs to distinguish them.
 
 inline std::string_view to_string(Error e) {
     switch (e) {
-    case Error::NotFound:      return "NotFound";
-    case Error::BadSignature:  return "BadSignature";
+    case Error::NotFound:       return "NotFound";
     case Error::NullHandle:    return "NullHandle";
     case Error::TypeError:     return "TypeError";
+    case Error::ArityMismatch:  return "ArityMismatch";
+    case Error::ReadOnly:       return "ReadOnly";
+    case Error::NotCopyable:    return "NotCopyable";
     }
     return "Unknown";
 }
@@ -110,9 +112,14 @@ struct StaticFieldInfo {
     StaticSetterFn setter;  // nullptr for const members
 };
 
+struct BaseInfo {
+    std::string name;
+    std::ptrdiff_t offset;  // byte offset of this base within the derived class
+};
+
 struct ClassInfo {
     std::string name;
-    std::vector<std::string> base_names;
+    std::vector<BaseInfo> bases;
     std::vector<FieldInfo> fields;
     std::vector<StaticFieldInfo> static_fields;
     std::vector<ConstructorInfo> constructors;
@@ -179,25 +186,40 @@ std::expected<Class, Error> find_class(std::string_view name);
 namespace detail {
 
 // Normalize a type string: lowercase, strip whitespace, const, ref qualifiers.
-// Applied at storage time so lookups compare raw strings.
+// Applied at storage time so lookups compare raw strings.  Handles both
+// west const (`const int`) and east const (`int const`): const is stripped
+// while whitespace is still present, so it matches as a distinct token
+// rather than a substring (e.g. `const_iterator` is left untouched).
 inline std::string normalize_type(std::string_view sv) {
-    std::string result;
-    for (char c : sv) {
-        if (c == ' ' || c == '\t') continue;
-        result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
+    std::string s;
+    for (char c : sv)
+        s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
     auto strip_suffix = [&](std::string_view suffix) {
-        if (result.size() >= suffix.size() &&
-            result.compare(result.size() - suffix.size(),
-                           suffix.size(), suffix) == 0) {
-            result.erase(result.size() - suffix.size());
+        if (s.size() >= suffix.size() &&
+            s.compare(s.size() - suffix.size(),
+                       suffix.size(), suffix) == 0) {
+            s.erase(s.size() - suffix.size());
         }
     };
+    auto strip_prefix = [&](std::string_view prefix) {
+        if (s.size() >= prefix.size() &&
+            s.compare(0, prefix.size(), prefix) == 0) {
+            s.erase(0, prefix.size());
+        }
+    };
+
+    // Strip ref qualifiers, then const (trailing east, leading west),
+    // while whitespace separates "const" from the type name.
     strip_suffix("&&");
     strip_suffix("&");
-    while (result.size() >= 5 && result.compare(result.size() - 5, 5, "const") == 0) {
-        result.erase(result.size() - 5);
-    }
+    while (s.size() >= 6 && s.compare(s.size() - 6, 6, " const") == 0)
+        s.erase(s.size() - 6);
+    strip_prefix("const ");
+
+    std::string result;
+    for (char c : s)
+        if (c != ' ' && c != '\t') result += c;
     return result;
 }
 
@@ -224,13 +246,13 @@ make_arg_anys(Args&&... args) {
     };
 }
 
-// Compile-time type name for safe-cast checks.
-// ponytail: identifier_of yields the unqualified name, so two classes with
-// the same name in different namespaces collide in the pool and in cast_safe.
-// Use a qualified/mangled name if cross-namespace registration is needed.
+// Compile-time fully-qualified type name for pool keys and safe-cast checks.
+// display_string_of yields the qualified name (e.g. "ns::Point"), so two
+// classes with the same unqualified name in different namespaces no longer
+// collide in the pool or in cast_safe.  Global-scope types have no prefix.
 template <typename T>
 consteval std::string_view type_name() {
-    return std::meta::identifier_of(^^T);
+    return std::meta::display_string_of(^^T);
 }
 
 template <typename T, std::meta::info Ctor>
@@ -363,6 +385,79 @@ std::any static_invoker(const std::any* args) {
     }(std::make_index_sequence<n>{});
 }
 
+// --- Arity + type-erased call guards ---
+//
+// The invokers, factory, getters, and setters above forward arguments as
+// std::any.  An arity mismatch indexes the any array out of bounds (UB),
+// and a type mismatch inside std::any_cast throws std::bad_any_cast.  The
+// helpers below wrap the raw calls so the runtime handles report a clean
+// Error instead of crashing or throwing across the C boundary.
+
+inline std::expected<std::shared_ptr<void>, Error>
+checked_factory(FactoryFn fn, const std::any* args) {
+    try {
+        return fn(args);
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+inline std::expected<std::any, Error>
+checked_invoke(InvokerFn fn, void* obj, const std::any* args) {
+    try {
+        return fn(obj, args);
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+inline std::expected<std::any, Error>
+checked_static_invoke(StaticInvokerFn fn, const std::any* args) {
+    try {
+        return fn(args);
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+inline std::expected<std::any, Error>
+checked_get(GetterFn fn, void* obj) {
+    try {
+        return fn(obj);
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+inline std::expected<std::any, Error>
+checked_static_get(StaticGetterFn fn) {
+    try {
+        return fn();
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+inline std::expected<void, Error>
+checked_static_set(StaticSetterFn fn, std::any val) {
+    try {
+        fn(std::move(val));
+        return {};
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
+inline std::expected<void, Error>
+checked_set(SetterFn fn, void* obj, std::any val) {
+    try {
+        fn(obj, std::move(val));
+        return {};
+    } catch (const std::bad_any_cast&) {
+        return std::unexpected(Error::TypeError);
+    }
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -379,35 +474,67 @@ class Enum;
 class Enumerator;
 
 // Unlocked helper — caller must hold pool_mutex.
-inline bool is_base_of_unlocked(std::string_view derived_name, std::string_view base_name) {
+// Returns the byte offset of `base_name` within `derived_name` (accumulated
+// through the base hierarchy), or nullopt if not found.  Offset 0 means
+// either exact match or first base.
+inline std::optional<std::ptrdiff_t>
+base_offset_unlocked(std::string_view derived_name, std::string_view base_name) {
+    if (derived_name == base_name) return 0;
     auto it = class_pool().find(std::string(derived_name));
-    if (it == class_pool().end()) return false;
-    for (const auto& bn : it->second.base_names) {
-        if (bn == base_name) return true;
-        if (is_base_of_unlocked(bn, base_name)) return true;
+    if (it == class_pool().end()) return std::nullopt;
+    for (const auto& b : it->second.bases) {
+        if (b.name == base_name) return b.offset;
+        auto deeper = base_offset_unlocked(b.name, base_name);
+        if (deeper) return b.offset + *deeper;
     }
-    return false;
+    return std::nullopt;
 }
 
 // Check whether `base_name` is a base class of `derived_name` by walking
-// the registered base_names hierarchy.  Used by Object::is_class and
-// cast_safe for runtime upcast checks.
+// the registered bases hierarchy.  Used by Object::is_class and cast_safe
+// for runtime upcast checks.
+inline bool is_base_of_unlocked(std::string_view derived_name, std::string_view base_name) {
+    return base_offset_unlocked(derived_name, base_name).has_value();
+}
+
+// Check whether `base_name` is a base class of `derived_name`.
+// Also returns the accumulated byte offset if it is.
+inline std::optional<std::ptrdiff_t>
+is_base_of_with_offset(std::string_view derived_name, std::string_view base_name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    return base_offset_unlocked(derived_name, base_name);
+}
+
 inline bool is_base_of(std::string_view derived_name, std::string_view base_name) {
     std::lock_guard<std::mutex> lk(pool_mutex());
     return is_base_of_unlocked(derived_name, base_name);
 }
 
-template <typename T>
-class Refl;
+// Adjust a pointer from a most-derived object to a base subobject.
+// Returns nullptr if the base is not found (guards against pool races
+// after is_class passed).  Caller need not hold pool_mutex — this helper
+// takes it for the offset lookup.
+//
+// ponytail: the call sites do is_class() then adjust_to_base() in two
+// separate lock acquisitions.  This is a TOCTOU window in theory, but the
+// pool is append-only at static-init time — no unregister exists — so a
+// class cannot disappear between the check and the adjustment.
+inline void* adjust_to_base(void* obj, std::string_view derived_name,
+                            std::string_view base_name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    auto off = base_offset_unlocked(derived_name, base_name);
+    if (!off) return nullptr;
+    return static_cast<char*>(obj) + *off;
+}
 
 // ---------------------------------------------------------------------------
-// Refl<T> — registration driver.
+// Registration — the single responsibility of the core.
 //
-// Instantiating Refl<T> as a variable, or calling ensure_registered<T>(),
-// triggers static-initialisation of RegistrarHolder<T>::registrar, which
-// populates the global pool with T's metadata.  Refl<T> is NOT needed at
-// call sites — once registered, T is found via find_class("T") and
-// constructed/called through type-erased handles.
+// Call ensure_registered<T>() (or instantiate refl::Reg<T> as a static
+// variable) to trigger static-initialisation of RegistrarHolder<T>::registrar,
+// which populates the global pool with T's metadata.  Once registered, T is
+// found via find_class("T") and constructed/called through type-erased
+// handles — no wrapper object needed at call sites.
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -434,919 +561,16 @@ inline void ensure_registered() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TypedMethod<Sigs...> — variadic callable, one template arg per overload
-// signature.  Each Sigs is a function type R(Args...).  operator() uses a
-// concept to pick the matching Sig at compile time and returns that Sig's
-// return type — no std::variant, no std::any at the call site.
+// Registration-only tag.  Instantiate as a static variable to register T
+// in the global pool at static-initialisation time — the core's sole
+// user-facing side effect.
 //
-//   TypedMethod<int(), void(int), void(int,int)>
-//     p->sum()       → int
-//     p->set(42)     → void
-//     p->set(1, 2)   → void
-//
-// Mixed return types are fine: TypedMethod<int(int), double(double)>
-//     p->compute(3)    → int
-//     p->compute(3.0)   → double
-//
-// The invoker returns std::any internally; the cast to the real return
-// type happens inside operator() — the caller never sees std::any.
-// No std::function, no heap, no variant.
-// ---------------------------------------------------------------------------
-
-// Extract R and Args... from a function type R(Args...).
-template <typename Sig> struct sig_traits;
-template <typename R, typename... Args>
-struct sig_traits<R(Args...)> {
-    using return_type = R;
-    using args_type = std::tuple<std::remove_cvref_t<Args>...>;
-};
-
-// Concept: do the call's argument types match this signature?
-template <typename Sig, typename... CallArgs>
-concept matches_sig = std::same_as<
-    typename sig_traits<Sig>::args_type,
-    std::tuple<std::remove_cvref_t<CallArgs>...>>;
-
-// Helper alias for building function types via substitute.
-template <typename R, typename... Args> using fn_type = R(Args...);
-
-namespace detail {
-
-// consteval: build a function-type reflection R(Args...) from a member.
-consteval std::meta::info make_fn_sig(std::meta::info m) {
-    auto rt = std::meta::return_type_of(m);
-    auto params = std::meta::parameters_of(m);
-    std::vector<std::meta::info> args = {rt};
-    for (auto p : params)
-        args.push_back(std::meta::type_of(p));
-    return std::meta::substitute(^^fn_type, args);
-}
-
-// consteval: collect all overload signatures for a function name.
-consteval std::vector<std::meta::info>
-collect_sigs(std::meta::info type, std::string_view name) {
-    std::vector<std::meta::info> result;
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_function(m) && std::meta::has_identifier(m)
-            && !std::meta::is_static_member(m)
-            && std::meta::identifier_of(m) == name)
-            result.push_back(make_fn_sig(m));
-    }
-    return result;
-}
-
-}  // namespace detail
-
-template <typename... Sigs>
-struct TypedMethod {
-    struct OverloadEntry {
-        InvokerFn invoker;
-    };
-    const OverloadEntry* overloads = nullptr;
-    std::size_t num = 0;
-    void* obj = nullptr;
-
-    void (*after_call)(void* ctx, std::any& result) = nullptr;
-    void* hook_ctx = nullptr;
-
-    template <typename... Args>
-    auto operator()(Args&&... args) {
-        return call_dispatch<0, Args...>(std::forward<Args>(args)...);
-    }
-
-    template <std::size_t I, typename... Args>
-    auto call_dispatch(Args&&... args) {
-        using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
-        if constexpr (matches_sig<Sig, Args...>) {
-            using R = typename sig_traits<Sig>::return_type;
-            auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
-            const std::any* args_ptr =
-                arg_anys.empty() ? nullptr : arg_anys.data();
-            std::any result = overloads[I].invoker(obj, args_ptr);
-            if (after_call) after_call(hook_ctx, result);
-            if constexpr (std::is_void_v<R>) return;
-            else return std::any_cast<R>(result);
-        } else {
-            if constexpr (I + 1 < sizeof...(Sigs))
-                return call_dispatch<I + 1, Args...>(std::forward<Args>(args)...);
-            else
-                static_assert(sizeof...(Args) == 0, "no matching overload");
-        }
-    }
-};
-
-// ---------------------------------------------------------------------------
-// TypedProperty<T, Readonly> — mimics a public data member via operator=
-// and implicit conversion.  p->x = 42 writes; int v = p->x reads.
-// Const members use Readonly=true, which deletes operator= at compile time.
-// Subscriptable members (std::array, std::vector) also offer operator[].
-// ---------------------------------------------------------------------------
-template <typename T, bool Readonly = false>
-struct TypedProperty {
-    GetterFn getter = nullptr;
-    SetterFn setter = nullptr;  // always nullptr when Readonly=true
-    void* obj = nullptr;
-    std::size_t member_offset = 0;  // byte offset of the member within T
-
-    void (*after_set)(void* ctx, std::any& val) = nullptr;
-    void* hook_ctx = nullptr;
-
-    // Implicit conversion to T (read).
-    operator T() const {
-        if (!getter || !obj) throw std::bad_any_cast{};
-        return std::any_cast<T>(getter(obj));
-    }
-
-    // Assignment from T (write).  Compile error when Readonly=true.
-    void operator=(T val) requires (!Readonly) {
-        if (!setter || !obj) return;
-        setter(obj, std::any(std::move(val)));
-        if (after_set) {
-            std::any current = getter(obj);
-            after_set(hook_ctx, current);
-        }
-    }
-
-    // operator[] — returns a reference to the element in the actual object.
-    // Only available when T is subscriptable (std::array, std::vector, etc.).
-    template <typename Self>
-    auto& operator[](this Self&& self, std::size_t i)
-        requires requires { typename std::remove_cvref_t<T>::value_type; }
-    {
-        return reinterpret_cast<std::remove_cv_t<T>*>(
-            static_cast<char*>(self.obj) + self.member_offset)->operator[](i);
-    }
-
-    static constexpr bool is_readonly() { return Readonly; }
-};
-
-// ---------------------------------------------------------------------------
-// TypedStaticProperty<T, Readonly> — static data member proxy.  No obj
-// pointer needed; accesses static storage via function pointers.
-// ---------------------------------------------------------------------------
-template <typename T, bool Readonly = false>
-struct TypedStaticProperty {
-    StaticGetterFn getter = nullptr;
-    StaticSetterFn setter = nullptr;
-
-    operator T() const {
-        if (!getter) throw std::bad_any_cast{};
-        return std::any_cast<T>(getter());
-    }
-
-    void operator=(T val) requires (!Readonly) {
-        if (!setter) return;
-        setter(std::any(std::move(val)));
-    }
-
-    static constexpr bool is_readonly() { return Readonly; }
-};
-
-// ---------------------------------------------------------------------------
-// TypedStaticMethod<R> — static member function proxy.  No obj pointer.
-// ---------------------------------------------------------------------------
-template <typename R>
-struct TypedStaticMethod {
-    using is_static_method = void;
-    StaticInvokerFn invoker = nullptr;
-
-    R operator()() {
-        std::any result = invoker(nullptr);
-        if constexpr (std::is_void_v<R>) return;
-        else return std::any_cast<R>(result);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Field-type builders — must be after TypedMethod/TypedProperty definitions
-// because they use ^^TypedMethod / ^^TypedProperty in consteval substitute().
-// ---------------------------------------------------------------------------
-namespace detail {
-
-// Check if a dispatch field type is a TypedMethod specialization.
-template <typename T> struct is_typed_method : std::false_type {};
-template <typename... Sigs> struct is_typed_method<TypedMethod<Sigs...>>
-    : std::true_type {};
-template <typename T> inline constexpr bool is_typed_method_v =
-    is_typed_method<T>::value;
-
-// Check if a dispatch field type is a TypedStaticMethod.
-template <typename T> struct is_typed_static_method : std::false_type {};
-template <typename R>
-struct is_typed_static_method<TypedStaticMethod<R>> : std::true_type {};
-template <typename T> inline constexpr bool is_typed_static_method_v =
-    is_typed_static_method<T>::value;
-
-// Check if a dispatch field type is a TypedStaticProperty.
-template <typename T> struct is_typed_static_property : std::false_type {};
-template <typename T2, bool R>
-struct is_typed_static_property<TypedStaticProperty<T2, R>> : std::true_type {};
-template <typename T> inline constexpr bool is_typed_static_property_v =
-    is_typed_static_property<T>::value;
-
-// consteval: build the TypedMethod<Sigs...> type for a function name.
-consteval std::meta::info make_typed_method_type(std::meta::info type,
-                                                    std::string_view name) {
-    return std::meta::substitute(^^TypedMethod, collect_sigs(type, name));
-}
-
-// consteval: build the TypedStaticMethod<R> type for a static function.
-consteval std::meta::info make_static_method_type(std::meta::info m) {
-    auto rt = std::meta::return_type_of(m);
-    return std::meta::substitute(^^TypedStaticMethod,
-        std::initializer_list<std::meta::info>{rt});
-}
-
-// consteval: build the TypedStaticProperty<T, Readonly> type for a static member.
-consteval std::meta::info make_static_property_type(std::meta::info m) {
-    auto mt = std::meta::type_of(m);
-    bool is_const = std::meta::is_const_type(mt);
-    auto clean_mt = std::meta::substitute(^^std::remove_cv_t,
-        std::initializer_list<std::meta::info>{mt});
-    return std::meta::substitute(^^TypedStaticProperty,
-        {clean_mt, std::meta::reflect_constant(is_const)});
-}
-
-// consteval: build the TypedProperty field type for a data member name.
-// Passes Readonly=true for const members (deletes operator= at compile time).
-consteval std::meta::info make_property_field_type(std::meta::info type,
-                                                       std::string_view name) {
-    for (auto m : std::meta::nonstatic_data_members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (!std::meta::is_bit_field(m) && std::meta::has_identifier(m)
-            && std::meta::identifier_of(m) == name) {
-            auto mt = std::meta::type_of(m);
-            bool is_const = std::meta::is_const_type(mt);
-            auto clean_mt = std::meta::substitute(^^std::remove_cv_t,
-                std::initializer_list<std::meta::info>{mt});
-            return std::meta::substitute(^^TypedProperty,
-                {clean_mt, std::meta::reflect_constant(is_const)});
-        }
-    }
-    return std::meta::info{};
-}
-
-}  // namespace detail
-
-// Structural fixed-size string for use as a non-type template parameter.
-// Enables implement<"method_name">(...) without exposing ^^ syntax.
-template <std::size_t N>
-struct FixedString {
-    char data[N] = {};
-    static constexpr std::size_t size = N;
-    constexpr FixedString(const char (&str)[N]) {
-        for (std::size_t i = 0; i < N; ++i) data[i] = str[i];
-    }
-    constexpr std::string_view sv() const {
-        return std::string_view(data, N - 1);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Refl<T> — typed proxy with compile-time-synthesized dispatch struct.
-//
-//   Refl<Point> p(1, 2);
-//   p->set(10, 20);           // TypedMethod<void(int), void(int,int)>
-//   int s = p->sum();          // TypedMethod<int()> — real return type!
-//   int x = p->x.get();        // TypedProperty<int> — real type!
-//   p->x.set(42);             // typed set
-//
-// Mixed return types: TypedMethod<int(int), double(double)>
-//   int  i = p->compute(3);    // returns int
-//   double d = p->compute(3.0); // returns double
-//
-// Hooks (Qt-style, after-only):
-//   p.connect("sum", [](std::any& r) { ... });
-//   p.on_change("x", [](std::any& v) { ... });
-//
-// Refl<T> is non-copyable, non-movable.
-// ---------------------------------------------------------------------------
+//   [[maybe_unused]] static refl::Reg<MyClass> reg_my_class;
+//   // ... find_class("MyClass") now works.
 template <typename T>
-class Refl {
-    struct Dispatch;
-    consteval {
-        if constexpr (std::is_class_v<T>) {
-            static constexpr auto members = std::define_static_array(
-                std::meta::members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::meta::info> specs;
-            std::vector<std::string> seen_fns;
-            template for (constexpr auto m : members) {
-                if constexpr (std::meta::is_function(m)
-                              && std::meta::has_identifier(m)
-                              && !std::meta::is_static_member(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_fns)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_fns.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_typed_method_type(^^T, nm);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            static constexpr auto data_members = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::string> seen_fields;
-            template for (constexpr auto m : data_members) {
-                if constexpr (!std::meta::is_bit_field(m)
-                              && std::meta::has_identifier(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_fields)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_fields.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_property_field_type(^^T, nm);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Static data members → TypedStaticProperty.
-            static constexpr auto static_data = std::define_static_array(
-                std::meta::static_data_members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::string> seen_static;
-            template for (constexpr auto m : static_data) {
-                if constexpr (std::meta::has_identifier(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_static)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_static.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_static_property_type(m);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Static member functions → TypedStaticMethod.
-            std::vector<std::string> seen_static_fns;
-            template for (constexpr auto m : members) {
-                if constexpr (std::meta::is_function(m)
-                              && std::meta::has_identifier(m)
-                              && std::meta::is_static_member(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_static_fns)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_static_fns.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_static_method_type(m);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Only add the obj field when T is constructible (not abstract).
-            if constexpr (!std::meta::is_abstract_type(^^T)) {
-                specs.push_back(std::meta::data_member_spec(
-                    ^^std::shared_ptr<T>, {.name="obj"}));
-            }
-            std::meta::define_aggregate(^^Dispatch, specs);
-        } else {
-            std::meta::define_aggregate(^^Dispatch, {});
-        }
-    }
-
-    Dispatch dispatch_;
-
-    void populate() {
-        if constexpr (std::is_class_v<T> && !std::meta::is_abstract_type(^^T)) {
-            static constexpr auto dm = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^Dispatch,
-                    std::meta::access_context::unchecked()));
-            template for (constexpr auto field : dm) {
-                if constexpr (std::meta::has_identifier(field)
-                              && std::meta::identifier_of(field) != "obj") {
-                    using FieldType = [:std::meta::type_of(field):];
-                    if constexpr (detail::is_typed_method_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Non-static member function → bind invokers.
-                        dispatch_.[:field:].obj = dispatch_.obj.get();
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        constexpr auto entries = []() consteval {
-                            using OE = typename
-                                std::remove_cv_t<FieldType>::OverloadEntry;
-                            std::vector<OE> v;
-                            static constexpr auto tmembers =
-                                std::define_static_array(
-                                    std::meta::members_of(^^T,
-                                        std::meta::access_context::unchecked()));
-                            template for (constexpr auto m : tmembers) {
-                                if constexpr (std::meta::is_function(m)
-                                    && std::meta::has_identifier(m)
-                                    && !std::meta::is_static_member(m)
-                                    && std::meta::identifier_of(m) == nm_sv) {
-                                    v.push_back(OE{&detail::invoker<T, m>});
-                                }
-                            }
-                            return std::define_static_array(v);
-                        }();
-                        dispatch_.[:field:].overloads = entries.data();
-                        dispatch_.[:field:].num = entries.size();
-                    } else if constexpr (detail::is_typed_static_method_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Static member function → bind invoker.
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto tmembers =
-                            std::define_static_array(
-                                std::meta::members_of(^^T,
-                                    std::meta::access_context::unchecked()));
-                        template for (constexpr auto m : tmembers) {
-                            if constexpr (std::meta::is_function(m)
-                                          && std::meta::has_identifier(m)
-                                          && std::meta::is_static_member(m)
-                                          && std::meta::identifier_of(m)
-                                              == nm_sv) {
-                                dispatch_.[:field:].invoker =
-                                    &detail::static_invoker<T, m>;
-                            }
-                        }
-                    } else if constexpr (detail::is_typed_static_property_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Static data member → bind getter/setter.
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto sdm = std::define_static_array(
-                            std::meta::static_data_members_of(^^T,
-                                std::meta::access_context::unchecked()));
-                        template for (constexpr auto m : sdm) {
-                            if constexpr (std::meta::has_identifier(m)
-                                          && std::meta::identifier_of(m)
-                                              == nm_sv) {
-                                using MT = [:std::meta::type_of(m):];
-                                if constexpr (!std::is_const_v<MT>) {
-                                    dispatch_.[:field:].setter =
-                                        &detail::static_setter<T, m>;
-                                }
-                                dispatch_.[:field:].getter =
-                                    &detail::static_getter<T, m>;
-                            }
-                        }
-                    } else {
-                        // Non-static data member → bind getter/setter/offset.
-                        dispatch_.[:field:].obj = dispatch_.obj.get();
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto tdm = std::define_static_array(
-                            std::meta::nonstatic_data_members_of(^^T,
-                                std::meta::access_context::unchecked()));
-                        template for (constexpr auto m : tdm) {
-                            if constexpr (!std::meta::is_bit_field(m)
-                                          && std::meta::has_identifier(m)
-                                          && std::meta::identifier_of(m)
-                                              == nm_sv) {
-                                using MemberType = [:std::meta::type_of(m):];
-                                constexpr auto offset = std::meta::offset_of(m);
-                                dispatch_.[:field:].member_offset =
-                                    offset.bytes;
-                                if constexpr (!std::is_const_v<MemberType>) {
-                                    dispatch_.[:field:].setter =
-                                        &detail::setter<T, m>;
-                                }
-                                dispatch_.[:field:].getter =
-                                    &detail::getter<T, m>;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    void* find_field(std::string_view name) {
-        if constexpr (std::is_class_v<T>) {
-            static constexpr auto dm = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^Dispatch,
-                    std::meta::access_context::unchecked()));
-            template for (constexpr auto field : dm) {
-                if constexpr (std::meta::has_identifier(field)
-                              && std::meta::identifier_of(field) != "obj") {
-                    constexpr auto nm_sv = std::meta::identifier_of(field);
-                    constexpr auto nm = std::define_static_string(nm_sv);
-                    if (name == std::string_view(nm))
-                        return &dispatch_.[:field:];
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    // Hook storage: multi-listener (vector of callbacks per name).
-    // std::map nodes are stable — pointers to the vectors don't move.
-    std::map<std::string, std::vector<std::function<void(std::any&)>>> invoke_hooks_;
-    std::map<std::string, std::vector<std::function<void(std::any&)>>> change_hooks_;
-
-    // Dynamic properties (runtime-added, not reflected from T).
-    std::map<std::string, std::any> dynamic_props_;
-
-    // --- Dynamic mode: runtime callable storage + trampolines.
-    //     When T is abstract, no object is constructed; instead, implement()
-    //     wires each method to a runtime-provided callable.
-    //     When T is concrete, implement() can override individual methods
-    //     while keeping the real object alive — other methods still call
-    //     through to the real object.  This enables per-method mocking.
-    std::map<std::string, std::any> dynamic_callables_;
-    bool dynamic_mode_ = false;  // true = fully dynamic (no real object)
-
-    // Trampoline: calls a stored std::function matching the method's signature.
-    // The void* ctx points at the Refl<T> itself (this).  The trampoline
-    // looks up the callable by method name and passes *self as the first
-    // argument — so the lambda receives Refl<T>& as its "this".
-    // Supports 0-2 args (extendable).  The lambda signature is
-    // R(Refl<T>&, Args...) — the first arg is always the self-reference.
-    template <std::meta::info Method>
-    static std::any trampoline(void* ctx, const std::any* args) {
-        auto* self = static_cast<Refl<T>*>(ctx);
-        using R = [: std::meta::return_type_of(Method) :];
-        constexpr auto params = std::define_static_array(
-            std::meta::parameters_of(Method));
-        constexpr auto nm_sv = std::meta::identifier_of(Method);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        auto key = std::string(nm);
-        if constexpr (params.size() == 0) {
-            auto& fn = std::any_cast<std::function<R(Refl<T>&)>&>(
-                self->dynamic_callables_[key]);
-            if constexpr (std::is_void_v<R>) { fn(*self); return {}; }
-            else return std::any(fn(*self));
-        } else if constexpr (params.size() == 1) {
-            using P0 = [: std::meta::type_of(params[0]) :];
-            using C0 = std::remove_cvref_t<P0>;
-            auto& fn = std::any_cast<std::function<R(Refl<T>&, C0)>&>(
-                self->dynamic_callables_[key]);
-            if constexpr (std::is_void_v<R>) {
-                fn(*self, std::any_cast<C0>(args[0])); return {};
-            } else {
-                return std::any(fn(*self, std::any_cast<C0>(args[0])));
-            }
-        } else if constexpr (params.size() == 2) {
-            using P0 = [: std::meta::type_of(params[0]) :];
-            using P1 = [: std::meta::type_of(params[1]) :];
-            using C0 = std::remove_cvref_t<P0>;
-            using C1 = std::remove_cvref_t<P1>;
-            auto& fn = std::any_cast<std::function<R(Refl<T>&, C0, C1)>&>(
-                self->dynamic_callables_[key]);
-            if constexpr (std::is_void_v<R>) {
-                fn(*self, std::any_cast<C0>(args[0]),
-                   std::any_cast<C1>(args[1])); return {};
-            } else {
-                return std::any(fn(*self, std::any_cast<C0>(args[0]),
-                                   std::any_cast<C1>(args[1])));
-            }
-        } else {
-            // ponytail: 3+ args not yet supported in the trampoline.
-            return {};
-        }
-    }
-
-public:
-    using value_type = T;
-
-    Refl() { if constexpr (!std::meta::is_abstract_type(^^T)) ensure_registered<T>(); }
-
-    template <typename... Args>
-    explicit Refl(Args&&... args) {
-        ensure_registered<T>();
-        if constexpr (std::is_class_v<T>) {
-            dispatch_.obj = std::make_shared<T>(std::forward<Args>(args)...);
-            populate();
-        }
-    }
-
-    // Replace the underlying object (swap to real-object mode).
-    // Re-populates all fields with real invokers.  Clears any
-    // dynamic-mode callables and per-method overrides.
-    template <typename... Args>
-    void reset(Args&&... args) requires (!std::meta::is_abstract_type(^^T)) {
-        if constexpr (std::is_class_v<T>) {
-            dispatch_.obj = std::make_shared<T>(std::forward<Args>(args)...);
-            dynamic_mode_ = false;
-            dynamic_callables_.clear();
-            populate();
-        }
-    }
-
-    // Remove a per-method override, restoring the real invoker.
-    // Only works when a real object is present (not in full dynamic mode).
-    template <std::meta::info Method>
-    void restore() requires (!std::meta::is_abstract_type(^^T)) {
-        if (dynamic_mode_) return;  // can't restore in full dynamic mode
-        constexpr auto nm_sv = std::meta::identifier_of(Method);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        dynamic_callables_.erase(std::string(nm));
-        // Re-populate just this method with the real invoker.
-        if constexpr (std::is_class_v<T>) {
-            static constexpr auto dm = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^Dispatch,
-                    std::meta::access_context::unchecked()));
-            template for (constexpr auto field : dm) {
-                if constexpr (std::meta::has_identifier(field)
-                              && std::meta::identifier_of(field) == nm_sv) {
-                    using FT = [:std::meta::type_of(field):];
-                    if constexpr (detail::is_typed_method_v<
-                            std::remove_cv_t<FT>>) {
-                        dispatch_.[:field:].obj = dispatch_.obj.get();
-                        constexpr auto entries = []() consteval {
-                            using OE = typename
-                                std::remove_cv_t<FT>::OverloadEntry;
-                            std::vector<OE> v;
-                            static constexpr auto tmembers =
-                                std::define_static_array(
-                                    std::meta::members_of(^^T,
-                                        std::meta::access_context::unchecked()));
-                            template for (constexpr auto m : tmembers) {
-                                if constexpr (std::meta::is_function(m)
-                                    && std::meta::has_identifier(m)
-                                    && !std::meta::is_static_member(m)
-                                    && std::meta::identifier_of(m) == nm_sv) {
-                                    v.push_back(OE{&detail::invoker<T, m>});
-                                }
-                            }
-                            return std::define_static_array(v);
-                        }();
-                        dispatch_.[:field:].overloads = entries.data();
-                        dispatch_.[:field:].num = entries.size();
-                    }
-                }
-            }
-        }
-    }
-
-    // Switch to dynamic mode (no real object).  All methods must be
-    // implemented via implement() before calling.  If currently in
-    // real-object mode, the real object is released.
-    void make_dynamic() {
-        dynamic_mode_ = true;
-        dynamic_callables_.clear();
-        // Don't populate — implement() will wire each method.
-    }
-
-    // Implement a method with a runtime callable (dynamic mode).
-    // T must be abstract or the method must not have a real invoker yet.
-    // The callable's signature must match the method's.
-    //
-    //   refl::Refl<IShape> s;
-    //   s.implement<^^IShape::area>([](int scale) { return scale * 100; });
-    //   int a = s->area(5);  // calls the lambda
-    template <std::meta::info Method, typename F>
-    void implement(F fn) {
-        using R = [: std::meta::return_type_of(Method) :];
-        constexpr auto params = std::define_static_array(
-            std::meta::parameters_of(Method));
-        constexpr auto nm_sv = std::meta::identifier_of(Method);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        auto key = std::string(nm);
-        // Store as std::function<R(Refl<T>&, Args...)> — first arg is self.
-        if constexpr (params.size() == 0) {
-            dynamic_callables_[key] =
-                std::function<R(Refl<T>&)>(std::move(fn));
-        } else if constexpr (params.size() == 1) {
-            using P0 = [: std::meta::type_of(params[0]) :];
-            using C0 = std::remove_cvref_t<P0>;
-            dynamic_callables_[key] =
-                std::function<R(Refl<T>&, C0)>(std::move(fn));
-        } else if constexpr (params.size() == 2) {
-            using P0 = [: std::meta::type_of(params[0]) :];
-            using P1 = [: std::meta::type_of(params[1]) :];
-            using C0 = std::remove_cvref_t<P0>;
-            using C1 = std::remove_cvref_t<P1>;
-            dynamic_callables_[key] =
-                std::function<R(Refl<T>&, C0, C1)>(std::move(fn));
-        }
-        // Wire the trampoline.  obj points at THIS Refl<T> — the
-        // trampoline casts it to Refl<T>* and passes *self to the lambda.
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto field : dm) {
-            if constexpr (std::meta::has_identifier(field)
-                          && std::meta::identifier_of(field) == nm_sv) {
-                using FT = [:std::meta::type_of(field):];
-                if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
-                    constexpr auto entries = []() consteval {
-                        using OE = typename
-                            std::remove_cv_t<FT>::OverloadEntry;
-                        return std::define_static_array(
-                            std::vector<OE>{OE{&trampoline<Method>}});
-                    }();
-                    dispatch_.[:field:].overloads = entries.data();
-                    dispatch_.[:field:].num = 1;
-                    dispatch_.[:field:].obj = this;  // pass Refl<T>* to trampoline
-                }
-            }
-        }
-    }
-
-    // Implement a method by name (string literal) — no ^^ syntax needed.
-    //   refl::Refl<IShape> s;
-    //   s.implement("area", [](int scale) { return scale * 100; });
-    //   int a = s->area(5);
-    //
-    // Only non-overloaded methods can be implemented by name (the string
-    // matches the first member with that identifier).  For overloaded
-    // methods, use the ^^-based implement<^^T::method>().
-    //
-    // The name is carried as a structural NTTP (FixedString) so it's
-    // usable in constexpr comparisons inside a template-for.
-    template <FixedString Name, typename F>
-    void implement(F fn) {
-        if constexpr (std::is_class_v<T>) {
-            static constexpr auto members = std::define_static_array(
-                std::meta::members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            constexpr bool found = []() consteval {
-                for (auto m : std::meta::members_of(^^T,
-                        std::meta::access_context::unchecked())) {
-                    if (std::meta::is_function(m)
-                        && std::meta::has_identifier(m)
-                        && !std::meta::is_static_member(m)
-                        && std::meta::identifier_of(m) == Name.sv())
-                        return true;
-                }
-                return false;
-            }();
-            static_assert(found, "implement: method not found on T");
-            template for (constexpr auto m : members) {
-                if constexpr (std::meta::is_function(m)
-                              && std::meta::has_identifier(m)
-                              && !std::meta::is_static_member(m)
-                              && std::meta::identifier_of(m) == Name.sv()) {
-                    implement<m>(std::move(fn));
-                }
-            }
-        }
-    }
-    Refl& operator=(const Refl&) = delete;
-    Refl(Refl&&) = delete;
-    Refl& operator=(Refl&&) = delete;
-
-    auto* operator->() { return &dispatch_; }
-    const auto* operator->() const { return &dispatch_; }
-
-    T& get() requires (!std::meta::is_abstract_type(^^T)) { return *dispatch_.obj; }
-    const T& get() const requires (!std::meta::is_abstract_type(^^T)) { return *dispatch_.obj; }
-
-    // Check if this Refl is in dynamic (runtime-implemented) mode.
-    bool is_dynamic() const { return dynamic_mode_; }
-
-    // Connect a callback to a method (multi-listener).  Multiple connect()
-    // calls on the same method name accumulate — all callbacks fire.
-    //
-    //   p.connect("sum", [](std::any& r) { ... });
-    //   p.connect("sum", [](std::any& r) { ... });  // also fires
-    void connect(std::string_view name,
-                  std::function<void(std::any&)> cb) {
-        auto key = std::string(name);
-        auto& vec = invoke_hooks_[key];
-        vec.push_back(std::move(cb));
-        void* field = find_field(name);
-        if (!field) return;
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto f : dm) {
-            if constexpr (std::meta::has_identifier(f)
-                          && std::meta::identifier_of(f) != "obj") {
-                using FT = [:std::meta::type_of(f):];
-                if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
-                    constexpr auto nm_sv = std::meta::identifier_of(f);
-                    constexpr auto nm = std::define_static_string(nm_sv);
-                    if (name == std::string_view(nm)) {
-                        auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
-                        tm->hook_ctx = &vec;
-                        tm->after_call = +[](void* ctx, std::any& r) {
-                            auto* v = static_cast<
-                                std::vector<std::function<void(std::any&)>>*>(
-                                    ctx);
-                            for (auto& cb : *v) cb(r);
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    // on_change: connect a callback to a property change (multi-listener).
-    void on_change(std::string_view name,
-                    std::function<void(std::any&)> cb) {
-        auto key = std::string(name);
-        auto& vec = change_hooks_[key];
-        vec.push_back(std::move(cb));
-        void* field = find_field(name);
-        if (!field) return;
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto f : dm) {
-            if constexpr (std::meta::has_identifier(f)
-                          && std::meta::identifier_of(f) != "obj") {
-                using FT = [:std::meta::type_of(f):];
-                if constexpr (!detail::is_typed_method_v<std::remove_cv_t<FT>>
-                              && !detail::is_typed_static_method_v<std::remove_cv_t<FT>>
-                              && !detail::is_typed_static_property_v<std::remove_cv_t<FT>>) {
-                    constexpr auto nm_sv = std::meta::identifier_of(f);
-                    constexpr auto nm = std::define_static_string(nm_sv);
-                    if (name == std::string_view(nm)) {
-                        auto* tp = static_cast<std::remove_cv_t<FT>*>(field);
-                        tp->hook_ctx = &vec;
-                        tp->after_set = +[](void* ctx, std::any& v) {
-                            auto* vct = static_cast<
-                                std::vector<std::function<void(std::any&)>>*>(
-                                    ctx);
-                            for (auto& cb : *vct) cb(v);
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    // Explicitly emit a signal — fire all connected callbacks for a name.
-    // The std::any is passed to each callback.  Useful for custom signals
-    // that don't map to a specific method.
-    void emit(std::string_view name, std::any value = {}) {
-        auto key = std::string(name);
-        auto it = invoke_hooks_.find(key);
-        if (it != invoke_hooks_.end())
-            for (auto& cb : it->second) cb(value);
-    }
-
-    // Set a dynamic property (runtime-added, not reflected from T).
-    // Fires on_change hooks for that name if any are connected.
-    void set_property(std::string_view name, std::any val) {
-        auto key = std::string(name);
-        dynamic_props_[key] = std::move(val);
-        auto it = change_hooks_.find(key);
-        if (it != change_hooks_.end())
-            for (auto& cb : it->second) cb(dynamic_props_[key]);
-    }
-
-    // Get a dynamic property (runtime-added).
-    std::any get_property(std::string_view name) const {
-        auto key = std::string(name);
-        auto it = dynamic_props_.find(key);
-        if (it != dynamic_props_.end()) return it->second;
-        return {};
-    }
-
-    // Connect a method on this object to a method on another Refl<T>.
-    // When this->name fires, it calls other->slot_name via operator->.
-    // Both Refl<T> instances must be kept alive (raw pointers — Refl is
-    // non-movable so addresses are stable, like Qt's connect).
-    void connect(std::string_view name, Refl* other,
-                  std::string_view slot_name) {
-        auto key = std::string(name);
-        auto slot = std::string(slot_name);
-        auto* other_ptr = other;
-        invoke_hooks_[key].push_back([other_ptr, slot](std::any& r) {
-            // Forward the result to the other object's slot hooks.
-            other_ptr->emit(slot, r);
-        });
-        // Re-wire the field to fire the vector (same as connect above).
-        void* field = find_field(name);
-        if (!field) return;
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto f : dm) {
-            if constexpr (std::meta::has_identifier(f)
-                          && std::meta::identifier_of(f) != "obj") {
-                using FT = [:std::meta::type_of(f):];
-                if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
-                    constexpr auto nm_sv = std::meta::identifier_of(f);
-                    constexpr auto nm = std::define_static_string(nm_sv);
-                    if (name == std::string_view(nm)) {
-                        auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
-                        tm->hook_ctx = &invoke_hooks_[key];
-                        tm->after_call = +[](void* ctx, std::any& r) {
-                            auto* v = static_cast<
-                                std::vector<std::function<void(std::any&)>>*>(
-                                    ctx);
-                            for (auto& cb : *v) cb(r);
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    static const Registrar& registrar() { return RegistrarHolder<T>::registrar; }
+struct Reg {
+    Reg() { ensure_registered<T>(); }
 };
-
 // ---------------------------------------------------------------------------
 // Object — a type-erased, shared-ownership handle to a heap-allocated
 // instance.
@@ -1390,20 +614,27 @@ public:
     template <typename T>
     std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!is_class(detail::type_name<T>()))
-            return std::unexpected(Error::TypeError);
-        return std::static_pointer_cast<T>(ptr_);
+        const auto tname = detail::type_name<T>();
+        // One hierarchy walk: 0 for exact match or first base, nonzero for
+        // offset bases, nullopt if T is not the class or a base.
+        auto off = is_base_of_with_offset(class_name_, tname);
+        if (!off) return std::unexpected(Error::TypeError);
+        auto* adjusted = static_cast<char*>(ptr_.get()) + *off;
+        // Alias: share the control block with the original, point at the
+        // offset-adjusted T (via void* — the offset is computed from
+        // reflection metadata, not from the type system).
+        return std::shared_ptr<T>(ptr_, static_cast<T*>(static_cast<void*>(adjusted)));
     }
 
     // Deep-copy the object through the type-erased handle.  Returns a
-    // new Object with independent ownership.  Returns Error::BadSignature
+    // new Object with independent ownership.  Returns Error::NotCopyable
     // if the class is not copy-constructible, Error::NullHandle if invalid.
     std::expected<Object, Error> clone() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         std::lock_guard<std::mutex> lk(pool_mutex());
         auto it = class_pool().find(class_name_);
         if (it == class_pool().end() || !it->second.clone)
-            return std::unexpected(Error::BadSignature);
+            return std::unexpected(Error::NotCopyable);
         auto copied = it->second.clone(ptr_.get());
         return Object(std::move(copied), class_name_);
     }
@@ -1438,14 +669,16 @@ private:
 template <typename T>
 ClassInfo RegistrarHolder<T>::make_info() {
     ClassInfo info;
-    info.name = std::string(std::meta::identifier_of(^^T));
+    info.name = std::string(std::meta::display_string_of(^^T));
 
-    // Base classes.
+    // Base classes — store name + byte offset within T.
     static constexpr auto bases = std::define_static_array(
         std::meta::bases_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto b : bases) {
-        info.base_names.emplace_back(
-            std::meta::identifier_of(std::meta::type_of(b)));
+        info.bases.push_back({
+            std::string(std::meta::display_string_of(std::meta::type_of(b))),
+            std::meta::offset_of(b).bytes,
+        });
     }
 
     // Data members — generate getter/setter for each.
@@ -1574,7 +807,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
 template <typename T>
 EnumInfo EnumRegistrarHolder<T>::make_enum_info() {
     EnumInfo info;
-    info.name = std::string(std::meta::identifier_of(^^T));
+    info.name = std::string(std::meta::display_string_of(^^T));
 
     static constexpr auto enumerators = std::define_static_array(
         std::meta::enumerators_of(^^T));
@@ -1604,16 +837,23 @@ public:
         return owner_->constructors[idx_].param_types;
     }
 
+    // Construct via the type-erased factory.  Returns Error::ArityMismatch
+    // if the argument count doesn't match the constructor's parameter count,
+    // Error::TypeError if an argument's std::any type doesn't match the
+    // parameter type, Error::NullHandle if the handle is invalid.
     template <typename... Args>
-    std::expected<Object, Error> call(Args&&... args) {
+    std::expected<Object, Error> call(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
+        const auto& ci = owner_->constructors[idx_];
+        if (sizeof...(Args) != ci.param_types.size())
+            return std::unexpected(Error::ArityMismatch);
 
         auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
         const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
 
-        const auto& ci = owner_->constructors[idx_];
-        std::shared_ptr<void> result = ci.factory(args_ptr);
-        return Object(std::move(result), owner_->name);
+        auto result = detail::checked_factory(ci.factory, args_ptr);
+        if (!result) return std::unexpected(result.error());
+        return Object(std::move(*result), owner_->name);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1640,29 +880,39 @@ public:
 
     // Invoke on an Object — the type-erased owning handle from call().
     // Returns Error::TypeError if obj is not the function's class (or a
-    // derived class), Error::NullHandle if the handle is invalid.
+    // derived class) or if an argument's std::any type doesn't match the
+    // parameter type, Error::ArityMismatch if the argument count is wrong,
+    // Error::NullHandle if the handle is invalid.
     template <typename... Args>
-    std::expected<std::any, Error> invoke(Object& obj, Args&&... args) {
+    std::expected<std::any, Error> invoke(Object& obj, Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!obj.is_class(owner_->name))
-            return std::unexpected(Error::TypeError);
+        if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        const auto& fi = owner_->functions[idx_];
+        if (sizeof...(Args) != fi.param_types.size())
+            return std::unexpected(Error::ArityMismatch);
         auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
         const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
-        return owner_->functions[idx_].invoker(obj.raw(), args_ptr);
+        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return detail::checked_invoke(fi.invoker, adj, args_ptr);
     }
 
     // Invoke on a concrete type — for when you have the real object already.
     // Returns Error::TypeError if T is not the function's class or a class
-    // derived from it, Error::NullHandle if the handle is invalid.
+    // derived from it, Error::ArityMismatch if the argument count is wrong,
+    // Error::NullHandle if the handle is invalid.
     template <typename T, typename... Args>
-    std::expected<std::any, Error> invoke(T& obj, Args&&... args) {
+    std::expected<std::any, Error> invoke(T& obj, Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        constexpr auto tname = detail::type_name<T>();
-        if (owner_->name != tname && !is_base_of(tname, owner_->name))
-            return std::unexpected(Error::TypeError);
+        const auto& fi = owner_->functions[idx_];
+        if (sizeof...(Args) != fi.param_types.size())
+            return std::unexpected(Error::ArityMismatch);
         auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
         const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
-        return owner_->functions[idx_].invoker(static_cast<void*>(&obj), args_ptr);
+        constexpr auto tname = detail::type_name<T>();
+        void* adj = adjust_to_base(static_cast<void*>(&obj), tname, owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return detail::checked_invoke(fi.invoker, adj, args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1688,29 +938,34 @@ public:
     // the handle is invalid.
     std::expected<std::any, Error> get(Object& obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!obj.is_class(owner_->name))
-            return std::unexpected(Error::TypeError);
-        return owner_->fields[idx_].getter(obj.raw());
+        if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return detail::checked_get(owner_->fields[idx_].getter, adj);
     }
 
     std::expected<std::any, Error> get(const Object& obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!obj.is_class(owner_->name))
-            return std::unexpected(Error::TypeError);
-        return owner_->fields[idx_].getter(const_cast<Object&>(obj).raw());
+        if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        void* adj = adjust_to_base(const_cast<Object&>(obj).raw(),
+                                   obj.class_name(), owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return detail::checked_get(owner_->fields[idx_].getter, adj);
     }
 
-    // Set the field value on an Object.  Returns Error::BadSignature if
+    // Set the field value on an Object.  Returns Error::ReadOnly if
     // the field is read-only (const or bit-field), Error::TypeError if obj
-    // is not the field's class (or a derived class), Error::NullHandle if
-    // the Field handle is invalid.
+    // is not the field's class (or a derived class) or the std::any value's
+    // type doesn't match the field type, Error::NullHandle if the Field
+    // handle is invalid.
     std::expected<void, Error> set(Object& obj, std::any val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (!obj.is_class(owner_->name))
-            return std::unexpected(Error::TypeError);
-        if (is_readonly()) return std::unexpected(Error::BadSignature);
-        owner_->fields[idx_].setter(obj.raw(), std::move(val));
-        return {};
+        if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        if (is_readonly()) return std::unexpected(Error::ReadOnly);
+        void* adj = adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        if (!adj) return std::unexpected(Error::TypeError);
+        return detail::checked_set(owner_->fields[idx_].setter,
+                                   adj, std::move(val));
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1731,16 +986,21 @@ public:
     const std::string& type() const { return owner_->static_fields[idx_].type; }
     bool is_readonly() const { return owner_->static_fields[idx_].setter == nullptr; }
 
-    std::any get() const {
-        if (!valid()) return std::any{};
-        return owner_->static_fields[idx_].getter();
+    // Get the static field value.  Returns Error::NullHandle if the handle
+    // is invalid.
+    std::expected<std::any, Error> get() const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        return detail::checked_static_get(owner_->static_fields[idx_].getter);
     }
 
+    // Set the static field value.  Returns Error::ReadOnly if the field
+    // is read-only (const), Error::TypeError if the std::any value's type
+    // doesn't match the field type, Error::NullHandle if the handle is invalid.
     std::expected<void, Error> set(std::any val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        if (is_readonly()) return std::unexpected(Error::BadSignature);
-        owner_->static_fields[idx_].setter(std::move(val));
-        return {};
+        if (is_readonly()) return std::unexpected(Error::ReadOnly);
+        return detail::checked_static_set(owner_->static_fields[idx_].setter,
+                                          std::move(val));
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1765,12 +1025,19 @@ public:
         return owner_->static_functions[idx_].return_type;
     }
 
+    // Invoke the static function.  Returns Error::ArityMismatch if the
+    // argument count is wrong, Error::TypeError if an argument's std::any
+    // type doesn't match the parameter type, Error::NullHandle if the
+    // handle is invalid.
     template <typename... Args>
-    std::any invoke(Args&&... args) {
-        if (!valid()) return std::any{};
+    std::expected<std::any, Error> invoke(Args&&... args) const {
+        if (!valid()) return std::unexpected(Error::NullHandle);
+        const auto& sf = owner_->static_functions[idx_];
+        if (sizeof...(Args) != sf.param_types.size())
+            return std::unexpected(Error::ArityMismatch);
         auto arg_anys = detail::make_arg_anys(std::forward<Args>(args)...);
         const std::any* args_ptr = arg_anys.empty() ? nullptr : arg_anys.data();
-        return owner_->static_functions[idx_].invoker(args_ptr);
+        return detail::checked_static_invoke(sf.invoker, args_ptr);
     }
 
     bool valid() const { return owner_ != nullptr; }
@@ -1826,8 +1093,8 @@ public:
 
     const std::string& name() const { return info_->name; }
 
-    const std::vector<std::string>& base_names() const {
-        return info_->base_names;
+    const std::vector<BaseInfo>& bases() const {
+        return info_->bases;
     }
 
     const std::vector<FieldInfo>& fields() const {
@@ -1844,6 +1111,10 @@ public:
 
     const std::vector<ConstructorInfo>& constructors() const {
         return info_->constructors;
+    }
+
+    const std::vector<FunctionInfo>& functions() const {
+        return info_->functions;
     }
 
     std::expected<Constructor, Error> find_constructor(
@@ -1932,10 +1203,10 @@ inline std::vector<std::string> list_all_enums() {
 // base until one returns a value.  Returns the first hit or Error::NotFound.
 template <typename R, typename Finder>
 std::expected<R, Error> walk_bases(
-    const std::vector<std::string>& base_names,
+    const std::vector<BaseInfo>& bases,
     Finder&& finder) {
-    for (const auto& bn : base_names) {
-        auto base = find_class(bn);
+    for (const auto& b : bases) {
+        auto base = find_class(b.name);
         if (base) {
             auto result = finder(*base);
             if (result) return result;
@@ -1967,9 +1238,7 @@ inline std::expected<Function, Error> Class::find_function(
         if (info_->functions[i].name == name)
             return Function(info_, i);
     }
-    // ponytail: single inheritance only — multiple inheritance with offset
-    // bases would produce wrong pointer adjustments in the invoker.
-    return walk_bases<Function>(info_->base_names,
+    return walk_bases<Function>(info_->bases,
         [name](const Class& b) { return b.find_function(name); });
 }
 
@@ -1981,7 +1250,7 @@ inline std::expected<Field, Error> Class::find_field(
         if (info_->fields[i].name == name)
             return Field(info_, i);
     }
-    return walk_bases<Field>(info_->base_names,
+    return walk_bases<Field>(info_->bases,
         [name](const Class& b) { return b.find_field(name); });
 }
 
@@ -1999,7 +1268,7 @@ inline std::expected<Function, Error> Class::find_function(
         if (fn.name == name && detail::match_signature(fn.param_types, query))
             return Function(info_, i);
     }
-    return walk_bases<Function>(info_->base_names,
+    return walk_bases<Function>(info_->bases,
         [name, types](const Class& b) { return b.find_function(name, types); });
 }
 
@@ -2045,7 +1314,7 @@ inline std::expected<StaticField, Error> Class::find_static_field(
         if (info_->static_fields[i].name == name)
             return StaticField(info_, i);
     }
-    return walk_bases<StaticField>(info_->base_names,
+    return walk_bases<StaticField>(info_->bases,
         [name](const Class& b) { return b.find_static_field(name); });
 }
 
@@ -2057,7 +1326,7 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
         if (info_->static_functions[i].name == name)
             return StaticFunction(info_, i);
     }
-    return walk_bases<StaticFunction>(info_->base_names,
+    return walk_bases<StaticFunction>(info_->bases,
         [name](const Class& b) { return b.find_static_function(name); });
 }
 
@@ -2075,7 +1344,7 @@ inline std::expected<StaticFunction, Error> Class::find_static_function(
         if (sf.name == name && detail::match_signature(sf.param_types, query))
             return StaticFunction(info_, i);
     }
-    return walk_bases<StaticFunction>(info_->base_names,
+    return walk_bases<StaticFunction>(info_->bases,
         [name, types](const Class& b) { return b.find_static_function(name, types); });
 }
 

@@ -1,7 +1,7 @@
-// Full API test: register a class, find it by name, find a constructor,
-// construct an instance (type-erased Object), find a function, invoke it,
-// find a field, get/set it, cast back, resolve overloads, walk inheritance,
-// and reflect enums.
+// Core reflection API test: register a class, find it by name, find a
+// constructor, construct an instance (type-erased Object), find a function,
+// invoke it, find a field, get/set it, cast back, resolve overloads, walk
+// inheritance, and reflect enums.
 //
 // Returns non-zero (fails meson test) on any assertion failure.
 #include <refl/refl.hpp>
@@ -43,16 +43,43 @@ struct Mixed {
     double compute(double f) const { return v * f; }
 };
 
-struct IShape {
-    virtual int area(int scale) = 0;
-    virtual void set_color(int c) = 0;
-    virtual ~IShape() = default;
+// Two classes with the same unqualified name in different namespaces —
+// must not collide in the pool or in cast_safe.
+namespace alpha { struct Widget { int id; Widget(int i) : id(i) {} int val() const { return id; } }; }
+namespace beta  { struct Widget { int id; Widget(int i) : id(i) {} int val() const { return id * 10; } }; }
+
+// Multi-inheritance: two bases at different offsets.
+struct Left  { int lv; Left() : lv(0) {} Left(int v) : lv(v) {} int lmethod() const { return lv * 3; } };
+struct Right { int rv; Right() : rv(0) {} Right(int v) : rv(v) {} int rmethod() const { return rv * 5; } };
+struct Diamond : Left, Right {
+    int d;
+    Diamond(int l, int r, int d) : Left(l), Right(r), d(d) {}
+    int dmethod() const { return d; }
 };
 
-[[maybe_unused]] static refl::Refl<Base> reg_base;
-[[maybe_unused]] static refl::Refl<Point> reg_point;
-[[maybe_unused]] static refl::Refl<Color> reg_color;
-[[maybe_unused]] static refl::Refl<Mixed> reg_mixed;
+// 3-level transitive: Deep -> Mid -> {Left, Right}
+struct Mid : Left, Right {
+    int m;
+    Mid(int l, int r, int m) : Left(l), Right(r), m(m) {}
+    int mmethod() const { return m; }
+};
+struct Deep : Mid {
+    int dp;
+    Deep(int l, int r, int m, int dp) : Mid(l, r, m), dp(dp) {}
+    int dmethod() const { return dp; }
+};
+
+[[maybe_unused]] static refl::Reg<Base> reg_base;
+[[maybe_unused]] static refl::Reg<Point> reg_point;
+[[maybe_unused]] static refl::Reg<Color> reg_color;
+[[maybe_unused]] static refl::Reg<Mixed> reg_mixed;
+[[maybe_unused]] static refl::Reg<alpha::Widget> reg_alpha_widget;
+[[maybe_unused]] static refl::Reg<beta::Widget> reg_beta_widget;
+[[maybe_unused]] static refl::Reg<Left> reg_left;
+[[maybe_unused]] static refl::Reg<Right> reg_right;
+[[maybe_unused]] static refl::Reg<Diamond> reg_diamond;
+[[maybe_unused]] static refl::Reg<Mid> reg_mid;
+[[maybe_unused]] static refl::Reg<Deep> reg_deep;
 
 struct Wrong {};
 
@@ -160,11 +187,11 @@ int main() {
     CHECK(idf.is_readonly(), "id should be readonly");
     auto set_id = idf.set(obj, std::any(99));
     CHECK(!set_id.has_value(), "set on readonly should fail");
-    CHECK(set_id.error() == refl::Error::BadSignature, "should be BadSignature");
+    CHECK(set_id.error() == refl::Error::ReadOnly, "should be ReadOnly");
 
     // --- inheritance ---
-    CHECK(cls.base_names().size() == 1, "Point should have 1 base");
-    CHECK(cls.base_names()[0] == "Base", "base should be Base");
+    CHECK(cls.bases().size() == 1, "Point should have 1 base");
+    CHECK(cls.bases()[0].name == "Base", "base should be Base");
 
     // inherited field from Base
     auto base_field = cls.find_field("base_val");
@@ -214,36 +241,44 @@ int main() {
     CHECK(sf->name() == "instance_count", "static field name");
     CHECK(!sf->is_readonly(), "instance_count should not be readonly");
     // Point(1,3) was constructed once, so instance_count should be 1
-    CHECK(std::any_cast<int>(sf->get()) == 1, "instance_count should be 1");
+    CHECK(std::any_cast<int>(*sf->get()) == 1, "instance_count should be 1");
 
     (void)sf->set(std::any(42));
-    CHECK(std::any_cast<int>(sf->get()) == 42, "after set, instance_count should be 42");
+    CHECK(std::any_cast<int>(*sf->get()) == 42, "after set, instance_count should be 42");
 
     // readonly static field (const)
     auto maxf = cls.find_static_field("max_instances");
     CHECK(maxf.has_value(), "find_static_field(\"max_instances\") should succeed");
     CHECK(maxf->is_readonly(), "max_instances should be readonly (const)");
-    CHECK(std::any_cast<int>(maxf->get()) == 100, "max_instances should be 100");
+    CHECK(std::any_cast<int>(*maxf->get()) == 100, "max_instances should be 100");
     auto set_max = maxf->set(std::any(200));
     CHECK(!set_max.has_value(), "set on readonly static should fail");
-    CHECK(set_max.error() == refl::Error::BadSignature, "should be BadSignature");
+    CHECK(set_max.error() == refl::Error::ReadOnly, "should be ReadOnly");
 
     // --- static member functions ---
     auto sf_count = cls.find_static_function("get_instance_count");
     CHECK(sf_count.has_value(), "find_static_function(\"get_instance_count\") should succeed");
     CHECK(sf_count->return_type() == "int", "get_instance_count returns int");
-    std::any sc_ret = sf_count->invoke();
+    std::any sc_ret = *sf_count->invoke();
     CHECK(std::any_cast<int>(sc_ret) == 42, "get_instance_count should be 42");
 
     auto sf_reset = cls.find_static_function("reset_count");
     CHECK(sf_reset.has_value(), "find_static_function(\"reset_count\") should succeed");
-    std::any sr_ret = sf_reset->invoke();
-    CHECK(!sr_ret.has_value(), "reset_count returns void, any should be empty");
+    auto sr_ret = sf_reset->invoke();
+    CHECK(sr_ret.has_value(), "reset_count should succeed");
+    CHECK(!sr_ret->has_value(), "reset_count returns void, any should be empty");
     CHECK(Point::instance_count == 0, "after reset_count, instance_count should be 0");
 
     // --- constructors enumeration ---
     const auto& ctors = cls.constructors();
     CHECK(ctors.size() == 1, "Point should have 1 registered constructor (the 2-param one)");
+
+    // --- functions enumeration (raw accessor) ---
+    const auto& fns = cls.functions();
+    CHECK(fns.size() >= 3, "Point should have at least 3 member functions (sum, set, set)");
+    bool has_sum = false;
+    for (const auto& f : fns) if (f.name == "sum") has_sum = true;
+    CHECK(has_sum, "functions() should list sum");
 
     // --- find_static_function with param types ---
     // (Point has no overloaded static functions, so just verify the name-based lookup works)
@@ -289,220 +324,118 @@ int main() {
     CHECK(!cls.find_function("no_such_function").has_value(), "non-existent function should fail");
     CHECK(!cls.find_field("no_such_field").has_value(), "non-existent field should fail");
 
-    // === Refl<T> dispatch-struct tests ===
+    // === qualified names: same unqualified name in different namespaces ===
+    auto a_cls = refl::find_class("alpha::Widget");
+    CHECK(a_cls.has_value(), "find_class(\"alpha::Widget\") should succeed");
+    auto b_cls = refl::find_class("beta::Widget");
+    CHECK(b_cls.has_value(), "find_class(\"beta::Widget\") should succeed");
+    CHECK(a_cls->name() != b_cls->name(), "alpha::Widget and beta::Widget must be distinct");
+    CHECK(a_cls->name() == "alpha::Widget", "alpha name should be qualified");
+    CHECK(b_cls->name() == "beta::Widget", "beta name should be qualified");
+    // The unqualified "Widget" must NOT resolve to either.
+    CHECK(!refl::find_class("Widget").has_value(), "unqualified Widget should not be findable");
 
-    // --- construct via Refl<T> args constructor ---
-    refl::Refl<Point> rp(1, 2);
-    CHECK(rp.get().x == 1, "Refl<Point> get().x should be 1");
-    CHECK(rp.get().y == 2, "Refl<Point> get().y should be 2");
+    auto a_obj = *a_cls->find_constructor({"int"})->call(7);
+    auto b_obj = *b_cls->find_constructor({"int"})->call(7);
 
-    // --- typed method call via -> (real return type, no any_cast!) ---
-    int sum_result = rp->sum();
-    CHECK(sum_result == 3, "rp->sum() should be 3");
+    auto a_cast = a_obj.cast_safe<alpha::Widget>();
+    CHECK(a_cast.has_value(), "cast_safe<alpha::Widget> on alpha object should succeed");
+    CHECK(a_cast.value()->id == 7, "alpha Widget id should be 7");
+    CHECK(a_cast.value()->val() == 7, "alpha Widget val() should be 7");
 
-    // --- overloaded methods via -> ---
-    rp->set(50);
-    CHECK(rp.get().x == 50, "after rp->set(50), x should be 50");
-    rp->set(10, 20);
-    CHECK(rp.get().x == 10, "after rp->set(10,20), x should be 10");
-    CHECK(rp.get().y == 20, "after rp->set(10,20), y should be 20");
+    auto b_cast = b_obj.cast_safe<beta::Widget>();
+    CHECK(b_cast.has_value(), "cast_safe<beta::Widget> on beta object should succeed");
+    CHECK(b_cast.value()->val() == 70, "beta Widget val() should be 70");
 
-    // --- property get/set via -> (member-like syntax) ---
-    int xval = rp->x;
-    CHECK(xval == 10, "rp->x should be 10 (implicit conversion)");
-    rp->x = 99;
-    CHECK(rp.get().x == 99, "after rp->x = 99, x should be 99");
+    // Cross-cast: alpha::Widget must NOT cast to beta::Widget.
+    auto cross = a_obj.cast_safe<beta::Widget>();
+    CHECK(!cross.has_value(), "cast_safe<beta::Widget> on alpha object should fail");
+    CHECK(cross.error() == refl::Error::TypeError, "cross-namespace cast should be TypeError");
 
-    // --- readonly property (compile-time rejected assignment) ---
-    CHECK(rp->id.is_readonly(), "id property should be readonly");
-    int id_val = rp->id;
-    CHECK(id_val == 0, "rp->id should be 0 (Point ctor sets id=0)");
-    // rp->id = 100;  // COMPILE ERROR: operator= deleted for Readonly=true
-    // Verify the readonly constraint at compile time:
-    static_assert(decltype(rp->id)::is_readonly(), "id must be Readonly=true");
-    static_assert(!decltype(rp->x)::is_readonly(), "x must be Readonly=false");
+    // === arity + type guards (#5) ===
+    // Too few args → ArityMismatch (not UB).
+    auto few = ctor.call(1);
+    CHECK(!few.has_value(), "call(1) on 2-param ctor should fail");
+    CHECK(few.error() == refl::Error::ArityMismatch, "too few args should be ArityMismatch");
+    // Too many args → ArityMismatch.
+    auto many = ctor.call(1, 2, 3);
+    CHECK(!many.has_value(), "call(1,2,3) on 2-param ctor should fail");
+    CHECK(many.error() == refl::Error::ArityMismatch, "too many args should be ArityMismatch");
 
-    // --- connect (function call hook) ---
-    int hook_result = 0;
-    rp.connect("sum", [&hook_result](std::any& r) {
-        hook_result = std::any_cast<int>(r);
-    });
-    (void)rp->sum();
-    CHECK(hook_result == 119, "connect hook should fire after sum() with result 119 (99+20)");
+    auto fn2 = *cls.find_function("set", {"int", "int"});
+    auto bad_arity = fn2.invoke(obj, 99);
+    CHECK(!bad_arity.has_value(), "invoke with wrong arg count should fail");
+    CHECK(bad_arity.error() == refl::Error::ArityMismatch, "wrong arity invoke should be ArityMismatch");
 
-    // --- on_change (property change hook) ---
-    int change_result = 0;
-    rp.on_change("x", [&change_result](std::any& v) {
-        change_result = std::any_cast<int>(v);
-    });
-    rp->x = 42;
-    CHECK(change_result == 42, "on_change hook should fire with new value 42");
-    CHECK(rp.get().x == 42, "after on_change set, x should be 42");
+    // Wrong any type → TypeError (not bad_any_cast throw).
+    auto bad_type = fn2.invoke(obj, std::any(1.5), std::any(2));
+    CHECK(!bad_type.has_value(), "invoke with wrong arg type should fail");
+    CHECK(bad_type.error() == refl::Error::TypeError, "wrong arg type should be TypeError");
 
-    // --- registration still works via default constructor ---
-    // (reg_base, reg_point, reg_color were default-constructed above)
-    CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
+    // Static function arity guard.
+    auto bad_sfn = sf_count->invoke(1);
+    CHECK(!bad_sfn.has_value(), "static invoke with wrong arg count should fail");
+    CHECK(bad_sfn.error() == refl::Error::ArityMismatch, "static wrong arity should be ArityMismatch");
 
-    // === operator[] on array members ===
-    rp->coords[0] = 10;
-    rp->coords[1] = 20;
-    rp->coords[2] = 30;
-    CHECK(rp.get().coords[0] == 10, "coords[0] should be 10");
-    CHECK(rp.get().coords[1] == 20, "coords[1] should be 20");
-    CHECK(rp.get().coords[2] == 30, "coords[2] should be 30");
-    int c1 = rp->coords[1];
-    CHECK(c1 == 20, "coords[1] read via operator[] should be 20");
+    // Field set with wrong any type → TypeError.
+    auto bad_field = xf.set(obj, std::any(3.14));
+    CHECK(!bad_field.has_value(), "field set with wrong type should fail");
+    CHECK(bad_field.error() == refl::Error::TypeError, "field wrong type should be TypeError");
 
-    // === static members in the dispatch struct ===
-    int ic = rp->instance_count;
-    CHECK(ic >= 1, "instance_count via dispatch should be >= 1");
-    rp->instance_count = 50;
-    CHECK(Point::instance_count == 50, "after instance_count=50, static should be 50");
+    // === multiple inheritance: offset-adjusted base access ===
+    auto dia_cls = *refl::find_class("Diamond");
+    auto dia_obj = *dia_cls.find_constructor({"int", "int", "int"})->call(10, 20, 30);
+    CHECK(dia_obj.is_class("Diamond"), "is_class Diamond");
+    CHECK(dia_obj.is_class("Left"), "is_class Left (Diamond derives from Left)");
+    CHECK(dia_obj.is_class("Right"), "is_class Right (Diamond derives from Right)");
 
-    int max = rp->max_instances;
-    CHECK(max == 100, "max_instances should be 100");
-    // rp->max_instances = 200;  // COMPILE ERROR — readonly
-    static_assert(decltype(rp->max_instances)::is_readonly(), "max must be readonly");
-    static_assert(!decltype(rp->instance_count)::is_readonly(), "instance_count must be writable");
+    // cast_safe to each base — must get the correct subobject, not the
+    // first member of the wrong base.
+    auto lp = dia_obj.cast_safe<Left>();
+    CHECK(lp.has_value(), "cast_safe<Left> on Diamond should succeed");
+    CHECK(lp.value()->lv == 10, "Left::lv should be 10");
+    CHECK(lp.value()->lmethod() == 30, "Left::lmethod() should be 30 (10*3)");
 
-    int gi = rp->get_instance_count();
-    CHECK(gi == 50, "get_instance_count() via dispatch should be 50");
+    auto rp = dia_obj.cast_safe<Right>();
+    CHECK(rp.has_value(), "cast_safe<Right> on Diamond should succeed");
+    CHECK(rp.value()->rv == 20, "Right::rv should be 20");
+    CHECK(rp.value()->rmethod() == 100, "Right::rmethod() should be 100 (20*5)");
 
-    rp->reset_count();
-    CHECK(Point::instance_count == 0, "after reset_count(), instance_count should be 0");
+    // Invoke inherited methods through the type-erased path.
+    auto lfn = *dia_cls.find_function("lmethod");
+    CHECK(std::any_cast<int>(*lfn.invoke(dia_obj)) == 30, "lmethod via invoke should be 30");
+    auto rfn = *dia_cls.find_function("rmethod");
+    CHECK(std::any_cast<int>(*rfn.invoke(dia_obj)) == 100, "rmethod via invoke should be 100");
 
-    // === swap via reset() ===
-    rp.reset(100, 200);
-    CHECK(rp.get().x == 100, "after reset(100,200), x should be 100");
-    CHECK(rp.get().y == 200, "after reset(100,200), y should be 200");
-    rp->set(5, 6);
-    CHECK(rp.get().x == 5, "after set(5,6) on swapped object, x should be 5");
-    rp->coords[0] = 999;
-    CHECK(rp.get().coords[0] == 999, "coords[0] on swapped object should be 999");
+    // Get/set inherited fields through the type-erased path.
+    auto lfield = *dia_cls.find_field("lv");
+    CHECK(std::any_cast<int>(*lfield.get(dia_obj)) == 10, "field get lv should be 10");
+    auto rfield = *dia_cls.find_field("rv");
+    CHECK(std::any_cast<int>(*rfield.get(dia_obj)) == 20, "field get rv should be 20");
+    (void)lfield.set(dia_obj, std::any(99));
+    CHECK(lp.value()->lv == 99, "after field set lv=99, Left::lv should be 99");
+    (void)rfield.set(dia_obj, std::any(88));
+    CHECK(rp.value()->rv == 88, "after field set rv=88, Right::rv should be 88");
 
-    // === typed overload dispatch: Mixed::compute(int) returns int, compute(double) returns double ===
-    // No variant — the return type is picked by argument type at compile time.
-    refl::Refl<Mixed> rm(5);
-    int ci = rm->compute(3);
-    CHECK(ci == 15, "compute(3) should be 15 (5*3)");
-    double cd = rm->compute(3.0);
-    CHECK(cd == 15.0, "compute(3.0) should be 15.0 (5*3.0)");
+    // === 3-level transitive: Deep -> Mid -> {Left, Right} ===
+    auto deep_obj = *refl::find_class("Deep")
+        ->find_constructor({"int", "int", "int", "int"})->call(1, 2, 3, 4);
+    auto deep_lp = deep_obj.cast_safe<Left>();
+    CHECK(deep_lp.has_value(), "cast_safe<Left> on Deep should succeed");
+    CHECK(deep_lp.value()->lv == 1, "transitive Left::lv should be 1");
+    CHECK(deep_lp.value()->lmethod() == 3, "transitive lmethod should be 3 (1*3)");
+    auto deep_rp = deep_obj.cast_safe<Right>();
+    CHECK(deep_rp.has_value(), "cast_safe<Right> on Deep should succeed");
+    CHECK(deep_rp.value()->rv == 2, "transitive Right::rv should be 2");
+    CHECK(deep_rp.value()->rmethod() == 10, "transitive rmethod should be 10 (2*5)");
+    auto deep_mp = deep_obj.cast_safe<Mid>();
+    CHECK(deep_mp.has_value(), "cast_safe<Mid> on Deep should succeed");
+    CHECK(deep_mp.value()->m == 3, "transitive Mid::m should be 3");
 
-    // === dynamic interface implementation ===
-    // Refl<IShape> with an abstract T — no object constructed, methods
-    // implemented via runtime callables.
-    refl::Refl<IShape> ishape;
-    ishape.implement<^^IShape::area>([](refl::Refl<IShape>&, int scale) {
-        return scale * 100;
-    });
-    ishape.implement<^^IShape::set_color>([](refl::Refl<IShape>&, int) {
-        // no-op for test
-    });
+    // Inherited method 2 levels up.
+    auto deep_lfn = *refl::find_class("Deep")->find_function("lmethod");
+    CHECK(std::any_cast<int>(*deep_lfn.invoke(deep_obj)) == 3, "transitive lmethod via invoke should be 3");
 
-    int ar = ishape->area(5);
-    CHECK(ar == 500, "dynamic area(5) should be 500 (5*100)");
-    ishape->set_color(42);  // should not crash
-    CHECK(true, "set_color called successfully");
-
-    // Re-implement at runtime
-    ishape.implement<^^IShape::area>([](refl::Refl<IShape>&, int scale) {
-        return scale * 200;
-    });
-    int ar2 = ishape->area(5);
-    CHECK(ar2 == 1000, "dynamic area(5) after re-implement should be 1000");
-
-    // === real-to-dynamic-to-real switching ===
-    // Start with a real Point, switch to dynamic (mock), then back.
-    refl::Refl<Point> rp2(3, 4);
-    CHECK(!rp2.is_dynamic(), "rp2 should start in real mode");
-    CHECK(rp2->sum() == 7, "real sum() should be 7 (3+4)");
-
-    // Per-method override: keep real object, override just sum().
-    rp2.implement<^^Point::sum>([](refl::Refl<Point>&) { return 999; });
-    CHECK(!rp2.is_dynamic(), "rp2 should NOT be in full dynamic mode (partial override)");
-    CHECK(rp2->sum() == 999, "overridden sum() should be 999");
-    rp2->set(10, 20);
-    CHECK(rp2.get().x == 10, "set() should still call real object (x=10)");
-    CHECK(rp2.get().y == 20, "set() should still call real object (y=20)");
-
-    // Restore the real sum() — removes the override.
-    rp2.restore<^^Point::sum>();
-    CHECK(rp2->sum() == 30, "restored sum() should be 30 (10+20)");
-
-    // Full dynamic mode: make_dynamic() then implement everything.
-    rp2.make_dynamic();
-    CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after make_dynamic");
-    rp2.implement<^^Point::sum>([](refl::Refl<Point>&) { return 42; });
-    CHECK(rp2->sum() == 42, "mocked sum() should be 42");
-    // Note: ^^Point::set can't be used — it's an overload set.
-    rp2.implement<^^Point::sum>([](refl::Refl<Point>&) { return 84; });
-    CHECK(rp2->sum() == 84, "re-implemented sum() should be 84");
-
-    // Switch back to real mode.
-    rp2.reset(1, 2);
-    CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
-    CHECK(rp2->sum() == 3, "real sum() should be 3 (1+2)");
-
-    // String-based implement (no ^^ syntax, compile-time checked).
-    rp2.implement<"sum">([](refl::Refl<Point>&) { return 777; });
-    CHECK(rp2->sum() == 777, "string-based implement sum() should be 777");
-    rp2.restore<^^Point::sum>();
-    CHECK(rp2->sum() == 3, "restored sum() should be 3 again");
-
-    // Verify the self reference can access the real object.
-    rp2.implement<"sum">([](refl::Refl<Point>& self) {
-        return self.get().x + self.get().y + 100;
-    });
-    CHECK(rp2->sum() == 103, "self-ref sum() should be 103 (1+2+100)");
-    rp2.restore<^^Point::sum>();
-    CHECK(rp2->sum() == 3, "restored sum() should be 3 after self-ref test");
-
-    // === multi-listener hooks ===
-    int hook_a = 0, hook_b = 0;
-    rp2.connect("sum", [&hook_a](std::any& r) {
-        hook_a = std::any_cast<int>(r);
-    });
-    rp2.connect("sum", [&hook_b](std::any& r) {
-        hook_b = std::any_cast<int>(r);
-    });
-    (void)rp2->sum();
-    CHECK(hook_a == 3, "multi-listener hook A should fire with 3");
-    CHECK(hook_b == 3, "multi-listener hook B should fire with 3");
-
-    // === explicit emit ===
-    int emit_result = 0;
-    rp2.connect("custom_signal", [&emit_result](std::any& v) {
-        emit_result = std::any_cast<int>(v);
-    });
-    rp2.emit("custom_signal", std::any(42));
-    CHECK(emit_result == 42, "emit should fire connected callbacks");
-
-    // === dynamic properties ===
-    rp2.set_property("dynamic_val", std::any(123));
-    int dp_val = std::any_cast<int>(rp2.get_property("dynamic_val"));
-    CHECK(dp_val == 123, "dynamic property should be 123");
-
-    // dynamic property with on_change
-    int dyn_change = 0;
-    rp2.on_change("dynamic_val", [&dyn_change](std::any& v) {
-        dyn_change = std::any_cast<int>(v);
-    });
-    rp2.set_property("dynamic_val", std::any(456));
-    CHECK(dyn_change == 456, "on_change should fire on dynamic property set");
-
-    // === cross-object connect ===
-    refl::Refl<Point> rp3(10, 20);
-    int cross_result = 0;
-    rp3.connect("sum", [&cross_result](std::any& r) {
-        cross_result = std::any_cast<int>(r);
-    });
-    // Connect rp2's "sum" to rp3's "sum" — when rp2->sum() fires,
-    // rp3's hooks receive rp2's result (forwarded via emit).
-    rp2.connect("sum", &rp3, "sum");
-    (void)rp2->sum();
-    // rp2->sum() returns 3 (1+2), forwarded to rp3's hook.
-    CHECK(cross_result == 3, "cross-object connect: rp3 hook should receive rp2's result (3)");
-
-    std::printf("refl API test ok\n");
+    std::printf("refl core API test ok\n");
     return 0;
 }

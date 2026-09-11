@@ -22,3 +22,11 @@ test_refl = executable(
   install: false,
 )
 test('refl_api', test_refl)
+
+test_dyn = executable(
+  'test_dyn',
+  'test_dyn.cpp',
+  include_directories: inc,
+  install: false,
+)
+test('dyn_api', test_dyn)

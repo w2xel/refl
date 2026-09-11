@@ -40,4 +40,5 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Design: design.md
+  - Dyn: dyn.md
   - Getting Started: getting-started.md

@@ -36,7 +36,8 @@ reflecting a `struct Point { int x; int y; }` and asserting two members.
 ## Run a sample
 
 ```sh
-./builddir/basic_sample
+./builddir/basic_sample      # core type-erased API
+./builddir/dynamic_sample    # Dyn<T> dispatch + mocking
 ```
 
 ## Serve the documentation
@@ -56,7 +57,7 @@ The site is written to `docs/site`.
 ## Layout
 
 ```
-include/refl/   framework headers (header-only for now)
+include/refl/   framework headers (refl.hpp = core, dyn.hpp = Dyn<T> layer)
 tests/           meson tests (assert-based executables, no test framework)
 samples/         runnable usage examples
 docs/            MkDocs Material site
