@@ -1,17 +1,21 @@
 // proxy — typed proxy field types for the dyn dispatch layer.
 //
-// These are the compile-time proxy field types used by Dyn<T>'s synthesized
-// Dispatch struct.  Each proxies a single reflected member (method, data
-// member, static member) with real C++ types at the call site — no std::any,
-// no std::variant.
+// TypedMethod<Sigs...> and TypedProperty<T> are the compile-time field
+// types used by Proxy<T> and Dyn<T>'s synthesized Dispatch struct.  Each
+// proxies a single reflected member with real C++ types at the call site
+// — no std::any, no std::variant.
 //
 //   TypedMethod<int(), void(int)>     — overload-resolved method dispatch
 //   TypedProperty<int>               — data member get/set via operator=/cast
-//   TypedStaticProperty<int>         — static data member proxy
-//   TypedStaticMethod<int()>         — static member function proxy
 //
-// Pure primitives: no dependency on Dyn<T>.  Dyn<T> (in refl/dyn.hpp) includes
-// this header and builds its Dispatch struct from these field types.
+// Proxy<T> synthesizes a Dispatch struct from T's public interface at
+// compile time, then wires it to a type-erased Object at runtime via its
+// ClassInfo.  Statics are not proxied — use Proxy<T>::get_class() for
+// static access via refl::Class.
+//
+// Pure primitives: no dependency on Dyn<T>.  Dyn<T> (in refl/dyn.hpp)
+// includes this header and builds its Dispatch struct from these field
+// types.
 #pragma once
 
 #include <refl/refl.hpp>
@@ -66,37 +70,55 @@ struct OverloadEntry {
     InvokerFn invoker;
 };
 
+// Runtime: look up a base class's ClassInfo by name from the pool.
+// Returns nullptr if not registered.  The pool is append-only, so the
+// pointer stays valid after the lock is released.
+inline const ClassInfo* lookup_base_info(std::string_view name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    auto it = class_pool().find(std::string(name));
+    return it != class_pool().end() ? it->second.get() : nullptr;
+}
+
+// Runtime: search a ClassInfo's direct fields by name.
+inline const FieldInfo* find_field_direct(
+        const ClassInfo* info, std::string_view name) {
+    for (const auto& fi : info->fields)
+        if (fi.name == name) return &fi;
+    return nullptr;
+}
+
 // Runtime: search a ClassInfo and its registered public bases for a
 // field by name.  Returns the FieldInfo and accumulated byte offset to
 // the base subobject (0 for direct fields), or {nullptr, 0} if not found.
-// Used by Proxy and Dyn populate() to bind inherited data members.
-// The pool is append-only (no unregister), so ClassInfo pointers remain
-// valid after the lock is released.
 struct FieldSearchResult {
     const FieldInfo* fi;
     std::ptrdiff_t offset;
 };
 inline FieldSearchResult find_field_in_hierarchy(
         const ClassInfo* info, std::string_view name) {
-    for (const auto& fi : info->fields)
-        if (fi.name == name) return {&fi, 0};
+    if (auto* fi = find_field_direct(info, name))
+        return {fi, 0};
     for (const auto& b : info->bases) {
-        const ClassInfo* base_info;
-        {
-            std::lock_guard<std::mutex> lk(pool_mutex());
-            auto it = class_pool().find(b.name);
-            if (it == class_pool().end()) continue;
-            base_info = it->second.get();
+        if (auto* base_info = lookup_base_info(b.name)) {
+            auto r = find_field_in_hierarchy(base_info, name);
+            if (r.fi) return {r.fi, b.offset + r.offset};
         }
-        auto r = find_field_in_hierarchy(base_info, name);
-        if (r.fi) return {r.fi, b.offset + r.offset};
     }
     return {nullptr, 0};
 }
 
+// Runtime: search a ClassInfo's direct functions by name + param types.
+inline const FunctionInfo* find_function_direct(
+        const ClassInfo* info, std::string_view name,
+        const std::vector<std::string>& param_types) {
+    for (const auto& fi : info->functions)
+        if (fi.name == name && fi.param_types == param_types)
+            return &fi;
+    return nullptr;
+}
+
 // Runtime: search a ClassInfo and its registered public bases for a
-// function by name + param-type signature.  Returns the FunctionInfo
-// and accumulated byte offset, or {nullptr, 0} if not found.
+// function by name + param-type signature.
 struct FunctionSearchResult {
     const FunctionInfo* fi;
     std::ptrdiff_t offset;
@@ -104,19 +126,13 @@ struct FunctionSearchResult {
 inline FunctionSearchResult find_function_in_hierarchy(
         const ClassInfo* info, std::string_view name,
         const std::vector<std::string>& param_types) {
-    for (const auto& fi : info->functions)
-        if (fi.name == name && fi.param_types == param_types)
-            return {&fi, 0};
+    if (auto* fi = find_function_direct(info, name, param_types))
+        return {fi, 0};
     for (const auto& b : info->bases) {
-        const ClassInfo* base_info;
-        {
-            std::lock_guard<std::mutex> lk(pool_mutex());
-            auto it = class_pool().find(b.name);
-            if (it == class_pool().end()) continue;
-            base_info = it->second.get();
+        if (auto* base_info = lookup_base_info(b.name)) {
+            auto r = find_function_in_hierarchy(base_info, name, param_types);
+            if (r.fi) return {r.fi, b.offset + r.offset};
         }
-        auto r = find_function_in_hierarchy(base_info, name, param_types);
-        if (r.fi) return {r.fi, b.offset + r.offset};
     }
     return {nullptr, 0};
 }
@@ -125,25 +141,15 @@ inline FunctionSearchResult find_function_in_hierarchy(
 // function by name only (ignoring param types).  Used for operator binding
 // where the interface and impl parameter types are structurally different
 // types (e.g. IVec2 vs Vec2Impl).  Returns the first match by name.
-struct FunctionSearchResultNameOnly {
-    const FunctionInfo* fi;
-    std::ptrdiff_t offset;
-};
-inline FunctionSearchResultNameOnly find_function_by_name_in_hierarchy(
+inline FunctionSearchResult find_function_by_name_in_hierarchy(
         const ClassInfo* info, std::string_view name) {
     for (const auto& fi : info->functions)
-        if (fi.name == name)
-            return {&fi, 0};
+        if (fi.name == name) return {&fi, 0};
     for (const auto& b : info->bases) {
-        const ClassInfo* base_info;
-        {
-            std::lock_guard<std::mutex> lk(pool_mutex());
-            auto it = class_pool().find(b.name);
-            if (it == class_pool().end()) continue;
-            base_info = it->second.get();
+        if (auto* base_info = lookup_base_info(b.name)) {
+            auto r = find_function_by_name_in_hierarchy(base_info, name);
+            if (r.fi) return {r.fi, b.offset + r.offset};
         }
-        auto r = find_function_by_name_in_hierarchy(base_info, name);
-        if (r.fi) return {r.fi, b.offset + r.offset};
     }
     return {nullptr, 0};
 }
@@ -207,7 +213,8 @@ collect_sigs_by_op(std::meta::info type, std::meta::operators op) {
 
 // consteval: map a std::meta::operators value to a valid C++ identifier
 // for use as a dispatch struct field name (e.g. op_plus → "_op_add").
-// Used by make_dispatch_specs to give operators addressable fields.
+// Only the operators Proxy<T> defines overloads for are listed; others
+// return empty and are skipped by make_dispatch_specs.
 consteval std::string_view op_field_name(std::meta::operators op) {
     using enum std::meta::operators;
     switch (op) {
@@ -216,42 +223,14 @@ consteval std::string_view op_field_name(std::meta::operators op) {
     case op_star:              return "_op_mul";
     case op_slash:             return "_op_div";
     case op_percent:           return "_op_mod";
-    case op_plus_equals:       return "_op_add_eq";
-    case op_minus_equals:      return "_op_sub_eq";
-    case op_star_equals:       return "_op_mul_eq";
-    case op_slash_equals:      return "_op_div_eq";
-    case op_percent_equals:    return "_op_mod_eq";
     case op_equals_equals:     return "_op_eq";
     case op_exclamation_equals:return "_op_ne";
     case op_less:              return "_op_lt";
     case op_greater:           return "_op_gt";
     case op_less_equals:       return "_op_le";
     case op_greater_equals:    return "_op_ge";
-    case op_spaceship:         return "_op_spaceship";
-    case op_ampersand:         return "_op_band";
-    case op_pipe:              return "_op_bor";
-    case op_caret:             return "_op_bxor";
-    case op_tilde:             return "_op_bnot";
-    case op_less_less:         return "_op_shl";
-    case op_greater_greater:   return "_op_shr";
-    case op_ampersand_ampersand:return "_op_land";
-    case op_pipe_pipe:         return "_op_lor";
-    case op_exclamation:       return "_op_lnot";
-    case op_plus_plus:         return "_op_inc";
-    case op_minus_minus:       return "_op_dec";
-    case op_comma:             return "_op_comma";
-    case op_parentheses:       return "_op_call";
-    case op_square_brackets:   return "_op_subscript";
-    case op_arrow:             return "_op_arrow";
-    case op_arrow_star:        return "_op_arrow_star";
     default:                   return {};
     }
-}
-
-// consteval: map a std::meta::operators value to the ClassInfo function
-// name that make_info stores (e.g. "operator+", "operator==").
-consteval std::string op_classinfo_name(std::meta::operators op) {
-    return "operator" + std::string(std::meta::symbol_of(op));
 }
 
 // consteval: collect all distinct operator kinds from a type and its
@@ -281,38 +260,17 @@ consteval void collect_all_operators(std::meta::info type,
 // fields (_op_add, _op_eq, etc.) map to "operator+", "operator==", etc.
 // Returns empty string_view if the field is not a method/operator.
 consteval std::string_view field_to_classinfo_name(std::string_view fname) {
-    using enum std::meta::operators;
-    if (fname == "_op_add")         return "operator+";
-    if (fname == "_op_sub")        return "operator-";
-    if (fname == "_op_mul")        return "operator*";
-    if (fname == "_op_div")        return "operator/";
-    if (fname == "_op_mod")        return "operator%";
-    if (fname == "_op_add_eq")     return "operator+=";
-    if (fname == "_op_sub_eq")     return "operator-=";
-    if (fname == "_op_mul_eq")     return "operator*=";
-    if (fname == "_op_div_eq")     return "operator/=";
-    if (fname == "_op_mod_eq")     return "operator%=";
-    if (fname == "_op_eq")         return "operator==";
-    if (fname == "_op_ne")         return "operator!=";
-    if (fname == "_op_lt")         return "operator<";
-    if (fname == "_op_gt")         return "operator>";
-    if (fname == "_op_le")         return "operator<=";
-    if (fname == "_op_ge")         return "operator>=";
-    if (fname == "_op_spaceship")  return "operator<=>";
-    if (fname == "_op_band")       return "operator&";
-    if (fname == "_op_bor")        return "operator|";
-    if (fname == "_op_bxor")       return "operator^";
-    if (fname == "_op_bnot")       return "operator~";
-    if (fname == "_op_shl")        return "operator<<";
-    if (fname == "_op_shr")        return "operator>>";
-    if (fname == "_op_land")       return "operator&&";
-    if (fname == "_op_lor")        return "operator||";
-    if (fname == "_op_lnot")       return "operator!";
-    if (fname == "_op_inc")        return "operator++";
-    if (fname == "_op_dec")        return "operator--";
-    if (fname == "_op_comma")      return "operator,";
-    if (fname == "_op_call")       return "operator()";
-    if (fname == "_op_subscript")  return "operator[]";
+    if (fname == "_op_add")  return "operator+";
+    if (fname == "_op_sub")  return "operator-";
+    if (fname == "_op_mul")  return "operator*";
+    if (fname == "_op_div")  return "operator/";
+    if (fname == "_op_mod")  return "operator%";
+    if (fname == "_op_eq")   return "operator==";
+    if (fname == "_op_ne")   return "operator!=";
+    if (fname == "_op_lt")   return "operator<";
+    if (fname == "_op_gt")   return "operator>";
+    if (fname == "_op_le")   return "operator<=";
+    if (fname == "_op_ge")   return "operator>=";
     return fname;  // named method: identity
 }
 
@@ -372,43 +330,21 @@ consteval std::vector<bool> collect_const_quals_op(std::meta::info type,
 // the field name back to the operator and uses collect_const_quals_op.
 consteval std::vector<bool> field_const_quals(std::meta::info type,
                                                  std::string_view fname) {
-    if (!is_op_field(fname)) {
+    if (!is_op_field(fname))
         return collect_const_quals(type, fname);
-    }
-    // Map field name to operator enum — reverse of op_field_name.
     using enum std::meta::operators;
     auto op = std::meta::operators(-1);
-    if (fname == "_op_add")          op = op_plus;
-    else if (fname == "_op_sub")     op = op_minus;
-    else if (fname == "_op_mul")     op = op_star;
-    else if (fname == "_op_div")     op = op_slash;
-    else if (fname == "_op_mod")     op = op_percent;
-    else if (fname == "_op_add_eq")  op = op_plus_equals;
-    else if (fname == "_op_sub_eq")  op = op_minus_equals;
-    else if (fname == "_op_mul_eq")  op = op_star_equals;
-    else if (fname == "_op_div_eq")  op = op_slash_equals;
-    else if (fname == "_op_mod_eq")  op = op_percent_equals;
-    else if (fname == "_op_eq")      op = op_equals_equals;
-    else if (fname == "_op_ne")      op = op_exclamation_equals;
-    else if (fname == "_op_lt")      op = op_less;
-    else if (fname == "_op_gt")      op = op_greater;
-    else if (fname == "_op_le")      op = op_less_equals;
-    else if (fname == "_op_ge")      op = op_greater_equals;
-    else if (fname == "_op_spaceship") op = op_spaceship;
-    else if (fname == "_op_band")    op = op_ampersand;
-    else if (fname == "_op_bor")      op = op_pipe;
-    else if (fname == "_op_bxor")     op = op_caret;
-    else if (fname == "_op_bnot")    op = op_tilde;
-    else if (fname == "_op_shl")     op = op_less_less;
-    else if (fname == "_op_shr")     op = op_greater_greater;
-    else if (fname == "_op_land")    op = op_ampersand_ampersand;
-    else if (fname == "_op_lor")     op = op_pipe_pipe;
-    else if (fname == "_op_lnot")    op = op_exclamation;
-    else if (fname == "_op_inc")     op = op_plus_plus;
-    else if (fname == "_op_dec")     op = op_minus_minus;
-    else if (fname == "_op_comma")   op = op_comma;
-    else if (fname == "_op_call")    op = op_parentheses;
-    else if (fname == "_op_subscript") op = op_square_brackets;
+    if (fname == "_op_add")  op = op_plus;
+    else if (fname == "_op_sub")  op = op_minus;
+    else if (fname == "_op_mul")  op = op_star;
+    else if (fname == "_op_div")  op = op_slash;
+    else if (fname == "_op_mod")  op = op_percent;
+    else if (fname == "_op_eq")   op = op_equals_equals;
+    else if (fname == "_op_ne")   op = op_exclamation_equals;
+    else if (fname == "_op_lt")   op = op_less;
+    else if (fname == "_op_gt")   op = op_greater;
+    else if (fname == "_op_le")   op = op_less_equals;
+    else if (fname == "_op_ge")   op = op_greater_equals;
     if (op == std::meta::operators(-1)) return {};
     return collect_const_quals_op(type, op);
 }
@@ -873,6 +809,19 @@ class Proxy {
         return s;
     }
 
+    // Check the impl's const-ness matches the interface's for one overload.
+    // Shared by operator and named-method binding paths.
+    template <typename ConstArr>
+    static void check_const_qual(const ConstArr& exp_const,
+            std::size_t oi, const FunctionInfo* fi, std::string_view key) {
+        if (oi < exp_const.size() && fi->is_const != exp_const[oi])
+            throw std::runtime_error(
+                "Proxy: const-ness mismatch on '" + std::string(key) +
+                "' — interface expects " +
+                (exp_const[oi] ? "const" : "non-const") +
+                ", impl is " + (fi->is_const ? "const" : "non-const"));
+    }
+
     void populate() {
         if constexpr (std::is_class_v<T>) {
             if (!obj_.valid()) return;
@@ -890,20 +839,10 @@ class Proxy {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Non-static method or operator → bind from Object's
-                        // ClassInfo.  Operator fields (_op_add etc.) are mapped
-                        // to ClassInfo names ("operator+" etc.) and matched by
-                        // name only (param types differ structurally between
-                        // interface and impl, e.g. IVec2 vs Vec2Impl).
-                        // Named methods match by param-type signature +
-                        // return type.  Both search the base hierarchy.
                         using TM = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         constexpr auto ci_name = detail::field_to_classinfo_name(nm_sv);
-                        // Compute expected const-ness per overload at compile time.
-                        // GCC 16.2 can't return std::vector from constexpr, so we
-                        // use define_static_array + template-for to build it.
                         static constexpr auto exp_const_arr = []() consteval {
                             return std::define_static_array(
                                 detail::field_const_quals(^^T, nm_sv));
@@ -914,7 +853,6 @@ class Proxy {
                         auto exp_returns = TM::expected_return_types();
                         std::ptrdiff_t method_off = 0;
                         if constexpr (detail::is_op_field(nm_sv)) {
-                            // Operator: match by name only (first overload).
                             for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
                                 auto r = detail::find_function_by_name_in_hierarchy(
                                     info, key);
@@ -923,19 +861,11 @@ class Proxy {
                                         "Proxy: no operator '" + key +
                                         "' in type '" +
                                         std::string(obj_.class_name()) + "'");
-                                if (oi < exp_const_arr.size()
-                                    && r.fi->is_const != exp_const_arr[oi])
-                                    throw std::runtime_error(
-                                        "Proxy: const-ness mismatch on '" + key +
-                                        "' — interface expects " +
-                                        (exp_const_arr[oi] ? "const" : "non-const") +
-                                        ", impl is " +
-                                        (r.fi->is_const ? "const" : "non-const"));
+                                check_const_qual(exp_const_arr, oi, r.fi, key);
                                 vec.push_back({r.fi->invoker});
                                 method_off = r.offset;
                             }
                         } else {
-                            // Named method: match by name + param-type + return type + const.
                             for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
                                 auto r = detail::find_function_in_hierarchy(
                                     info, key, exp_params[oi]);
@@ -953,14 +883,7 @@ class Proxy {
                                         exp_returns[oi] +
                                         "', impl returns '" +
                                         r.fi->return_type + "'");
-                                if (oi < exp_const_arr.size()
-                                    && r.fi->is_const != exp_const_arr[oi])
-                                    throw std::runtime_error(
-                                        "Proxy: const-ness mismatch on '" + key +
-                                        "' — interface expects " +
-                                        (exp_const_arr[oi] ? "const" : "non-const") +
-                                        ", impl is " +
-                                        (r.fi->is_const ? "const" : "non-const"));
+                                check_const_qual(exp_const_arr, oi, r.fi, key);
                                 vec.push_back({r.fi->invoker});
                                 method_off = r.offset;
                             }
@@ -970,8 +893,6 @@ class Proxy {
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
                     } else {
-                        // Non-static data member → bind from Object's ClassInfo.
-                        // Searches the base hierarchy for inherited fields.
                         using TP = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
