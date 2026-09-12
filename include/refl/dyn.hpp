@@ -60,7 +60,9 @@ struct FixedString {
 // ---------------------------------------------------------------------------
 template <typename T>
 class Dyn {
+protected:
     std::shared_ptr<Mockable<T>> mockable_;
+private:
     std::shared_ptr<T> obj_;
     bool dynamic_mode_ = false;
     Proxy<T> proxy_;
