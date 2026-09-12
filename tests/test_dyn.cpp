@@ -72,9 +72,18 @@ struct DoubleReturn { double compute(int x) { return x * 1.5; } };
 struct IConstMethod { int compute(int) const; };
 struct NonConstImpl { int compute(int x) { return x; } };
 
+// For const-impl-satisfies-nonconst-interface test: a const impl method is a
+// valid (stronger) match for a non-const interface declaration — calling a
+// const method on a non-const object is fine.
+struct INonConstSet { int set(int); };
+struct ConstSetImpl { int v; ConstSetImpl() : v(0) {} int set(int x) const { return x; } };
+
 // For non-owning/shared_ptr Proxy tests.
 struct ISimple { int get_value(); };
 struct SimpleImpl { int v; SimpleImpl(int v) : v(v) {} int get_value() { return v; } };
+// Second impl type with the same ISimple interface — lets a failed-rebind test
+// distinguish which object the proxy reports/dispatches to by class name.
+struct SimpleImplB { int v; SimpleImplB(int v) : v(v) {} int get_value() { return v; } };
 
 // For Proxy operator tests.
 struct IVec2 {
@@ -188,7 +197,9 @@ struct MoveOnlyProp {
 [[maybe_unused]] static refl::Reg<HasPartial> reg_has_partial;
 [[maybe_unused]] static refl::Reg<DoubleReturn> reg_double_return;
 [[maybe_unused]] static refl::Reg<NonConstImpl> reg_nonconst_impl;
+[[maybe_unused]] static refl::Reg<ConstSetImpl> reg_const_set;
 [[maybe_unused]] static refl::Reg<SimpleImpl> reg_simple_impl;
+[[maybe_unused]] static refl::Reg<SimpleImplB> reg_simple_impl_b;
 [[maybe_unused]] static refl::Reg<Vec2Impl> reg_vec2_impl;
 [[maybe_unused]] static refl::Reg<Vec2Other> reg_vec2_other;
 [[maybe_unused]] static refl::Reg<ScalableImpl> reg_scalable_impl;
@@ -492,6 +503,16 @@ int main() {
     }
     CHECK(threw_const, "Proxy<IConstMethod> should throw — const-ness mismatch (interface const, impl non-const)");
 
+    // === Proxy: const impl satisfies non-const interface declaration ===
+    // A const impl method is a valid (stronger) match for a non-const
+    // interface: calling a const method on a non-const object is fine, so
+    // the bind should succeed and the method should be callable.
+    {
+        auto sp = std::make_shared<ConstSetImpl>();
+        refl::Proxy<INonConstSet> p(sp);
+        CHECK(p->set(7) == 7, "const impl for non-const interface should bind and call");
+    }
+
     // === Proxy: non-owning Object rejected ===
     // A non-owning Object (borrow) must be rejected — the proxy outlives it.
     SimpleImpl stack_impl(42);
@@ -510,6 +531,31 @@ int main() {
     refl::Proxy<ISimple> psp(sp);
     CHECK(psp.is_bound(), "Proxy from shared_ptr should be bound");
     CHECK(psp->get_value() == 42, "shared_ptr-backed Proxy get_value() should be 42");
+
+    // === Proxy: failed rebind leaves proxy bound to original object ===
+    // bind() validates ownership before replacing obj_, so a rejected
+    // (non-owning) rebind must not disturb the existing binding: get_class
+    // and calls should still report/dispatch to the original object.
+    {
+        auto sp1 = std::make_shared<SimpleImpl>(11);
+        refl::Proxy<ISimple> p(sp1);
+        CHECK(p->get_value() == 11, "original binding value 11");
+
+        SimpleImplB stack_obj(22);
+        refl::Object borrowed(stack_obj);  // non-owning, different type
+        bool threw = false;
+        try {
+            p.bind(borrowed);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw, "rebind to non-owning Object should throw");
+        CHECK(p.is_bound(), "proxy should still be bound after failed rebind");
+        CHECK(std::string(p.get_class().name()) == "SimpleImpl",
+            "get_class should still report original type SimpleImpl after failed rebind");
+        CHECK(p->get_value() == 11,
+            "calls should still dispatch to original object (value 11) after failed rebind");
+    }
 
     // === Proxy operators ===
     // Happy path: same impl type on both proxies.

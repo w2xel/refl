@@ -545,8 +545,8 @@ class Proxy {
     Object obj_;
     std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
 
-    void check_owned() {
-        if (obj_.valid() && !obj_.is_owned())
+    static void check_owned(const Object& obj) {
+        if (obj.valid() && !obj.is_owned())
             throw std::runtime_error(
                 "Proxy: non-owning Object cannot be bound — the proxy "
                 "outlives the borrow. Use a shared_ptr-backed Object.");
@@ -562,16 +562,18 @@ class Proxy {
     }
 
     // Check the impl's const-ness matches the interface's for one overload.
+    // A const impl satisfies a non-const interface declaration (const is the
+    // stronger guarantee — calling a const method on a non-const object is
+    // fine).  Only the reverse is a contract violation: a non-const impl
+    // cannot satisfy a const interface requirement.
     // Shared by operator and named-method binding paths.
     template <typename ConstArr>
     static void check_const_qual(const ConstArr& exp_const,
             std::size_t oi, const FunctionInfo* fi, std::string_view key) {
-        if (oi < exp_const.size() && fi->is_const != exp_const[oi])
+        if (oi < exp_const.size() && exp_const[oi] && !fi->is_const)
             throw std::runtime_error(
                 "Proxy: const-ness mismatch on '" + std::string(key) +
-                "' — interface expects " +
-                (exp_const[oi] ? "const" : "non-const") +
-                ", impl is " + (fi->is_const ? "const" : "non-const"));
+                "' — interface expects const, impl is non-const");
     }
 
     void populate() {
@@ -693,8 +695,8 @@ public:
     //
     //   auto sp = std::make_shared<Square>(4);
     //   refl::Proxy<IDrawable> p(sp);   // implicit, owning
-    explicit Proxy(Object obj) : obj_(std::move(obj)) { check_owned(); populate(); }
-    void bind(Object obj) { obj_ = std::move(obj); check_owned(); populate(); }
+    explicit Proxy(Object obj) : obj_(std::move(obj)) { check_owned(obj_); populate(); }
+    void bind(Object obj) { check_owned(obj); obj_ = std::move(obj); populate(); }
 
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }
