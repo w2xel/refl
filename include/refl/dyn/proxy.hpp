@@ -299,11 +299,11 @@ struct TypedProperty {
     // Expected type name of the proxied data member, normalized for
     // comparison against the impl's ClassInfo field type.  Both sides use
     // normalize_type so const-qualifier differences (the interface strips
-    // const via remove_cv_t, the impl stores the raw display string) don't
-    // cause false mismatches.
+    // cv-ref via remove_cvref_t, the impl stores the raw display string)
+    // don't cause false mismatches.
     static std::string expected_type() {
         return std::string(detail::normalize_type(
-            detail::type_name<std::remove_cvref_t<T>>()));
+            detail::type_name<T>()));
     }
 };
 
@@ -341,7 +341,7 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
             && std::meta::identifier_of(m) == name) {
             auto mt = std::meta::type_of(m);
             bool is_const = std::meta::is_const_type(mt);
-            auto clean_mt = std::meta::substitute(^^std::remove_cv_t,
+            auto clean_mt = std::meta::substitute(^^std::remove_cvref_t,
                 std::initializer_list<std::meta::info>{mt});
             return std::meta::substitute(^^TypedProperty,
                 {clean_mt, std::meta::reflect_constant(is_const)});
@@ -514,13 +514,9 @@ template <typename T>
 class Proxy {
     struct Dispatch;
     consteval {
-        if constexpr (std::is_class_v<T>) {
-            std::vector<std::meta::info> specs;
-            detail::make_dispatch_specs(^^T, false, specs);
-            std::meta::define_aggregate(^^Dispatch, specs);
-        } else {
-            std::meta::define_aggregate(^^Dispatch, {});
-        }
+        std::vector<std::meta::info> specs;
+        detail::make_dispatch_specs(^^T, false, specs);
+        std::meta::define_aggregate(^^Dispatch, specs);
     }
 
     Dispatch dispatch_;
@@ -557,85 +553,83 @@ class Proxy {
     }
 
     void populate() {
-        if constexpr (std::is_class_v<T>) {
-            if (!obj_.valid()) return;
-            overload_storage_.clear();
-            const ClassInfo* info = detail::lookup_class_info(obj_.class_name());
-            if (!info)
-                throw std::runtime_error(
-                    "Proxy: object type '" + std::string(obj_.class_name()) +
-                    "' is not registered in the reflection pool");
-            static constexpr auto dm = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^Dispatch,
-                    std::meta::access_context::unchecked()));
-            template for (constexpr auto field : dm) {
-                if constexpr (std::meta::has_identifier(field)) {
-                    using FieldType = [:std::meta::type_of(field):];
-                    if constexpr (detail::is_typed_method_v<
-                            std::remove_cv_t<FieldType>>) {
-                        using TM = std::remove_cv_t<FieldType>;
-                        dispatch_.[:field:].owner = obj_.owner();
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto exp_const_arr = []() consteval {
-                            return std::define_static_array(
-                                detail::collect_const_quals(^^T, nm_sv));
-                        }();
-                        auto key = std::string(nm_sv);
-                        auto& vec = overload_storage_[key];
-                        auto exp_params = TM::expected_param_types();
-                        auto exp_returns = TM::expected_return_types();
-                        std::ptrdiff_t method_off = 0;
-                        for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
-                            auto r = detail::find_function_in_hierarchy(
-                                info, key, exp_params[oi]);
-                            if (!r.fi)
-                                throw std::runtime_error(
-                                    "Proxy: no matching overload for '" + key +
-                                    "' with params [" +
-                                    join_types(exp_params[oi]) +
-                                    "] in type '" +
-                                    std::string(obj_.class_name()) + "'");
-                            if (detail::normalize_type(r.fi->return_type)
-                                    != exp_returns[oi])
-                                throw std::runtime_error(
-                                    "Proxy: return type mismatch on '" +
-                                    key + "' — interface expects '" +
-                                    exp_returns[oi] +
-                                    "', impl returns '" +
-                                    r.fi->return_type + "'");
-                            check_const_qual(exp_const_arr, oi, r.fi, key);
-                            vec.push_back({r.fi->invoker});
-                            method_off = r.offset;
-                        }
-                        dispatch_.[:field:].obj =
-                            static_cast<char*>(obj_.raw()) + method_off;
-                        dispatch_.[:field:].overloads = vec.data();
-                        dispatch_.[:field:].num = vec.size();
-                    } else {
-                        using TP = std::remove_cv_t<FieldType>;
-                        dispatch_.[:field:].owner = obj_.owner();
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        auto key = std::string(nm_sv);
-                        auto exp_type = TP::expected_type();
-                        auto r = detail::find_field_in_hierarchy(info, key);
+        if (!obj_.valid()) return;
+        overload_storage_.clear();
+        const ClassInfo* info = detail::lookup_class_info(obj_.class_name());
+        if (!info)
+            throw std::runtime_error(
+                "Proxy: object type '" + std::string(obj_.class_name()) +
+                "' is not registered in the reflection pool");
+        static constexpr auto dm = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch,
+                std::meta::access_context::unchecked()));
+        template for (constexpr auto field : dm) {
+            if constexpr (std::meta::has_identifier(field)) {
+                using FieldType = [:std::meta::type_of(field):];
+                if constexpr (detail::is_typed_method_v<
+                        std::remove_cv_t<FieldType>>) {
+                    using TM = std::remove_cv_t<FieldType>;
+                    dispatch_.[:field:].owner = obj_.owner();
+                    constexpr auto nm_sv = std::meta::identifier_of(field);
+                    static constexpr auto exp_const_arr = []() consteval {
+                        return std::define_static_array(
+                            detail::collect_const_quals(^^T, nm_sv));
+                    }();
+                    auto key = std::string(nm_sv);
+                    auto& vec = overload_storage_[key];
+                    auto exp_params = TM::expected_param_types();
+                    auto exp_returns = TM::expected_return_types();
+                    std::ptrdiff_t method_off = 0;
+                    for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
+                        auto r = detail::find_function_in_hierarchy(
+                            info, key, exp_params[oi]);
                         if (!r.fi)
                             throw std::runtime_error(
-                                "Proxy: no field '" + key +
-                                "' in type '" +
+                                "Proxy: no matching overload for '" + key +
+                                "' with params [" +
+                                join_types(exp_params[oi]) +
+                                "] in type '" +
                                 std::string(obj_.class_name()) + "'");
-                        auto impl_type = detail::normalize_type(r.fi->type);
-                        if (impl_type != exp_type)
+                        if (detail::normalize_type(r.fi->return_type)
+                                != exp_returns[oi])
                             throw std::runtime_error(
-                                "Proxy: field type mismatch on '" + key +
-                                "' — interface expects '" + exp_type +
-                                "', impl has '" + impl_type + "'");
-                        dispatch_.[:field:].obj =
-                            static_cast<char*>(obj_.raw()) + r.offset;
-                        dispatch_.[:field:].member_offset =
-                            static_cast<std::size_t>(r.fi->offset);
-                        dispatch_.[:field:].getter = r.fi->getter;
-                        dispatch_.[:field:].setter = r.fi->setter;
+                                "Proxy: return type mismatch on '" +
+                                key + "' — interface expects '" +
+                                exp_returns[oi] +
+                                "', impl returns '" +
+                                r.fi->return_type + "'");
+                        check_const_qual(exp_const_arr, oi, r.fi, key);
+                        vec.push_back({r.fi->invoker});
+                        method_off = r.offset;
                     }
+                    dispatch_.[:field:].obj =
+                        static_cast<char*>(obj_.raw()) + method_off;
+                    dispatch_.[:field:].overloads = vec.data();
+                    dispatch_.[:field:].num = vec.size();
+                } else {
+                    using TP = std::remove_cv_t<FieldType>;
+                    dispatch_.[:field:].owner = obj_.owner();
+                    constexpr auto nm_sv = std::meta::identifier_of(field);
+                    auto key = std::string(nm_sv);
+                    auto exp_type = TP::expected_type();
+                    auto r = detail::find_field_in_hierarchy(info, key);
+                    if (!r.fi)
+                        throw std::runtime_error(
+                            "Proxy: no field '" + key +
+                            "' in type '" +
+                            std::string(obj_.class_name()) + "'");
+                    auto impl_type = detail::normalize_type(r.fi->type);
+                    if (impl_type != exp_type)
+                        throw std::runtime_error(
+                            "Proxy: field type mismatch on '" + key +
+                            "' — interface expects '" + exp_type +
+                            "', impl has '" + impl_type + "'");
+                    dispatch_.[:field:].obj =
+                        static_cast<char*>(obj_.raw()) + r.offset;
+                    dispatch_.[:field:].member_offset =
+                        static_cast<std::size_t>(r.fi->offset);
+                    dispatch_.[:field:].getter = r.fi->getter;
+                    dispatch_.[:field:].setter = r.fi->setter;
                 }
             }
         }
