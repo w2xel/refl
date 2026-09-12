@@ -271,12 +271,19 @@ struct TypedProperty {
     }
 
     // operator[] — returns a reference to the element in the actual object.
-    // Only available when T is subscriptable (std::array, std::vector, etc.).
+    // Only available when T is subscriptable (std::array, std::vector, etc.)
+    // and the member is not Readonly.  A const member's element type would
+    // be const-qualified, but operator[] returns a mutable reference — so
+    // Readonly properties are excluded entirely to avoid a write path that
+    // bypasses the const contract (the whole-object operator= is already
+    // deleted for Readonly).  Read individual elements of a const container
+    // via the implicit conversion to T (a copy) instead.
     // ponytail: no bounds check — out-of-range index is UB, same as raw
     // operator[] on the underlying container.  The caller owns the index.
     template <typename Self>
     auto& operator[](this Self&& self, std::size_t i)
-        requires requires { typename std::remove_cvref_t<T>::value_type; }
+        requires (!Readonly)
+              && requires { typename std::remove_cvref_t<T>::value_type; }
     {
         return reinterpret_cast<std::remove_cv_t<T>*>(
             static_cast<char*>(self.obj) + self.member_offset)->operator[](i);
@@ -691,13 +698,16 @@ public:
                 std::string(arg.class_name()) + "' in '" + \
                 std::string(obj_.class_name()) + "'"); \
         if constexpr (std::is_void_v<R>) return; \
-        else if constexpr (std::is_same_v<R, bool>) \
-            return std::move(*static_cast<bool*>(result->raw())); \
         else if constexpr (std::is_class_v<std::remove_cvref_t<R>>) \
             return Proxy(std::move(*result)); \
-        else \
-            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
-                result->raw())); \
+        else { \
+            auto cr = result->template cast_ref<std::remove_cvref_t<R>>(); \
+            if (!cr) throw std::runtime_error( \
+                "Proxy: " op_name " — return type mismatch: interface expects '" \
+                + std::string(detail::type_name<std::remove_cvref_t<R>>()) \
+                + "', impl returns '" + std::string(result->class_name()) + "'"); \
+            return std::move(*cr.value()); \
+        } \
     } \
     template <typename U> \
         requires (!std::is_same_v<std::remove_cvref_t<U>, Proxy>) \
@@ -713,13 +723,16 @@ public:
                 std::string(arg.class_name()) + "' in '" + \
                 std::string(obj_.class_name()) + "'"); \
         if constexpr (std::is_void_v<R>) return; \
-        else if constexpr (std::is_same_v<R, bool>) \
-            return std::move(*static_cast<bool*>(result->raw())); \
         else if constexpr (std::is_class_v<std::remove_cvref_t<R>>) \
             return Proxy(std::move(*result)); \
-        else \
-            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
-                result->raw())); \
+        else { \
+            auto cr = result->template cast_ref<std::remove_cvref_t<R>>(); \
+            if (!cr) throw std::runtime_error( \
+                "Proxy: " op_name " — return type mismatch: interface expects '" \
+                + std::string(detail::type_name<std::remove_cvref_t<R>>()) \
+                + "', impl returns '" + std::string(result->class_name()) + "'"); \
+            return std::move(*cr.value()); \
+        } \
     }
 
     PROXY_BINARY_OP(+, "operator+")

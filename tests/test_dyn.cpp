@@ -131,6 +131,27 @@ struct OverOpImpl {
     int operator+(int) const { return 1010; }
 };
 
+// For Proxy operator return-type mismatch tests — interface declares a
+// primitive return, impl returns a different primitive type.  The proxy
+// must detect the mismatch at call time, not reinterpret the storage.
+struct IIntAdd { int v; IIntAdd(int v) : v(v) {} int operator+(int) const; };
+struct LongAddImpl {
+    int v;
+    LongAddImpl(int v) : v(v) {}
+    long operator+(int x) const { return static_cast<long>(v) + x; }
+};
+
+// For Proxy readonly-array operator[] tests — a const array member must
+// not expose a mutable operator[] that bypasses the Readonly contract.
+struct IConstArr {
+    const std::array<int, 2> data;
+    IConstArr() : data{10, 20} {}
+};
+struct ConstArrImpl {
+    const std::array<int, 2> data;
+    ConstArrImpl() : data{10, 20} {}
+};
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
@@ -142,12 +163,24 @@ struct OverOpImpl {
 [[maybe_unused]] static refl::Reg<Vec2Other> reg_vec2_other;
 [[maybe_unused]] static refl::Reg<ScalableImpl> reg_scalable_impl;
 [[maybe_unused]] static refl::Reg<OverOpImpl> reg_overop_impl;
+[[maybe_unused]] static refl::Reg<LongAddImpl> reg_long_add;
+[[maybe_unused]] static refl::Reg<ConstArrImpl> reg_const_arr;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
         std::fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); \
         return 1; \
     } } while (0)
+
+// Trait: does a TypedProperty expose operator[]?  Uses void_t (SFINAE)
+// rather than a requires-expression, because GCC 16.2 reports a hard
+// error (not a soft false) when a deducing-this candidate's constraints
+// fail inside a requires-expression.
+template <typename, typename = void>
+struct has_subscript : std::false_type {};
+template <typename P>
+struct has_subscript<P, std::void_t<decltype(std::declval<P&>()[std::size_t{}])>>
+    : std::true_type {};
 
 int main() {
     // === Dyn<T> dispatch-struct tests ===
@@ -503,6 +536,41 @@ int main() {
         // double argument → operator+(double), returns 7070
         int rd = p + 3.0;
         CHECK(rd == 7070, "p + 3.0 (double) should dispatch to operator+(double) -> 7070");
+    }
+
+    // === Proxy: operator primitive return-type mismatch throws at call time ===
+    // Interface declares operator+(int) returning int; impl returns long.
+    // The proxy must not reinterpret the long storage as int — it must throw.
+    {
+        auto sp = std::make_shared<LongAddImpl>(1);
+        refl::Proxy<IIntAdd> p(sp);
+        bool threw = false;
+        try {
+            int r = p + 41;
+            (void)r;
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw, "operator+ with mismatched primitive return (int vs long) should throw");
+    }
+
+    // === Proxy: readonly array operator[] is not exposed ===
+    // A const array member has Readonly=true, so operator[] must not exist.
+    // This is a compile-time guarantee: the requires(!Readonly) clause
+    // removes operator[] from the overload set.
+    {
+        auto sp = std::make_shared<ConstArrImpl>();
+        refl::Proxy<IConstArr> p(sp);
+        using DataProp = decltype(p->data);
+        CHECK(DataProp::is_readonly(), "const array data should be Readonly");
+        static_assert(!has_subscript<DataProp>::value,
+            "readonly array must not expose operator[]");
+        static_assert(has_subscript<refl::TypedProperty<std::array<int,2>, false>>::value,
+            "non-readonly array must expose operator[]");
+        // Read the whole array via the copy conversion (the safe read path).
+        std::array<int, 2> copy = p->data;
+        CHECK(copy[0] == 10, "readonly array read via copy: data[0] == 10");
+        CHECK(copy[1] == 20, "readonly array read via copy: data[1] == 20");
     }
 
     std::printf("dyn dispatch test ok\n");
