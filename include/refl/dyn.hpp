@@ -550,6 +550,16 @@ class Dyn {
     // Dynamic properties (runtime-added, not reflected from T).
     std::map<std::string, Object> dynamic_props_;
 
+    // Shared callback-dispatcher for both after_call (method hooks) and
+    // after_set (property-change hooks).  ctx points at the
+    // std::vector<std::function<void(Object&)>> stored in invoke_hooks_ or
+    // change_hooks_ (std::map nodes are stable).
+    static void fire_hooks(void* ctx, Object& result) {
+        auto* v = static_cast<
+            std::vector<std::function<void(Object&)>>*>(ctx);
+        for (auto& cb : *v) cb(result);
+    }
+
     // --- Dynamic mode: runtime callable storage + trampolines.
     //     When T is abstract, no object is constructed; instead, implement()
     //     wires each method to a runtime-provided callable.
@@ -781,6 +791,9 @@ public:
                     if (std::meta::is_function(m)
                         && std::meta::has_identifier(m)
                         && !std::meta::is_static_member(m)
+                        && std::meta::is_public(m)
+                        && !std::meta::is_deleted(m)
+                        && !detail::is_consteval_fn(m)
                         && std::meta::identifier_of(m) == Name.sv())
                         return true;
                 }
@@ -791,6 +804,9 @@ public:
                 if constexpr (std::meta::is_function(m)
                               && std::meta::has_identifier(m)
                               && !std::meta::is_static_member(m)
+                              && std::meta::is_public(m)
+                              && !std::meta::is_deleted(m)
+                              && !detail::is_consteval_fn(m)
                               && std::meta::identifier_of(m) == Name.sv()) {
                     implement<m>(std::move(fn));
                 }
@@ -835,12 +851,7 @@ public:
                     if (name == std::string_view(nm)) {
                         auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
                         tm->hook_ctx = &vec;
-                        tm->after_call = +[](void* ctx, Object& r) {
-                            auto* v = static_cast<
-                                std::vector<std::function<void(Object&)>>*>(
-                                    ctx);
-                            for (auto& cb : *v) cb(r);
-                        };
+                        tm->after_call = &fire_hooks;
                     }
                 }
             }
@@ -870,12 +881,7 @@ public:
                     if (name == std::string_view(nm)) {
                         auto* tp = static_cast<std::remove_cv_t<FT>*>(field);
                         tp->hook_ctx = &vec;
-                        tp->after_set = +[](void* ctx, Object& v) {
-                            auto* vct = static_cast<
-                                std::vector<std::function<void(Object&)>>*>(
-                                    ctx);
-                            for (auto& cb : *vct) cb(v);
-                        };
+                        tp->after_set = &fire_hooks;
                     }
                 }
             }
@@ -911,44 +917,16 @@ public:
     }
 
     // Connect a method on this object to a method on another Dyn<T>.
-    // When this->name fires, it calls other->slot_name via operator->.
+    // When this->name fires, it calls other->slot_name via emit().
     // Both Dyn<T> instances must be kept alive (raw pointers — Dyn is
     // non-movable so addresses are stable, like Qt's connect).
     void connect(std::string_view name, Dyn* other,
                   std::string_view slot_name) {
-        auto key = std::string(name);
         auto slot = std::string(slot_name);
         auto* other_ptr = other;
-        invoke_hooks_[key].push_back([other_ptr, slot](Object& r) {
-            // Forward the result to the other object's slot hooks.
+        connect(name, [other_ptr, slot](Object& r) {
             other_ptr->emit(slot, r);
         });
-        // Re-wire the field to fire the vector (same as connect above).
-        void* field = find_field(name);
-        if (!field) return;
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto f : dm) {
-            if constexpr (std::meta::has_identifier(f)
-                          && std::meta::identifier_of(f) != "obj") {
-                using FT = [:std::meta::type_of(f):];
-                if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
-                    constexpr auto nm_sv = std::meta::identifier_of(f);
-                    constexpr auto nm = std::define_static_string(nm_sv);
-                    if (name == std::string_view(nm)) {
-                        auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
-                        tm->hook_ctx = &invoke_hooks_[key];
-                        tm->after_call = +[](void* ctx, Object& r) {
-                            auto* v = static_cast<
-                                std::vector<std::function<void(Object&)>>*>(
-                                    ctx);
-                            for (auto& cb : *v) cb(r);
-                        };
-                    }
-                }
-            }
-        }
     }
 
     static const Registrar& registrar() { return RegistrarHolder<T>::registrar; }
