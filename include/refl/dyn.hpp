@@ -1,18 +1,19 @@
 // dyn — typed dispatch and dynamic-implementation layer for the refl core.
 //
 // Built on top of refl/refl.hpp (which provides the type-erased reflection
-// pool).  Dyn<T> wraps a shared instance of T and synthesizes a compile-time
-// dispatch struct (via define_aggregate) with named callable fields for each
-// member function and data member, so you get real return types at the call
-// site — no std::any, no std::variant.
+// pool).  Proxy<T> synthesizes a compile-time dispatch struct (via
+// define_aggregate) with named callable fields for each member function and
+// data member of T, so you get real return types at the call site — no
+// std::any, no std::variant.  The object behind the proxy can be any type
+// whose interface is structurally compatible with T (same method names and
+// signatures), not just T itself.
 //
-//   refl::Dyn<Point> p(1, 2);
-//   p->set(10, 20);        // overload resolved by argument type
-//   int s = p->sum();       // real return type
-//   p->x = 42;              // member-like assignment
+//   refl::Proxy<IShape> p;
+//   p.bind<Circle>(5);       // Circle need not inherit IShape
+//   int a = p->area(2);      // real return type, calls Circle::area
 //
-// Also supports runtime method implementation (mocking), Qt-style hooks
-// (connect / on_change / emit), and dynamic properties.
+// Dyn<T> extends this with runtime method implementation (mocking), Qt-style
+// hooks (connect / on_change / emit), and dynamic properties.
 //
 // This layer is experimental and likely to change.
 #pragma once
@@ -24,6 +25,232 @@
 #include <functional>
 #include <map>
 namespace refl {
+// ---------------------------------------------------------------------------
+// Proxy<T> — typed dispatch struct with structural implementation binding.
+//
+// Synthesizes a Dispatch struct from T's public interface at compile time
+// (same field types as Dyn<T>: TypedMethod, TypedProperty, etc.).  At
+// runtime, bind<Impl>(args...) constructs an Impl object and wires the
+// dispatch fields from Impl's ClassInfo — so calls through the proxy
+// dispatch to Impl's methods with T's typed return types.
+//
+// Impl need not inherit T.  Matching is by method name (overloads in
+// declaration order, same as Dyn).  This is structural typing through the
+// reflection pool: any type with compatible public methods works.
+//
+//   struct IShape { virtual int area(int) = 0; virtual ~IShape() = default; };
+//   struct Circle { int r; Circle(int r) : r(r) {} int area(int s) const { ... } };
+//
+//   refl::Proxy<IShape> p;
+//   p.bind<Circle>(5);
+//   int a = p->area(2);   // calls Circle::area, returns int
+//
+// Proxy<T> is non-copyable, non-movable (dispatch fields point into it).
+// ---------------------------------------------------------------------------
+template <typename T>
+class Proxy {
+    struct Dispatch;
+    consteval {
+        if constexpr (std::is_class_v<T>) {
+            static constexpr auto members = std::define_static_array(
+                std::meta::members_of(^^T,
+                    std::meta::access_context::unchecked()));
+            std::vector<std::meta::info> specs;
+            std::vector<std::string> seen_fns;
+            template for (constexpr auto m : members) {
+                if constexpr (detail::is_public_method(m)
+                              && std::meta::has_identifier(m)
+                              && !std::meta::is_static_member(m)) {
+                    constexpr auto nm = std::meta::identifier_of(m);
+                    auto nm_str = std::string(nm);
+                    bool dup = false;
+                    for (const auto& s : seen_fns)
+                        if (s == nm_str) { dup = true; break; }
+                    if (!dup) {
+                        seen_fns.push_back(nm_str);
+                        constexpr auto field_type =
+                            detail::make_typed_method_type(^^T, nm);
+                        specs.push_back(std::meta::data_member_spec(
+                            field_type, {.name=nm_str}));
+                    }
+                }
+            }
+            static constexpr auto data_members = std::define_static_array(
+                std::meta::nonstatic_data_members_of(^^T,
+                    std::meta::access_context::unchecked()));
+            std::vector<std::string> seen_fields;
+            template for (constexpr auto m : data_members) {
+                if constexpr (detail::is_public_data_member(m)
+                              && std::meta::has_identifier(m)) {
+                    constexpr auto nm = std::meta::identifier_of(m);
+                    auto nm_str = std::string(nm);
+                    bool dup = false;
+                    for (const auto& s : seen_fields)
+                        if (s == nm_str) { dup = true; break; }
+                    if (!dup) {
+                        seen_fields.push_back(nm_str);
+                        constexpr auto field_type =
+                            detail::make_property_field_type(^^T, nm);
+                        specs.push_back(std::meta::data_member_spec(
+                            field_type, {.name=nm_str}));
+                    }
+                }
+            }
+            // Static data members → TypedStaticProperty.
+            static constexpr auto static_data = std::define_static_array(
+                std::meta::static_data_members_of(^^T,
+                    std::meta::access_context::unchecked()));
+            std::vector<std::string> seen_static;
+            template for (constexpr auto m : static_data) {
+                if constexpr (std::meta::has_identifier(m)
+                              && std::meta::is_public(m)) {
+                    constexpr auto nm = std::meta::identifier_of(m);
+                    auto nm_str = std::string(nm);
+                    bool dup = false;
+                    for (const auto& s : seen_static)
+                        if (s == nm_str) { dup = true; break; }
+                    if (!dup) {
+                        seen_static.push_back(nm_str);
+                        constexpr auto field_type =
+                            detail::make_static_property_type(m);
+                        specs.push_back(std::meta::data_member_spec(
+                            field_type, {.name=nm_str}));
+                    }
+                }
+            }
+            // Static member functions → TypedStaticMethod.
+            std::vector<std::string> seen_static_fns;
+            template for (constexpr auto m : members) {
+                if constexpr (detail::is_public_method(m)
+                              && std::meta::has_identifier(m)
+                              && std::meta::is_static_member(m)) {
+                    constexpr auto nm = std::meta::identifier_of(m);
+                    auto nm_str = std::string(nm);
+                    bool dup = false;
+                    for (const auto& s : seen_static_fns)
+                        if (s == nm_str) { dup = true; break; }
+                    if (!dup) {
+                        seen_static_fns.push_back(nm_str);
+                        constexpr auto field_type =
+                            detail::make_static_method_type(m);
+                        specs.push_back(std::meta::data_member_spec(
+                            field_type, {.name=nm_str}));
+                    }
+                }
+            }
+            // No obj field — Proxy stores the object separately as
+            // shared_ptr<void> since the actual type differs from T.
+            std::meta::define_aggregate(^^Dispatch, specs);
+        } else {
+            std::meta::define_aggregate(^^Dispatch, {});
+        }
+    }
+
+    Dispatch dispatch_;
+    std::shared_ptr<void> obj_;
+    // ponytail: overload matching is by name + declaration order, same as Dyn.
+    // If Impl reorders overloads relative to T, the wrong invoker may be picked.
+    // Match by param-type signature would fix this; deferred until needed.
+    std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
+
+    template <typename Impl>
+    static const ClassInfo* lookup_impl_info() {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        auto it = class_pool().find(std::string(detail::type_name<Impl>()));
+        return it != class_pool().end() ? it->second.get() : nullptr;
+    }
+
+    template <typename Impl>
+    void populate() {
+        if constexpr (std::is_class_v<T>) {
+            overload_storage_.clear();
+            const ClassInfo* info = lookup_impl_info<Impl>();
+            if (!info) return;
+            static constexpr auto dm = std::define_static_array(
+                std::meta::nonstatic_data_members_of(^^Dispatch,
+                    std::meta::access_context::unchecked()));
+            template for (constexpr auto field : dm) {
+                if constexpr (std::meta::has_identifier(field)) {
+                    using FieldType = [:std::meta::type_of(field):];
+                    if constexpr (detail::is_typed_method_v<
+                            std::remove_cv_t<FieldType>>) {
+                        // Non-static method → bind from Impl's ClassInfo.
+                        dispatch_.[:field:].obj = obj_.get();
+                        dispatch_.[:field:].owner = obj_;
+                        constexpr auto nm_sv = std::meta::identifier_of(field);
+                        auto key = std::string(nm_sv);
+                        auto& vec = overload_storage_[key];
+                        for (const auto& fi : info->functions)
+                            if (fi.name == key)
+                                vec.push_back({fi.invoker});
+                        dispatch_.[:field:].overloads = vec.data();
+                        dispatch_.[:field:].num = vec.size();
+                    } else if constexpr (detail::is_typed_static_method_v<
+                            std::remove_cv_t<FieldType>>) {
+                        // Static method → bind from Impl's ClassInfo.
+                        constexpr auto nm_sv = std::meta::identifier_of(field);
+                        auto key = std::string(nm_sv);
+                        for (const auto& fi : info->static_functions)
+                            if (fi.name == key) {
+                                dispatch_.[:field:].invoker = fi.invoker;
+                                break;
+                            }
+                    } else if constexpr (detail::is_typed_static_property_v<
+                            std::remove_cv_t<FieldType>>) {
+                        // Static property → bind from Impl's ClassInfo.
+                        constexpr auto nm_sv = std::meta::identifier_of(field);
+                        auto key = std::string(nm_sv);
+                        for (const auto& fi : info->static_fields)
+                            if (fi.name == key) {
+                                dispatch_.[:field:].getter = fi.getter;
+                                dispatch_.[:field:].setter = fi.setter;
+                                break;
+                            }
+                    } else {
+                        // Non-static data member → bind from Impl's ClassInfo.
+                        dispatch_.[:field:].obj = obj_.get();
+                        dispatch_.[:field:].owner = obj_;
+                        constexpr auto nm_sv = std::meta::identifier_of(field);
+                        auto key = std::string(nm_sv);
+                        for (const auto& fi : info->fields)
+                            if (fi.name == key) {
+                                dispatch_.[:field:].member_offset =
+                                    static_cast<std::size_t>(fi.offset);
+                                dispatch_.[:field:].getter = fi.getter;
+                                dispatch_.[:field:].setter = fi.setter;
+                                break;
+                            }
+                    }
+                }
+            }
+        }
+    }
+
+public:
+    Proxy() = default;
+
+    // Construct an Impl object and wire T's dispatch fields to Impl's
+    // methods.  Impl need not inherit T — matching is by method name.
+    template <typename Impl, typename... Args>
+    void bind(Args&&... args) {
+        ensure_registered<Impl>();
+        if constexpr (std::is_class_v<T> && std::is_class_v<Impl>) {
+            obj_ = std::make_shared<Impl>(std::forward<Args>(args)...);
+            populate<Impl>();
+        }
+    }
+
+    auto* operator->() { return &dispatch_; }
+    const auto* operator->() const { return &dispatch_; }
+
+    bool is_bound() const { return obj_ != nullptr; }
+
+    Proxy(const Proxy&) = delete;
+    Proxy(Proxy&&) = delete;
+    Proxy& operator=(const Proxy&) = delete;
+    Proxy& operator=(Proxy&&) = delete;
+};
+
 // ---------------------------------------------------------------------------
 // Dyn<T> — typed proxy with compile-time-synthesized dispatch struct.
 //

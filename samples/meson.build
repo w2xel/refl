@@ -16,3 +16,10 @@ executable(
   include_directories: inc,
   install: false,
 )
+
+executable(
+  'proxy_sample',
+  'proxy.cpp',
+  include_directories: inc,
+  install: false,
+)
