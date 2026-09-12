@@ -1,4 +1,5 @@
-// Mockable<T> test: mocking + method hooks + property hooks through Proxy<T>.
+// Mockable<T> test: mocking + virtual properties through Proxy<T>.
+// Hooks are user-side: wrap your lambda to add a hook.
 #include <refl/mockable.hpp>
 
 #include <cstdio>
@@ -20,10 +21,10 @@ struct ICalculator {
     virtual ~ICalculator() = default;
 };
 
-// Interface with data members (for property tests).
 struct IWidget {
     int width;
     int height;
+    const int id = 7;
     virtual void draw() = 0;
     virtual ~IWidget() = default;
 };
@@ -46,31 +47,24 @@ int main() {
     m->implement<^^IShape::area>([](int scale) { return scale * 200; });
     CHECK(p->area(5) == 1000, "re-implemented area(5) should be 1000");
 
-    // === Method hook injection after bind ===
+    // === Hook via wrapped lambda (no inject_hook API) ===
     int hook_result = 0;
-    m->inject_hook<^^IShape::area>([&hook_result](refl::Object& r) {
-        hook_result = *r.template cast_ref<int>().value();
+    m->implement<^^IShape::area>([&hook_result](int scale) {
+        int r = scale * 200;
+        hook_result = r;
+        return r;
     });
     (void)p->area(5);
-    CHECK(hook_result == 1000, "method hook should fire with result 1000");
-
-    // === Multiple method hooks accumulate ===
-    int hook2 = 0;
-    m->inject_hook<^^IShape::area>([&hook2](refl::Object& r) {
-        hook2 = *r.template cast_ref<int>().value() + 1;
-    });
-    hook_result = 0;
-    (void)p->area(3);
-    CHECK(hook_result == 600, "first hook should fire (3*200=600)");
-    CHECK(hook2 == 601, "second hook should fire (600+1=601)");
+    CHECK(hook_result == 1000, "wrapped lambda should observe result 1000");
 
     // === Hook on void method ===
     bool void_hook_fired = false;
-    m->inject_hook<^^IShape::set_color>([&void_hook_fired](refl::Object&) {
+    m->implement<^^IShape::set_color>([&last_color, &void_hook_fired](int c) {
+        last_color = c;
         void_hook_fired = true;
     });
     p->set_color(77);
-    CHECK(void_hook_fired, "hook on void method should fire");
+    CHECK(void_hook_fired, "void method hook should fire");
     CHECK(last_color == 77, "set_color should store 77");
 
     // === 2-arg method ===
@@ -79,7 +73,7 @@ int main() {
     auto pc = mc->proxy();
     CHECK(pc->add(3, 4) == 7, "add(3,4) should be 7");
 
-    // === Property mock: set + read through proxy ===
+    // === Stored-value property (sugar) ===
     auto mw = refl::Mockable<IWidget>::create();
     mw->set_property<^^IWidget::width>(42);
     mw->set_property<^^IWidget::height>(24);
@@ -92,32 +86,40 @@ int main() {
     pw->width = 99;
     CHECK(pw->width == 99, "width after write should be 99");
 
-    // === Property on_change hook after bind ===
+    // === Virtual property with hook in the setter ===
     int width_changed_to = 0;
-    mw->on_change<^^IWidget::width>([&width_changed_to](refl::Object& v) {
-        width_changed_to = *v.template cast_ref<int>().value();
-    });
+    int stored_w = 42;
+    mw->implement_property<^^IWidget::width>(
+        [&stored_w]() { return stored_w; },
+        [&width_changed_to, &stored_w](int v) {
+            stored_w = v;
+            width_changed_to = v;
+        }
+    );
     pw->width = 55;
-    CHECK(pw->width == 55, "width after on_change write should be 55");
-    CHECK(width_changed_to == 55, "on_change should fire with value 55");
+    CHECK(pw->width == 55, "width after virtual set should be 55");
+    CHECK(width_changed_to == 55, "setter hook should observe 55");
 
-    // === Multiple property hooks accumulate ===
-    int width_hook2 = 0;
-    mw->on_change<^^IWidget::width>([&width_hook2](refl::Object& v) {
-        width_hook2 = *v.template cast_ref<int>().value() * 2;
-    });
+    // === Read-only virtual property ===
+    mw->implement_property<^^IWidget::height>(
+        []() { return 88; }
+    );
+    CHECK(pw->height == 88, "read-only property should return 88");
+
+    // === Re-implement property to add another hook ===
+    int hook2 = 0;
+    mw->implement_property<^^IWidget::width>(
+        [&stored_w]() { return stored_w; },
+        [&width_changed_to, &hook2, &stored_w](int v) {
+            stored_w = v;
+            width_changed_to = v;
+            hook2 = v * 2;
+        }
+    );
     width_changed_to = 0;
     pw->width = 10;
-    CHECK(width_changed_to == 10, "first on_change should fire with 10");
-    CHECK(width_hook2 == 20, "second on_change should fire with 20");
-
-    // === on_change on height (separate property) ===
-    int height_changed = 0;
-    mw->on_change<^^IWidget::height>([&height_changed](refl::Object& v) {
-        height_changed = *v.template cast_ref<int>().value();
-    });
-    pw->height = 88;
-    CHECK(height_changed == 88, "height on_change should fire with 88");
+    CHECK(width_changed_to == 10, "re-implemented setter hook should fire with 10");
+    CHECK(hook2 == 20, "second hook should fire with 20");
 
     // === Lifetime: Mockable destroyed, Proxy keeps it alive ===
     refl::Proxy<IShape> p2;
