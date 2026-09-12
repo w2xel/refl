@@ -10,11 +10,13 @@
 #include <refl/dyn.hpp>
 #include <cstdio>
 
-// Interface — non-abstract, non-virtual stubs.  Proxy never calls these;
+// Interface — declaration only, no bodies.  Proxy never calls these;
 // they exist solely for compile-time signature extraction via reflection.
+// No link error: the methods are never odr-used (Proxy reflects their
+// signatures, not their addresses).
 struct IDrawable {
-    int render(int /*scale*/) { __builtin_unreachable(); }
-    void set_tint(int /*t*/) { __builtin_unreachable(); }
+    int render(int scale);
+    void set_tint(int t);
 };
 
 // Implementation — same method names and signatures, no inheritance.
