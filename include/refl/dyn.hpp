@@ -55,7 +55,8 @@ struct FixedString {
 // so calls flow: Proxy dispatch → Mockable slot trampoline → user lambda or
 // real invoker.
 //
-// Dyn<T> is non-copyable, non-movable.
+// Dyn<T> is non-copyable.  Movable: the move updates the SelfRef back-
+// pointer so existing lambdas point at the new address.
 // ---------------------------------------------------------------------------
 template <typename T>
 class Dyn {
@@ -148,8 +149,25 @@ public:
     }
 
     Dyn& operator=(const Dyn&) = delete;
-    Dyn(Dyn&&) = delete;
-    Dyn& operator=(Dyn&&) = delete;
+    Dyn(Dyn&& other) noexcept
+        : mockable_(std::move(other.mockable_))
+        , obj_(std::move(other.obj_))
+        , dynamic_mode_(other.dynamic_mode_)
+        , proxy_(std::move(other.proxy_))
+        , self_ref_(std::move(other.self_ref_)) {
+        if (self_ref_) self_ref_->dyn = this;
+    }
+    Dyn& operator=(Dyn&& other) noexcept {
+        if (this != &other) {
+            mockable_ = std::move(other.mockable_);
+            obj_ = std::move(other.obj_);
+            dynamic_mode_ = other.dynamic_mode_;
+            proxy_ = std::move(other.proxy_);
+            self_ref_ = std::move(other.self_ref_);
+            if (self_ref_) self_ref_->dyn = this;
+        }
+        return *this;
+    }
 
     // --- dispatch via Proxy ---
     auto* operator->() { return proxy_.operator->(); }
