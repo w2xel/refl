@@ -42,6 +42,21 @@ namespace refl {
 // The invoker returns Object internally; the cast to the real return
 // type happens inside operator() — the caller never sees Object.
 // No std::function, no heap, no variant.
+//
+// Argument matching is exact (after remove_cvref_t) — no implicit
+// conversions.  Calling p->render(short{2}) against int render(int) is a
+// compile error, not a conversion.  This is stricter than C++ overload
+// resolution but keeps the dispatch unambiguous at compile time.
+//
+// Const-correctness: a const TypedMethod (accessed through a const Proxy
+// or Dyn via operator->() const) blocks non-const overloads — calling a
+// non-const method through a const proxy throws at call time.  Each
+// overload's const-ness is stored at bind time in OverloadEntry::is_const.
+//
+// Reference returns: R& get_ref() returns a real R& into the bound object.
+// The reference's lifetime is tied to the Proxy's bound Object — rebinding
+// or destroying the proxy dangles the reference.  The caller must keep
+// the proxy alive while holding the reference.
 // ---------------------------------------------------------------------------
 
 // Extract R and Args... from a function type R(Args...).
@@ -68,6 +83,7 @@ namespace detail {
 // store std::vector<OverloadEntry> without knowing the specific Sigs pack.
 struct OverloadEntry {
     InvokerFn invoker;
+    bool is_const = false;  // matches the interface overload's const-ness
 };
 
 // consteval: build a function-type reflection R(Args...) from a member.
@@ -83,21 +99,29 @@ consteval std::meta::info make_fn_sig(std::meta::info m) {
 // consteval: collect the const-ness of all overloads for a named method
 // on the interface type, in Sigs-pack order.  Used by populate() to
 // verify the impl's method const-ness matches the interface's.
+// Respects C++ name-hiding: if the type declares any own method of this
+// name, base methods of the same name are hidden and not collected —
+// matching find_function_in_hierarchy on the impl side.
 consteval std::vector<bool> collect_const_quals(std::meta::info type,
                                                    std::string_view name) {
     std::vector<bool> result;
+    bool found_own = false;
     for (auto m : std::meta::members_of(type,
             std::meta::access_context::unchecked())) {
         if (is_public_method(m) && !std::meta::is_static_member(m)
             && std::meta::has_identifier(m)
-            && std::meta::identifier_of(m) == name)
+            && std::meta::identifier_of(m) == name) {
             result.push_back(is_const_method(m));
+            found_own = true;
+        }
     }
-    for (auto b : std::meta::bases_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b)) {
-            auto inherited = collect_const_quals(std::meta::type_of(b), name);
-            for (bool c : inherited) result.push_back(c);
+    if (!found_own) {
+        for (auto b : std::meta::bases_of(type,
+                std::meta::access_context::unchecked())) {
+            if (std::meta::is_public(b)) {
+                auto inherited = collect_const_quals(std::meta::type_of(b), name);
+                for (bool c : inherited) result.push_back(c);
+            }
         }
     }
     return result;
@@ -151,12 +175,19 @@ private:
 
 public:
 
-    template <typename... Args>
-    decltype(auto) operator()(Args&&... args) const {
-        return call_dispatch<0, Args...>(std::forward<Args>(args)...);
+    // Deducing-this: a const TypedMethod (accessed through a const
+    // Proxy/Dyn, i.e. operator->() const) blocks non-const overloads —
+    // a const view cannot mutate the object.  Const is a per-overload
+    // property stored in OverloadEntry::is_const at bind time.
+    template <typename Self, typename... Args>
+    decltype(auto) operator()(this Self&& self, Args&&... args) {
+        constexpr bool ConstCall =
+            std::is_const_v<std::remove_reference_t<Self>>;
+        return self.template call_dispatch<ConstCall, 0, Args...>(
+            std::forward<Args>(args)...);
     }
 
-    template <std::size_t I, typename... Args>
+    template <bool ConstCall, std::size_t I, typename... Args>
     decltype(auto) call_dispatch(Args&&... args) const {
         using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
         if constexpr (matches_sig<Sig, Args...>) {
@@ -164,6 +195,11 @@ public:
             if (!overloads || I >= num)
                 throw std::runtime_error(
                     "Proxy: call to unbound or missing overload");
+            if constexpr (ConstCall) {
+                if (!overloads[I].is_const)
+                    throw std::runtime_error(
+                        "Proxy: non-const method called through const proxy");
+            }
             // Build Object arg array from forwarded args.
             std::tuple<std::decay_t<Args>...> storage(
                 std::forward<Args>(args)...);
@@ -192,7 +228,7 @@ public:
             }
         } else {
             if constexpr (I + 1 < sizeof...(Sigs))
-                return call_dispatch<I + 1, Args...>(std::forward<Args>(args)...);
+                return call_dispatch<ConstCall, I + 1, Args...>(std::forward<Args>(args)...);
             else
                 static_assert(false,
                     "no matching overload for the given argument types");
@@ -324,19 +360,35 @@ consteval void collect_inherited_dms(std::meta::info type,
 }
 
 // consteval: collect all non-static method member reflections from a
-// type and its public bases (for inherited methods).
+// type and its public bases (for inherited methods).  Respects C++
+// name-hiding: if the type declares any own method of a given name,
+// all base methods of that name are hidden — matching
+// find_function_in_hierarchy on the impl side.
 consteval void collect_all_methods(std::meta::info type,
         std::vector<std::meta::info>& out) {
+    std::vector<std::string> own_names;
     for (auto m : std::meta::members_of(type,
             std::meta::access_context::unchecked())) {
         if (is_public_method(m) && std::meta::has_identifier(m)
-            && !std::meta::is_static_member(m))
+            && !std::meta::is_static_member(m)) {
             out.push_back(m);
+            own_names.push_back(std::string(std::meta::identifier_of(m)));
+        }
     }
     for (auto b : std::meta::bases_of(type,
             std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b))
-            collect_all_methods(std::meta::type_of(b), out);
+        if (std::meta::is_public(b)) {
+            auto bt = std::meta::type_of(b);
+            std::vector<std::meta::info> inherited;
+            collect_all_methods(bt, inherited);
+            for (auto m : inherited) {
+                auto nm = std::string(std::meta::identifier_of(m));
+                bool hidden = false;
+                for (const auto& on : own_names)
+                    if (on == nm) { hidden = true; break; }
+                if (!hidden) out.push_back(m);
+            }
+        }
     }
 }
 
@@ -468,9 +520,17 @@ consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
 // fields.  The caller must synchronize.  Calls through operator->() from
 // multiple threads are safe only if no bind() is in progress.
 //
+// Const-correctness: a const Proxy<T> (operator->() const) yields a const
+// view — non-const methods throw at call time, readonly properties block
+// writes, and operator[] yields const references.  Non-const methods,
+// non-readonly properties, and mutable operator[] require a non-const
+// Proxy.
+//
 // Proxy<T> is non-copyable.  Movable: move transfers the bound Object
 // and re-populates the dispatch fields (which point into overload_storage_,
-// a member of the Proxy, so they must be re-pointed after the move).
+// a member of the Proxy, so they must be re-pointed after the move).  A
+// moved-from Proxy is unbound: is_bound() returns false and calls through
+// operator->() throw rather than use stale pointers.
 // ---------------------------------------------------------------------------
 template <typename T>
 class Proxy {
@@ -561,7 +621,7 @@ class Proxy {
                                 "', impl returns '" +
                                 r.fi->return_type + "'");
                         check_const_qual(exp_const_arr, oi, r.fi, key);
-                        vec.push_back({r.fi->invoker});
+                        vec.push_back({r.fi->invoker, r.fi->is_const});
                         method_off = r.offset;
                     }
                     dispatch_.[:field:].obj =
@@ -597,6 +657,31 @@ class Proxy {
         }
     }
 
+    // Reset all dispatch fields to the unbound state so a moved-from
+    // Proxy throws cleanly instead of calling through stale pointers.
+    void clear_dispatch() {
+        static constexpr auto dm = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch,
+                std::meta::access_context::unchecked()));
+        template for (constexpr auto field : dm) {
+            if constexpr (std::meta::has_identifier(field)) {
+                using FieldType = [:std::meta::type_of(field):];
+                if constexpr (detail::is_typed_method_v<
+                        std::remove_cv_t<FieldType>>) {
+                    dispatch_.[:field:].overloads = nullptr;
+                    dispatch_.[:field:].num = 0;
+                    dispatch_.[:field:].obj = nullptr;
+                    dispatch_.[:field:].owner.reset();
+                } else {
+                    dispatch_.[:field:].getter = nullptr;
+                    dispatch_.[:field:].setter = nullptr;
+                    dispatch_.[:field:].obj = nullptr;
+                    dispatch_.[:field:].owner.reset();
+                }
+            }
+        }
+        overload_storage_.clear();
+    }
 public:
     Proxy() = default;
 
@@ -715,6 +800,7 @@ public:
         : obj_(std::move(other.obj_)) {
         if (obj_.valid()) { populate(); }
         other.obj_ = {};
+        other.clear_dispatch();
     }
     Proxy& operator=(const Proxy&) = delete;
     Proxy& operator=(Proxy&& other) {
@@ -722,6 +808,7 @@ public:
             obj_ = std::move(other.obj_);
             other.obj_ = {};
             if (obj_.valid()) { populate(); }
+            other.clear_dispatch();
         }
         return *this;
     }

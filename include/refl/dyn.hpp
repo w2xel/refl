@@ -97,7 +97,7 @@ class Dyn {
                             auto r = detail::find_function_in_hierarchy(
                                 info, key, exp);
                             if (r.fi) {
-                                vec.push_back({r.fi->invoker});
+                                vec.push_back({r.fi->invoker, r.fi->is_const});
                                 method_off = r.offset;
                             }
                         }
@@ -301,7 +301,7 @@ public:
                             for (const auto& fi : info->functions)
                                 if (fi.name == key
                                     && fi.param_types == exp) {
-                                    vec.push_back({fi.invoker});
+                                    vec.push_back({fi.invoker, fi.is_const});
                                     break;
                                 }
                         dispatch_.[:field:].overloads = vec.data();
@@ -366,7 +366,8 @@ public:
                     constexpr auto entries = []() consteval {
                         return std::define_static_array(
                             std::vector<detail::OverloadEntry>{
-                                detail::OverloadEntry{&trampoline<Method>}});
+                                detail::OverloadEntry{&trampoline<Method>,
+                                    detail::is_const_method(Method)}});
                     }();
                     dispatch_.[:field:].overloads = entries.data();
                     dispatch_.[:field:].num = 1;

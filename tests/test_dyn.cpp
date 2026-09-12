@@ -709,6 +709,58 @@ int main() {
             "move-only member should be set to 55");
     }
 
+    // === Proxy: const-correctness — const proxy blocks non-const methods ===
+    // A const Proxy<T> yields a const view: const methods work, non-const
+    // methods throw at call time.  Before the fix, operator() was
+    // unconditionally const and there was no per-overload const gate, so a
+    // const proxy could call non-const methods and mutate the object.
+    {
+        auto sp = std::make_shared<RefGet>();
+        sp->x = 42;
+        refl::Proxy<RefGet> p(sp);
+        // Non-const proxy: both methods work.
+        CHECK(p->val() == 42, "non-const proxy: val() should return 42");
+        p->get_ref() = 99;
+        CHECK(p->val() == 99, "non-const proxy: get_ref() write should mutate");
+
+        // Const proxy: const method works, non-const method throws.
+        sp->x = 42;
+        const refl::Proxy<RefGet> cp(sp);
+        CHECK(cp->val() == 42, "const proxy: val() (const) should return 42");
+        bool threw_nonconst = false;
+        try {
+            cp->get_ref();
+        } catch (const std::runtime_error&) {
+            threw_nonconst = true;
+        }
+        CHECK(threw_nonconst,
+            "const proxy: get_ref() (non-const) should throw");
+    }
+
+    // === Proxy: moved-from proxy is safe — throws, not UB ===
+    // After move, the moved-from Proxy is unbound: is_bound() returns
+    // false and calls through operator->() throw, rather than calling
+    // through stale pointers (use-after-free).  Before the fix, the
+    // dispatch fields were not cleared on move, so a call on the
+    // moved-from proxy used stale obj/owner pointers.
+    {
+        auto sp = std::make_shared<SimpleImpl>(42);
+        refl::Proxy<ISimple> p(sp);
+        CHECK(p.is_bound(), "proxy should be bound before move");
+        refl::Proxy<ISimple> moved(std::move(p));
+        CHECK(!p.is_bound(), "moved-from proxy should not be bound");
+        CHECK(moved.is_bound(), "moved-to proxy should be bound");
+        CHECK(moved->get_value() == 42, "moved-to proxy should work");
+
+        bool threw = false;
+        try {
+            (void)p->get_value();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw, "moved-from proxy call should throw, not UB");
+    }
+
     std::printf("dyn dispatch test ok\n");
     return 0;
 }
