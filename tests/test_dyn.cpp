@@ -60,9 +60,19 @@ struct OverloadImpl {
     int compute(int a) { return a * 100; }
 };
 
+// For bind-time validation tests: interface with a method the impl lacks.
+struct IMissing { int exists(int); int missing(int); };
+struct HasPartial { int exists(int x) { return x; } };
+
+// For bind-time validation tests: return type mismatch.
+struct IBadReturn { int compute(int); };
+struct DoubleReturn { double compute(int x) { return x * 1.5; } };
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
+[[maybe_unused]] static refl::Reg<HasPartial> reg_has_partial;
+[[maybe_unused]] static refl::Reg<DoubleReturn> reg_double_return;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -296,6 +306,29 @@ int main() {
     CHECK(oc1 == 300, "compute(3) should be 300 (3*100), not 30 (wrong invoker)");
     int oc2 = po->compute(3, 2);
     CHECK(oc2 == 32, "compute(3,2) should be 32 (3*10+2), not wrong invoker");
+
+    // === Proxy: bind-time validation throws on mismatch ===
+    // Interface has a method the impl doesn't — must throw at bind time.
+    auto hp_cls = *refl::find_class("HasPartial");
+    auto hp_obj = *hp_cls.constructors()[0].call();
+    bool threw_missing = false;
+    try {
+        refl::Proxy<IMissing> bad(hp_obj);
+    } catch (const std::runtime_error&) {
+        threw_missing = true;
+    }
+    CHECK(threw_missing, "Proxy<IMissing> should throw — HasPartial lacks 'missing'");
+
+    // Return type mismatch — must throw at bind time.
+    auto dr_cls = *refl::find_class("DoubleReturn");
+    auto dr_obj = *dr_cls.constructors()[0].call();
+    bool threw_return = false;
+    try {
+        refl::Proxy<IBadReturn> bad2(dr_obj);
+    } catch (const std::runtime_error&) {
+        threw_return = true;
+    }
+    CHECK(threw_return, "Proxy<IBadReturn> should throw — return type mismatch (int vs double)");
 
     std::printf("dyn dispatch test ok\n");
     return 0;

@@ -17,6 +17,7 @@
 #include <refl/refl.hpp>
 
 #include <map>
+#include <stdexcept>
 
 namespace refl {
 // ---------------------------------------------------------------------------
@@ -111,6 +112,14 @@ struct TypedMethod {
         return { sig_param_names<typename sig_traits<Sigs>::args_type>()... };
     }
 
+    // Returns return-type display strings per overload, in Sigs-pack order.
+    // Used by populate() to verify the impl's return type matches the
+    // interface's, catching structural mismatches at bind time.
+    static std::vector<std::string> expected_return_types() {
+        return { std::string(detail::type_name<
+            std::remove_cvref_t<typename sig_traits<Sigs>::return_type>>())... };
+    }
+
 private:
     template <typename Tuple>
     static std::vector<std::string> sig_param_names() {
@@ -137,6 +146,8 @@ public:
         using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
         if constexpr (matches_sig<Sig, Args...>) {
             using R = typename sig_traits<Sig>::return_type;
+            if (!overloads || I >= num)
+                throw std::bad_cast{};
             // Build Object arg array from forwarded args.
             std::tuple<std::decay_t<Args>...> storage(
                 std::forward<Args>(args)...);
@@ -355,9 +366,10 @@ struct FixedString {
 //
 // The object behind the proxy can be any type whose interface is
 // structurally compatible with T (same method names and signatures),
-// not just T itself.  Matching is by method name (overloads in
-// declaration order, same as Dyn).  This is structural typing through
-// the reflection pool: any type with compatible public methods works.
+// not just T itself.  Matching is by method name + param-type signature
+// (overloads are paired correctly even if the impl declares them in a
+// different order).  This is structural typing through the reflection
+// pool: any type with compatible public methods works.
 //
 // T need not be abstract or have pure-virtual methods — it is a
 // compile-time interface descriptor only.  Its methods are never called;
@@ -372,6 +384,18 @@ struct FixedString {
 //   auto obj = *cls.constructors()[0].call(4);  // type-erased Object
 //   refl::Proxy<IDrawable> p(obj);
 //   int a = p->render(2);   // calls Square::render, returns int
+//
+// Validation: bind() and the constructor throw std::runtime_error at bind
+// time if the object's type is not registered, if any interface method,
+// field, or static member has no match in the object's ClassInfo, or if
+// a matched method's return type differs from the interface's.  This
+// catches structural mismatches as early as possible — before any call
+// through the proxy.
+//
+// Thread safety: NOT thread-safe.  Concurrent bind() + operator->(), or
+// concurrent bind() from multiple threads, is a data race on the dispatch
+// fields.  The caller must synchronize.  Calls through operator->() from
+// multiple threads are safe only if no bind() is in progress.
 //
 // Proxy<T> is non-copyable, non-movable (dispatch fields point into it).
 // ---------------------------------------------------------------------------
@@ -484,12 +508,24 @@ class Proxy {
         return it != class_pool().end() ? it->second.get() : nullptr;
     }
 
+    static std::string join_types(const std::vector<std::string>& types) {
+        std::string s;
+        for (std::size_t i = 0; i < types.size(); ++i) {
+            if (i) s += ", ";
+            s += types[i];
+        }
+        return s;
+    }
+
     void populate() {
         if constexpr (std::is_class_v<T>) {
             if (!obj_.valid()) return;
             overload_storage_.clear();
             const ClassInfo* info = lookup_class_info(obj_.class_name());
-            if (!info) return;
+            if (!info)
+                throw std::runtime_error(
+                    "Proxy: object type '" + std::string(obj_.class_name()) +
+                    "' is not registered in the reflection pool");
             static constexpr auto dm = std::define_static_array(
                 std::meta::nonstatic_data_members_of(^^Dispatch,
                     std::meta::access_context::unchecked()));
@@ -499,21 +535,39 @@ class Proxy {
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
                         // Non-static method → bind from Object's ClassInfo,
-                        // matching by param-type signature so overloads are
-                        // paired correctly even if the impl type reorders them.
+                        // matching by param-type signature + return type.
                         using TM = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].obj = obj_.raw();
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
-                        for (const auto& exp : TM::expected_param_types())
+                        auto exp_params = TM::expected_param_types();
+                        auto exp_returns = TM::expected_return_types();
+                        for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
+                            bool found = false;
                             for (const auto& fi : info->functions)
                                 if (fi.name == key
-                                    && fi.param_types == exp) {
+                                    && fi.param_types == exp_params[oi]) {
+                                    if (fi.return_type != exp_returns[oi])
+                                        throw std::runtime_error(
+                                            "Proxy: return type mismatch on '" +
+                                            key + "' — interface expects '" +
+                                            exp_returns[oi] +
+                                            "', impl returns '" +
+                                            fi.return_type + "'");
                                     vec.push_back({fi.invoker});
+                                    found = true;
                                     break;
                                 }
+                            if (!found)
+                                throw std::runtime_error(
+                                    "Proxy: no matching overload for '" + key +
+                                    "' with params [" +
+                                    join_types(exp_params[oi]) +
+                                    "] in type '" +
+                                    std::string(obj_.class_name()) + "'");
+                        }
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
                     } else if constexpr (detail::is_typed_static_method_v<
@@ -521,36 +575,57 @@ class Proxy {
                         // Static method → bind from Object's ClassInfo.
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
+                        bool found = false;
                         for (const auto& fi : info->static_functions)
                             if (fi.name == key) {
                                 dispatch_.[:field:].invoker = fi.invoker;
+                                found = true;
                                 break;
                             }
+                        if (!found)
+                            throw std::runtime_error(
+                                "Proxy: no static method '" + key +
+                                "' in type '" +
+                                std::string(obj_.class_name()) + "'");
                     } else if constexpr (detail::is_typed_static_property_v<
                             std::remove_cv_t<FieldType>>) {
                         // Static property → bind from Object's ClassInfo.
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
+                        bool found = false;
                         for (const auto& fi : info->static_fields)
                             if (fi.name == key) {
                                 dispatch_.[:field:].getter = fi.getter;
                                 dispatch_.[:field:].setter = fi.setter;
+                                found = true;
                                 break;
                             }
+                        if (!found)
+                            throw std::runtime_error(
+                                "Proxy: no static field '" + key +
+                                "' in type '" +
+                                std::string(obj_.class_name()) + "'");
                     } else {
                         // Non-static data member → bind from Object's ClassInfo.
                         dispatch_.[:field:].obj = obj_.raw();
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
+                        bool found = false;
                         for (const auto& fi : info->fields)
                             if (fi.name == key) {
                                 dispatch_.[:field:].member_offset =
                                     static_cast<std::size_t>(fi.offset);
                                 dispatch_.[:field:].getter = fi.getter;
                                 dispatch_.[:field:].setter = fi.setter;
+                                found = true;
                                 break;
                             }
+                        if (!found)
+                            throw std::runtime_error(
+                                "Proxy: no field '" + key +
+                                "' in type '" +
+                                std::string(obj_.class_name()) + "'");
                     }
                 }
             }
