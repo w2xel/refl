@@ -1,21 +1,21 @@
-// mockable — runtime mock with swappable per-method invokers.
+// mockable — runtime mock with swappable per-method and per-property slots.
 //
-// Mockable<T> synthesizes a per-instance ClassInfo whose invoker is a
-// static trampoline that reads a MethodSlot at call time.  Each slot
-// holds a swappable (InvokerFn, void* ctx) pair.  implement() sets the
-// slot's invoker to the user lambda.  inject_hook() wraps the current
-// invoker in a hook trampoline and swaps it in — all after Proxy bind,
-// because the Proxy only holds the static trampoline pointer, which
-// always re-reads the slot.
+// Mockable<T> synthesizes a per-instance ClassInfo whose method invokers
+// and property getter/setters are static trampolines that read swappable
+// slots at call time.  implement() sets a method slot's invoker.
+// inject_hook() wraps a method slot's invoker in a hook trampoline.
+// on_change() wraps a property slot's setter to fire callbacks after
+// writes.  All work after Proxy bind — the Proxy holds the static
+// trampoline pointers, which always re-read the slots.
 //
-//   auto m = refl::Mockable<IShape>::create();
-//   m->implement<^^IShape::area>([](int s) { return s * 100; });
+//   auto m = refl::Mockable<IWidget>::create();
+//   m->implement<^^IWidget::draw>([]() { ... });
+//   m->set_property<^^IWidget::width>(42);
 //   auto p = m->proxy();
-//   // After bind: inject a hook that fires after area() calls.
-//   m->inject_hook<^^IShape::area>([](refl::Object& r) { ... });
-//   p->area(5);  // calls the lambda, then fires the hook
+//   m->on_change<^^IWidget::width>([](refl::Object& v) { ... });
+//   p->width = 99;  // fires the on_change callback
 //
-// Prototype: method-only (no property hooks), 0-2 args.
+// Prototype: method + property hooks, 0-2 args.
 #pragma once
 
 #include <refl/refl.hpp>
@@ -28,22 +28,27 @@
 
 namespace refl {
 
-// A swappable invoker slot.  The ClassInfo trampoline reads
-// slot->invoker and slot->ctx at call time, so swapping here takes
-// effect for all already-bound Proxies immediately.
+// Swappable invoker slot for methods.
 struct MethodSlot {
     InvokerFn invoker = nullptr;
     void* ctx = nullptr;
 };
 
+// Swappable getter/setter slot for properties.
+struct PropertySlot {
+    GetterFn getter = nullptr;
+    void* get_ctx = nullptr;
+    SetterFn setter = nullptr;
+    void* set_ctx = nullptr;
+};
+
 template <typename T>
 class Mockable : public std::enable_shared_from_this<Mockable<T>> {
-    // The static trampoline stored in ClassInfo.functions[].invoker.
-    // It reads the MethodSlot for this method (keyed by a compile-time
-    // index) and dispatches to slot->invoker with slot->ctx.  The slot
-    // pointer is stored in a static per-(T, Method) table, looked up
-    // by recovering the Mockable* from obj and indexing into its
-    // slots_ vector.
+
+    // ======================================================================
+    // Method trampolines
+    // ======================================================================
+
     template <std::meta::info Method>
     static Object slot_trampoline(const std::shared_ptr<void>& owner,
                                    void* obj, const Object* args) {
@@ -51,17 +56,13 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
         constexpr auto nm_sv = std::meta::identifier_of(Method);
         constexpr auto nm = std::define_static_string(nm_sv);
         auto key = std::string(nm);
-        auto it = self->slots_.find(key);
-        if (it == self->slots_.end() || !it->second.invoker)
+        auto it = self->method_slots_.find(key);
+        if (it == self->method_slots_.end() || !it->second.invoker)
             throw std::runtime_error(
                 "Mockable: method '" + key + "' not implemented");
         return it->second.invoker(owner, it->second.ctx, args);
     }
 
-    // --- Implementation trampoline: calls the user lambda.
-    //     ctx points at the MethodSlot itself; the lambda is in
-    //     callables_[key].  We read the slot to find the key, but
-    //     the lambda is stored separately (std::any in callables_).
     template <std::meta::info Method>
     static Object impl_trampoline(const std::shared_ptr<void>&,
                                     void* obj, const Object* args) {
@@ -104,10 +105,6 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
         }
     }
 
-    // --- Hook trampoline: calls the current invoker, then fires hooks.
-    //     ctx points at a HookCtx that holds the previous (wrapped)
-    //     invoker+ctx and the hook list.  This is what inject_hook
-    //     installs as the new slot->invoker.
     struct HookCtx {
         InvokerFn prev_invoker;
         void* prev_ctx;
@@ -125,9 +122,141 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
         return result;
     }
 
-    // Build a per-instance ClassInfo.  Each FunctionInfo.invoker points
-    // at slot_trampoline<m> — the static trampoline that reads the
-    // swappable slot at call time.
+    // ======================================================================
+    // Property trampolines
+    // ======================================================================
+    // The mock has no real object, so properties are stored as std::any
+    // values on the Mockable.  The getter/setter trampolines recover the
+    // Mockable* from obj (which Proxy sets to obj_.raw() + offset; offset
+    // is 0 for the mock since there's no base hierarchy) and read/write
+    // the stored value.
+
+    struct PropHookCtx {
+        SetterFn prev_setter;
+        void* prev_set_ctx;
+        std::shared_ptr<const ClassInfo> class_info;
+        std::vector<std::function<void(Object&)>>* hooks;
+    };
+
+    template <std::meta::info Member>
+    static Object prop_get_trampoline(void* obj) {
+        auto* self = static_cast<Mockable<T>*>(obj);
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        auto it = self->prop_slots_.find(key);
+        if (it == self->prop_slots_.end() || !it->second.getter)
+            throw std::runtime_error(
+                "Mockable: property '" + key + "' has no getter");
+        return it->second.getter(it->second.get_ctx);
+    }
+
+    template <std::meta::info Member>
+    static void prop_set_trampoline(void* obj, const Object* val) {
+        auto* self = static_cast<Mockable<T>*>(obj);
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        auto it = self->prop_slots_.find(key);
+        if (it == self->prop_slots_.end() || !it->second.setter)
+            throw std::runtime_error(
+                "Mockable: property '" + key + "' has no setter");
+        it->second.setter(it->second.set_ctx, val);
+    }
+
+    // Property implementation getter/setter: read/write a stored std::any.
+    // ctx is the Mockable* itself.
+    template <std::meta::info Member>
+    static Object prop_impl_get(void* ctx) {
+        auto* self = static_cast<Mockable<T>*>(ctx);
+        using MemberType = [:std::meta::type_of(Member):];
+        using Bare = std::remove_cvref_t<MemberType>;
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        auto it = self->prop_values_.find(key);
+        if (it == self->prop_values_.end())
+            throw std::runtime_error(
+                "Mockable: property '" + key + "' not set");
+        auto& val = std::any_cast<Bare&>(it->second);
+        return Object(std::make_shared<Bare>(val),
+                     detail::ensure_class_info<Bare>());
+    }
+
+    template <std::meta::info Member>
+    static void prop_impl_set(void* ctx, const Object* val) {
+        auto* self = static_cast<Mockable<T>*>(ctx);
+        using MemberType = [:std::meta::type_of(Member):];
+        using Bare = std::remove_cvref_t<MemberType>;
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        auto cr = val->template cast_ref<Bare>();
+        if (!cr) throw std::runtime_error(
+            "Mockable: property '" + key + "' type mismatch on set");
+        self->prop_values_[key] = Bare(std::move(*cr.value()));
+    }
+
+    // Property hook setter: calls the previous setter, then reads the
+    // current value (via the slot's getter) and fires the hook list.
+    template <std::meta::info Member>
+    static void prop_hook_set(void* ctx, const Object* val) {
+        auto* hc = static_cast<PropHookCtx*>(ctx);
+        hc->prev_setter(hc->prev_set_ctx, val);
+        // Read current value via the property's getter slot.
+        auto* self = static_cast<Mockable<T>*>(hc->prev_set_ctx);
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        auto it = self->prop_slots_.find(key);
+        Object current = it->second.getter
+            ? it->second.getter(it->second.get_ctx)
+            : Object{};
+        for (auto& cb : *hc->hooks) cb(current);
+    }
+
+    // consteval helpers: return function pointers to trampolines.  GCC 16.2
+    // requires taking the address of a function template instantiated with a
+    // std::meta::info NTTP to be in a constant-evaluated context (the function
+    // body uses consteval-only expressions like define_static_string).  These
+    // wrappers provide that context.
+    template <std::meta::info Method>
+    consteval static InvokerFn get_hook_tramp() {
+        return &hook_trampoline<Method>;
+    }
+    template <std::meta::info Method>
+    consteval static InvokerFn get_impl_tramp() {
+        return &impl_trampoline<Method>;
+    }
+    template <std::meta::info Method>
+    consteval static InvokerFn get_slot_tramp() {
+        return &slot_trampoline<Method>;
+    }
+    template <std::meta::info Member>
+    consteval static GetterFn get_prop_get_tramp() {
+        return &prop_get_trampoline<Member>;
+    }
+    template <std::meta::info Member>
+    consteval static SetterFn get_prop_set_tramp() {
+        return &prop_set_trampoline<Member>;
+    }
+    template <std::meta::info Member>
+    consteval static GetterFn get_prop_impl_get() {
+        return &prop_impl_get<Member>;
+    }
+    template <std::meta::info Member>
+    consteval static SetterFn get_prop_impl_set() {
+        return &prop_impl_set<Member>;
+    }
+    template <std::meta::info Member>
+    consteval static SetterFn get_prop_hook_set() {
+        return &prop_hook_set<Member>;
+    }
+
+    // ======================================================================
+    // ClassInfo synthesis
+    // ======================================================================
+
     static std::shared_ptr<const ClassInfo> make_class_info() {
         auto ci = std::make_shared<ClassInfo>();
         ci->name = std::string(detail::type_name<T>()) + "$mock";
@@ -145,7 +274,7 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
                     fi.return_type = std::string(
                         std::meta::display_string_of(
                             std::meta::return_type_of(m)));
-                    fi.invoker = &slot_trampoline<m>;
+                    fi.invoker = get_slot_tramp<m>();
                     static constexpr auto fparams = std::define_static_array(
                         std::meta::parameters_of(m));
                     template for (constexpr auto p : fparams) {
@@ -155,18 +284,40 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
                                     std::meta::type_of(p))));
                     }
                     ci->functions.push_back(std::move(fi));
+                } else if constexpr (detail::is_public_data_member(m)
+                              && std::meta::has_identifier(m)
+                              && !std::meta::is_static_member(m)) {
+                    FieldInfo fi;
+                    fi.name = std::string(std::meta::identifier_of(m));
+                    fi.type = std::string(
+                        std::meta::display_string_of(std::meta::type_of(m)));
+                    fi.offset = 0;
+                    using MemberType = [:std::meta::type_of(m):];
+                    fi.is_const = std::is_const_v<MemberType>;
+                    fi.getter = get_prop_get_tramp<m>();
+                    fi.setter = std::is_const_v<MemberType>
+                        ? nullptr
+                        : get_prop_set_tramp<m>();
+                    ci->fields.push_back(std::move(fi));
                 }
             }
         }
         return ci;
     }
 
+    // ======================================================================
+    // State
+    // ======================================================================
+
     std::shared_ptr<const ClassInfo> class_info_;
     std::map<std::string, std::any> callables_;
-    std::map<std::string, MethodSlot> slots_;
-    // Hook storage: stable vectors (map nodes are stable, .data() valid).
+    std::map<std::string, MethodSlot> method_slots_;
+    std::map<std::string, PropertySlot> prop_slots_;
+    std::map<std::string, std::any> prop_values_;
     std::map<std::string, std::vector<std::function<void(Object&)>>> hooks_;
     std::map<std::string, HookCtx> hook_ctxs_;
+    std::map<std::string, std::vector<std::function<void(Object&)>>> prop_hooks_;
+    std::map<std::string, PropHookCtx> prop_hook_ctxs_;
 
     Mockable() : class_info_(make_class_info()) {}
 
@@ -174,6 +325,10 @@ public:
     static std::shared_ptr<Mockable<T>> create() {
         return std::shared_ptr<Mockable<T>>(new Mockable<T>());
     }
+
+    // ======================================================================
+    // Method API
+    // ======================================================================
 
     template <std::meta::info Method, typename F>
     void implement(F fn) {
@@ -196,16 +351,9 @@ public:
             using C1 = std::remove_cvref_t<P1>;
             callables_[key] = std::function<R(C0, C1)>(std::move(fn));
         }
-        // Wire the slot: invoker points at impl_trampoline, ctx is self.
-        slots_[key] = {&impl_trampoline<Method>, this};
+        method_slots_[key] = {get_impl_tramp<Method>(), this};
     }
 
-    // Inject a hook (after-only observer) on a method.  Wraps the
-    // current slot invoker in hook_trampoline<Method>, which calls
-    // the previous invoker then fires all hooks for this method.
-    // Multiple inject_hook calls accumulate — all callbacks fire.
-    // Works after Proxy bind: the Proxy holds slot_trampoline, which
-    // re-reads the slot at call time.
     template <std::meta::info Method>
     void inject_hook(std::function<void(Object&)> cb) {
         constexpr auto nm_sv = std::meta::identifier_of(Method);
@@ -213,18 +361,63 @@ public:
         auto key = std::string(nm);
         auto& vec = hooks_[key];
         vec.push_back(std::move(cb));
-        auto& slot = slots_[key];
+        auto& slot = method_slots_[key];
         if (hook_ctxs_.find(key) == hook_ctxs_.end()) {
-            // First hook: wrap the current invoker.
             auto& hc = hook_ctxs_[key];
             hc.prev_invoker = slot.invoker;
             hc.prev_ctx = slot.ctx;
             hc.hooks = &vec;
-            slot.invoker = &hook_trampoline<Method>;
+            slot.invoker = get_hook_tramp<Method>();
             slot.ctx = &hc;
         }
-        // Subsequent hooks: already wrapped, just appended to vec.
     }
+
+    // ======================================================================
+    // Property API
+    // ======================================================================
+
+    // Set a mock property's initial value (wires the impl getter/setter).
+    template <std::meta::info Member, typename V>
+    void set_property(V&& val) {
+        using MemberType = [:std::meta::type_of(Member):];
+        using Bare = std::remove_cvref_t<MemberType>;
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        prop_values_[key] = Bare(std::forward<V>(val));
+        prop_slots_[key] = {
+            (GetterFn)get_prop_impl_get<Member>(), this,
+            (SetterFn)get_prop_impl_set<Member>(), this
+        };
+    }
+
+    // Inject an on_change hook on a property.  Wraps the property's
+    // setter so that after a write, the current value is read back and
+    // all hooks fire.  Works after Proxy bind.
+    template <std::meta::info Member>
+    void on_change(std::function<void(Object&)> cb) {
+        using MemberType = [:std::meta::type_of(Member):];
+        using Bare = std::remove_cvref_t<MemberType>;
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+        auto& vec = prop_hooks_[key];
+        vec.push_back(std::move(cb));
+        auto& slot = prop_slots_[key];
+        if (prop_hook_ctxs_.find(key) == prop_hook_ctxs_.end()) {
+            auto& hc = prop_hook_ctxs_[key];
+            hc.prev_setter = slot.setter;
+            hc.prev_set_ctx = slot.set_ctx;
+            hc.class_info = detail::ensure_class_info<Bare>();
+            hc.hooks = &vec;
+            slot.setter = get_prop_hook_set<Member>();
+            slot.set_ctx = &hc;
+        }
+    }
+
+    // ======================================================================
+    // Object / Proxy
+    // ======================================================================
 
     Object as_object() {
         auto sp = this->shared_from_this();
