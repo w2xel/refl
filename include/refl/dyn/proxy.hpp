@@ -80,11 +80,8 @@ collect_sigs(std::meta::info type, std::string_view name) {
     std::vector<std::meta::info> result;
     for (auto m : std::meta::members_of(type,
             std::meta::access_context::unchecked())) {
-        if (std::meta::is_function(m) && std::meta::has_identifier(m)
+        if (is_public_method(m) && std::meta::has_identifier(m)
             && !std::meta::is_static_member(m)
-            && std::meta::is_public(m)
-            && !std::meta::is_deleted(m)
-            && !is_consteval_fn(m)
             && std::meta::identifier_of(m) == name)
             result.push_back(make_fn_sig(m));
     }

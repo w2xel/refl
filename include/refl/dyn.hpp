@@ -54,12 +54,9 @@ class Dyn {
             std::vector<std::meta::info> specs;
             std::vector<std::string> seen_fns;
             template for (constexpr auto m : members) {
-                if constexpr (std::meta::is_function(m)
+                if constexpr (detail::is_public_method(m)
                               && std::meta::has_identifier(m)
-                              && !std::meta::is_static_member(m)
-                              && std::meta::is_public(m)
-                              && !std::meta::is_deleted(m)
-                              && !detail::is_consteval_fn(m)) {
+                              && !std::meta::is_static_member(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -79,9 +76,8 @@ class Dyn {
                     std::meta::access_context::unchecked()));
             std::vector<std::string> seen_fields;
             template for (constexpr auto m : data_members) {
-                if constexpr (!std::meta::is_bit_field(m)
-                              && std::meta::has_identifier(m)
-                              && std::meta::is_public(m)) {
+                if constexpr (detail::is_public_data_member(m)
+                              && std::meta::has_identifier(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -121,12 +117,9 @@ class Dyn {
             // Static member functions → TypedStaticMethod.
             std::vector<std::string> seen_static_fns;
             template for (constexpr auto m : members) {
-                if constexpr (std::meta::is_function(m)
+                if constexpr (detail::is_public_method(m)
                               && std::meta::has_identifier(m)
-                              && std::meta::is_static_member(m)
-                              && std::meta::is_public(m)
-                              && !std::meta::is_deleted(m)
-                              && !detail::is_consteval_fn(m)) {
+                              && std::meta::is_static_member(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -486,12 +479,9 @@ public:
             constexpr bool found = []() consteval {
                 for (auto m : std::meta::members_of(^^T,
                         std::meta::access_context::unchecked())) {
-                    if (std::meta::is_function(m)
+                    if (detail::is_public_method(m)
                         && std::meta::has_identifier(m)
                         && !std::meta::is_static_member(m)
-                        && std::meta::is_public(m)
-                        && !std::meta::is_deleted(m)
-                        && !detail::is_consteval_fn(m)
                         && std::meta::identifier_of(m) == Name.sv())
                         return true;
                 }
@@ -499,12 +489,9 @@ public:
             }();
             static_assert(found, "implement: method not found on T");
             template for (constexpr auto m : members) {
-                if constexpr (std::meta::is_function(m)
+                if constexpr (detail::is_public_method(m)
                               && std::meta::has_identifier(m)
                               && !std::meta::is_static_member(m)
-                              && std::meta::is_public(m)
-                              && !std::meta::is_deleted(m)
-                              && !detail::is_consteval_fn(m)
                               && std::meta::identifier_of(m) == Name.sv()) {
                     implement<m>(std::move(fn));
                 }

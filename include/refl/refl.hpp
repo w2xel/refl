@@ -274,6 +274,22 @@ consteval bool is_consteval_fn(std::meta::info Fn) {
     return ds.starts_with("consteval ");
 }
 
+// Shared member filters — used by both make_info (refl core) and Dyn<T>'s
+// consteval dispatch synthesis (dyn layer).  Dyn adds has_identifier on top
+// (it needs named struct fields); make_info also accepts operators
+// (has_identifier || is_operator_function).
+consteval bool is_public_method(std::meta::info m) {
+    return std::meta::is_function(m)
+        && std::meta::is_public(m)
+        && !std::meta::is_deleted(m)
+        && !is_consteval_fn(m);
+}
+
+consteval bool is_public_data_member(std::meta::info m) {
+    return !std::meta::is_bit_field(m)
+        && std::meta::is_public(m);
+}
+
 // Match a query (already-normalized type names) against a candidate's
 // param_types (also pre-normalized at storage time).  Returns true if
 // the param counts and types match.
@@ -864,8 +880,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
         std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::unchecked()));
     template for (constexpr auto m : data_members) {
         // Skip bit-fields and non-public members.
-        if constexpr (!std::meta::is_bit_field(m) &&
-                      std::meta::is_public(m)) {
+        if constexpr (detail::is_public_data_member(m)) {
             FieldInfo fi;
             fi.name = std::string(std::meta::identifier_of(m));
             fi.type = std::string(
@@ -986,10 +1001,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 }
                 info.constructors.push_back(std::move(ci));
             }
-        } else if constexpr (std::meta::is_function(m) &&
-                            !std::meta::is_deleted(m) &&
-                            std::meta::is_public(m) &&
-                            !detail::is_consteval_fn(m) &&
+        } else if constexpr (detail::is_public_method(m) &&
                             (std::meta::has_identifier(m) ||
                              std::meta::is_operator_function(m))) {
             static constexpr auto fparams = std::define_static_array(
