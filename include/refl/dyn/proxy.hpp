@@ -271,22 +271,27 @@ struct TypedProperty {
     }
 
     // operator[] — returns a reference to the element in the actual object.
-    // Only available when T is subscriptable (std::array, std::vector, etc.)
-    // and the member is not Readonly.  A const member's element type would
-    // be const-qualified, but operator[] returns a mutable reference — so
-    // Readonly properties are excluded entirely to avoid a write path that
-    // bypasses the const contract (the whole-object operator= is already
-    // deleted for Readonly).  Read individual elements of a const container
-    // via the implicit conversion to T (a copy) instead.
+    // Available whenever T is subscriptable (std::array, std::vector, etc.).
+    // For non-readonly members the reference is mutable (writes go through to
+    // the object); for Readonly members it is const-qualified, so element
+    // reads are allowed but element writes are a compile error — the same
+    // contract as whole-object operator= (deleted for Readonly).  This keeps
+    // individual-element access on const containers without a copy.
     // ponytail: no bounds check — out-of-range index is UB, same as raw
     // operator[] on the underlying container.  The caller owns the index.
     template <typename Self>
     auto& operator[](this Self&& self, std::size_t i)
-        requires (!Readonly)
-              && requires { typename std::remove_cvref_t<T>::value_type; }
+        requires requires { typename std::remove_cvref_t<T>::value_type; }
     {
-        return reinterpret_cast<std::remove_cv_t<T>*>(
-            static_cast<char*>(self.obj) + self.member_offset)->operator[](i);
+        if constexpr (Readonly) {
+            return reinterpret_cast<const std::remove_cvref_t<T>*>(
+                static_cast<const char*>(self.obj)
+                    + self.member_offset)->operator[](i);
+        } else {
+            return reinterpret_cast<std::remove_cv_t<T>*>(
+                static_cast<char*>(self.obj)
+                    + self.member_offset)->operator[](i);
+        }
     }
 
     static constexpr bool is_readonly() { return Readonly; }

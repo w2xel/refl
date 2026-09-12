@@ -182,6 +182,15 @@ template <typename P>
 struct has_subscript<P, std::void_t<decltype(std::declval<P&>()[std::size_t{}])>>
     : std::true_type {};
 
+// Trait: can the element returned by operator[] be assigned to?  False
+// for readonly properties, whose operator[] yields a const reference.
+template <typename, typename = void>
+struct is_assignable_subscript : std::false_type {};
+template <typename P>
+struct is_assignable_subscript<P,
+        std::void_t<decltype(std::declval<P&>()[std::size_t{}] = int{})>>
+    : std::true_type {};
+
 int main() {
     // === Dyn<T> dispatch-struct tests ===
 
@@ -554,22 +563,32 @@ int main() {
         CHECK(threw, "operator+ with mismatched primitive return (int vs long) should throw");
     }
 
-    // === Proxy: readonly array operator[] is not exposed ===
-    // A const array member has Readonly=true, so operator[] must not exist.
-    // This is a compile-time guarantee: the requires(!Readonly) clause
-    // removes operator[] from the overload set.
+    // === Proxy: readonly array operator[] — read-only element access ===
+    // A const array member has Readonly=true. operator[] is still exposed
+    // but yields a const reference: element reads work, element writes are a
+    // compile error — the same contract as whole-object operator= (deleted
+    // for Readonly).  This avoids a copy when reading individual elements of
+    // a const container.
     {
         auto sp = std::make_shared<ConstArrImpl>();
         refl::Proxy<IConstArr> p(sp);
         using DataProp = decltype(p->data);
         CHECK(DataProp::is_readonly(), "const array data should be Readonly");
-        static_assert(!has_subscript<DataProp>::value,
-            "readonly array must not expose operator[]");
+        // operator[] exists for both readonly and non-readonly subscriptable T.
+        static_assert(has_subscript<DataProp>::value,
+            "readonly array must expose operator[] (read)");
         static_assert(has_subscript<refl::TypedProperty<std::array<int,2>, false>>::value,
             "non-readonly array must expose operator[]");
-        // Read the whole array via the copy conversion (the safe read path).
+        // Element reads through the const overload:
+        CHECK(p->data[0] == 10, "readonly array element read: data[0] == 10");
+        CHECK(p->data[1] == 20, "readonly array element read: data[1] == 20");
+        // Element writes through a readonly array are a compile error:
+        static_assert(!is_assignable_subscript<DataProp>::value,
+            "readonly array element must not be assignable (const ref)");
+        static_assert(is_assignable_subscript<refl::TypedProperty<std::array<int,2>, false>>::value,
+            "non-readonly array element must be assignable");
+        // Read the whole array via the copy conversion still works too.
         std::array<int, 2> copy = p->data;
-        CHECK(copy[0] == 10, "readonly array read via copy: data[0] == 10");
         CHECK(copy[1] == 20, "readonly array read via copy: data[1] == 20");
     }
 
