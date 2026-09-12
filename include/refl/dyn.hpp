@@ -53,6 +53,13 @@ struct FixedString {
 //
 // Dyn<T> is non-copyable, non-movable.
 // ---------------------------------------------------------------------------
+// Compile-time count of overloads on a TypedMethod<Sigs...>.
+template <typename T> struct method_overload_count;
+template <typename... Sigs>
+struct method_overload_count<TypedMethod<Sigs...>> {
+    static constexpr std::size_t value = sizeof...(Sigs);
+};
+
 template <typename T>
 class Dyn {
     struct Dispatch;
@@ -72,6 +79,7 @@ class Dyn {
     void populate() {
         if constexpr (std::is_class_v<T> && !std::meta::is_abstract_type(^^T)) {
             overload_storage_.clear();
+            hook_contexts_.clear();
             const ClassInfo* info = lookup_class_info();
             if (!info) return;
             static constexpr auto dm = std::define_static_array(
@@ -153,14 +161,40 @@ class Dyn {
     // Dynamic properties (runtime-added, not reflected from T).
     std::map<std::string, Object> dynamic_props_;
 
-    // Shared callback-dispatcher for both after_call (method hooks) and
-    // after_set (property-change hooks).  ctx points at the
-    // std::vector<std::function<void(Object&)>> stored in invoke_hooks_ or
-    // change_hooks_ (std::map nodes are stable).
+    // Callback-dispatcher for property-change hooks (after_set).
+    // ctx points at the std::vector<std::function<void(Object&)>> stored
+    // in change_hooks_ (std::map nodes are stable).
     static void fire_hooks(void* ctx, Object& result) {
         auto* v = static_cast<
             std::vector<std::function<void(Object&)>>*>(ctx);
         for (auto& cb : *v) cb(result);
+    }
+
+    // --- Method hook wrapping (connect).
+    //     Instead of a per-field callback on TypedMethod (removed from
+    //     proxy.hpp for simplicity), connect() wraps each overload's
+    //     invoker with a hook trampoline.  The trampoline calls the
+    //     original invoker, then fires the hook list.  Per-overload
+    //     state (original invoker, original obj, hook list pointer) is
+    //     stored in MethodHookCtx; obj is redirected to the ctx array
+    //     so the trampoline can recover it.  Each overload gets a
+    //     distinct compile-time-indexed trampoline (hook_trampoline<I>)
+    //     so it knows which context slot to use.
+    struct MethodHookCtx {
+        InvokerFn original_invoker;
+        void* original_obj;
+        std::vector<std::function<void(Object&)>>* hooks;
+    };
+    std::map<std::string, std::vector<MethodHookCtx>> hook_contexts_;
+
+    template <std::size_t I>
+    static Object hook_trampoline(const std::shared_ptr<void>& owner,
+                                   void* ctx, const Object* args) {
+        auto* contexts = static_cast<MethodHookCtx*>(ctx);
+        Object result = contexts[I].original_invoker(
+            owner, contexts[I].original_obj, args);
+        for (auto& cb : *contexts[I].hooks) cb(result);
+        return result;
     }
 
     // --- Dynamic mode: runtime callable storage + trampolines.
@@ -318,6 +352,7 @@ public:
     void make_dynamic() {
         dynamic_mode_ = true;
         dynamic_callables_.clear();
+        hook_contexts_.clear();
         // Don't populate — implement() will wire each method.
     }
 
@@ -439,15 +474,19 @@ public:
     // Connect a callback to a method (multi-listener).  Multiple connect()
     // calls on the same method name accumulate — all callbacks fire.
     //
-    //   p.connect("sum", [](std::any& r) { ... });
-    //   p.connect("sum", [](std::any& r) { ... });  // also fires
+    //   p.connect("sum", [](Object& r) { ... });
+    //   p.connect("sum", [](Object& r) { ... });  // also fires
+    //
+    // Implementation: on first connect for a method, each overload's
+    // invoker is replaced with hook_trampoline<I>, which calls the
+    // original invoker then fires the hook list.  Subsequent connects
+    // just append to the list (already wrapped).  Repopulation (reset,
+    // populate) clears the wrapping — re-connect to restore hooks.
     void connect(std::string_view name,
                   std::function<void(Object&)> cb) {
         auto key = std::string(name);
         auto& vec = invoke_hooks_[key];
         vec.push_back(std::move(cb));
-        void* field = find_field(name);
-        if (!field) return;
         static constexpr auto dm = std::define_static_array(
             std::meta::nonstatic_data_members_of(^^Dispatch,
                 std::meta::access_context::unchecked()));
@@ -459,9 +498,29 @@ public:
                     constexpr auto nm_sv = std::meta::identifier_of(f);
                     constexpr auto nm = std::define_static_string(nm_sv);
                     if (name == std::string_view(nm)) {
-                        auto* tm = static_cast<std::remove_cv_t<FT>*>(field);
-                        tm->hook_ctx = &vec;
-                        tm->after_call = &fire_hooks;
+                        auto& ctxs = hook_contexts_[key];
+                        if (ctxs.empty()) {
+                            constexpr auto N = method_overload_count<
+                                std::remove_cv_t<FT>>::value;
+                            auto* tm = &dispatch_.[:f:];
+                            const std::size_t m = tm->num;
+                            // Snapshot current overloads before replacing.
+                            std::vector<detail::OverloadEntry> saved;
+                            if (tm->overloads && m > 0)
+                                saved.assign(tm->overloads, tm->overloads + m);
+                            auto& overs = overload_storage_[key];
+                            overs.resize(N);
+                            ctxs.resize(N);
+                            for (std::size_t i = 0; i < m; ++i) {
+                                ctxs[i] = {saved[i].invoker, tm->obj, &vec};
+                                overs[i].is_const = saved[i].is_const;
+                            }
+                            [&]<std::size_t... I>(std::index_sequence<I...>) {
+                                ((overs[I].invoker = &hook_trampoline<I>), ...);
+                            }(std::make_index_sequence<N>{});
+                            tm->overloads = overs.data();
+                            tm->obj = ctxs.data();
+                        }
                     }
                 }
             }

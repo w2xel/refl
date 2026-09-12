@@ -105,9 +105,6 @@ struct TypedMethod {
     void* obj = nullptr;
     std::shared_ptr<void> owner;  // shared_ptr for aliasing invoker calls
 
-    void (*after_call)(void* ctx, Object& result) = nullptr;
-    void* hook_ctx = nullptr;
-
     // Returns normalized param-type names per overload, in Sigs-pack
     // (interface declaration) order.  Used by populate() to match the
     // impl's FunctionInfo entries by signature, not just by name — so
@@ -182,7 +179,6 @@ public:
                 sizeof...(Args) == 0 ? nullptr : refs.data();
             Object result = overloads[I].invoker(
                 owner, obj, args_ptr);
-            if (after_call) after_call(hook_ctx, result);
             if constexpr (std::is_void_v<R>) return;
             else {
                 auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
