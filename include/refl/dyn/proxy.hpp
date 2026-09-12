@@ -102,6 +102,31 @@ struct TypedMethod {
     void (*after_call)(void* ctx, Object& result) = nullptr;
     void* hook_ctx = nullptr;
 
+    // Returns normalized param-type names per overload, in Sigs-pack
+    // (interface declaration) order.  Used by populate() to match the
+    // impl's FunctionInfo entries by signature, not just by name — so
+    // overloads are correctly paired even when the impl type declares
+    // them in a different order than the interface.
+    static std::vector<std::vector<std::string>> expected_param_types() {
+        return { sig_param_names<typename sig_traits<Sigs>::args_type>()... };
+    }
+
+private:
+    template <typename Tuple>
+    static std::vector<std::string> sig_param_names() {
+        return sig_param_names_impl<Tuple>(
+            std::make_index_sequence<std::tuple_size_v<Tuple>>{});
+    }
+
+    template <typename Tuple, std::size_t... I>
+    static std::vector<std::string> sig_param_names_impl(
+            std::index_sequence<I...>) {
+        return { std::string(detail::normalize_type(
+            detail::type_name<std::tuple_element_t<I, Tuple>>()))... };
+    }
+
+public:
+
     template <typename... Args>
     auto operator()(Args&&... args) {
         return call_dispatch<0, Args...>(std::forward<Args>(args)...);
@@ -451,9 +476,6 @@ class Proxy {
 
     Dispatch dispatch_;
     Object obj_;
-    // ponytail: overload matching is by name + declaration order, same as Dyn.
-    // If the impl type reorders overloads relative to T, the wrong invoker may
-    // be picked.  Match by param-type signature would fix this; deferred.
     std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
 
     static const ClassInfo* lookup_class_info(std::string_view name) {
@@ -476,15 +498,22 @@ class Proxy {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Non-static method → bind from Object's ClassInfo.
+                        // Non-static method → bind from Object's ClassInfo,
+                        // matching by param-type signature so overloads are
+                        // paired correctly even if the impl type reorders them.
+                        using TM = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].obj = obj_.raw();
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
-                        for (const auto& fi : info->functions)
-                            if (fi.name == key)
-                                vec.push_back({fi.invoker});
+                        for (const auto& exp : TM::expected_param_types())
+                            for (const auto& fi : info->functions)
+                                if (fi.name == key
+                                    && fi.param_types == exp) {
+                                    vec.push_back({fi.invoker});
+                                    break;
+                                }
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
                     } else if constexpr (detail::is_typed_static_method_v<

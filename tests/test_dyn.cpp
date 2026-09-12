@@ -46,8 +46,23 @@ struct IShape {
     virtual ~IShape() = default;
 };
 
+// Interface with overloaded method, declared in one order.
+struct IOverload {
+    int compute(int);
+    int compute(int, int);
+};
+
+// Impl with the same overloads declared in REVERSED order.
+// Without signature matching, the invokers would be paired by position
+// and p->compute(3) would call the 2-arg invoker — wrong.
+struct OverloadImpl {
+    int compute(int a, int b) { return a * 10 + b; }
+    int compute(int a) { return a * 100; }
+};
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
+[[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -269,6 +284,18 @@ int main() {
     (void)rp2->sum();
     // rp2->sum() returns 3 (1+2), forwarded to rp3's hook.
     CHECK(cross_result == 3, "cross-object connect: rp3 hook should receive rp2's result (3)");
+
+    // === Proxy: signature-matched overload binding ===
+    // IOverload declares compute(int) then compute(int,int).
+    // OverloadImpl declares them REVERSED: compute(int,int) then compute(int).
+    // Signature matching must pair them correctly despite the reordering.
+    auto ov_cls = *refl::find_class("OverloadImpl");
+    auto ov_obj = *ov_cls.constructors()[0].call();
+    refl::Proxy<IOverload> po(ov_obj);
+    int oc1 = po->compute(3);
+    CHECK(oc1 == 300, "compute(3) should be 300 (3*100), not 30 (wrong invoker)");
+    int oc2 = po->compute(3, 2);
+    CHECK(oc2 == 32, "compute(3,2) should be 32 (3*10+2), not wrong invoker");
 
     std::printf("dyn dispatch test ok\n");
     return 0;

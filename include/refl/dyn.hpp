@@ -158,16 +158,22 @@ class Dyn {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Non-static member function → bind from ClassInfo.
+                        // Non-static member function → bind from ClassInfo,
+                        // matching by param-type signature.
+                        using TM = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].obj = dispatch_.obj.get();
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
-                        for (const auto& fi : info->functions)
-                            if (fi.name == key)
-                                vec.push_back({fi.invoker});
+                        for (const auto& exp : TM::expected_param_types())
+                            for (const auto& fi : info->functions)
+                                if (fi.name == key
+                                    && fi.param_types == exp) {
+                                    vec.push_back({fi.invoker});
+                                    break;
+                                }
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
                     } else if constexpr (detail::is_typed_static_method_v<
@@ -375,15 +381,20 @@ public:
                     using FT = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FT>>) {
+                        using TM = std::remove_cv_t<FT>;
                         dispatch_.[:field:].obj = dispatch_.obj.get();
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         auto key = std::string(nm);
                         auto& vec = overload_storage_[key];
                         vec.clear();
-                        for (const auto& fi : info->functions)
-                            if (fi.name == key)
-                                vec.push_back({fi.invoker});
+                        for (const auto& exp : TM::expected_param_types())
+                            for (const auto& fi : info->functions)
+                                if (fi.name == key
+                                    && fi.param_types == exp) {
+                                    vec.push_back({fi.invoker});
+                                    break;
+                                }
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
                     }
