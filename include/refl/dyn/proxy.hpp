@@ -286,12 +286,15 @@ struct TypedMethod {
         return { sig_param_names<typename sig_traits<Sigs>::args_type>()... };
     }
 
-    // Returns return-type display strings per overload, in Sigs-pack order.
-    // Used by populate() to verify the impl's return type matches the
-    // interface's, catching structural mismatches at bind time.
+    // Returns normalized return-type strings per overload, in Sigs-pack
+    // order.  Both sides (interface and impl) are normalized via
+    // detail::normalize_type so const/ref-qualifier differences don't
+    // cause false mismatches — same pattern as expected_type() for
+    // TypedProperty.
     static std::vector<std::string> expected_return_types() {
-        return { std::string(detail::type_name<
-            std::remove_cvref_t<typename sig_traits<Sigs>::return_type>>())... };
+        return { std::string(detail::normalize_type(
+            detail::type_name<
+                std::remove_cvref_t<typename sig_traits<Sigs>::return_type>>()))... };
     }
 
 private:
@@ -392,7 +395,8 @@ public:
             if constexpr (I + 1 < sizeof...(Sigs))
                 return call_dispatch<I + 1, Args...>(std::forward<Args>(args)...);
             else
-                static_assert(sizeof...(Args) == 0, "no matching overload");
+                static_assert(false,
+                    "no matching overload for the given argument types");
         }
     }
 };
@@ -785,7 +789,8 @@ class Proxy {
                                         join_types(exp_params[oi]) +
                                         "] in type '" +
                                         std::string(obj_.class_name()) + "'");
-                                if (r.fi->return_type != exp_returns[oi])
+                                if (detail::normalize_type(r.fi->return_type)
+                                        != exp_returns[oi])
                                     throw std::runtime_error(
                                         "Proxy: return type mismatch on '" +
                                         key + "' — interface expects '" +
