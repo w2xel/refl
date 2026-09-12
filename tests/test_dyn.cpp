@@ -100,6 +100,36 @@ struct Vec2Other {
     bool operator<(const Vec2Other& o) const { return x + y < o.x + o.y; }
 };
 
+// For Proxy operator+(concrete value) tests — interface with operator+(int).
+struct IScalable {
+    int v;
+    IScalable(int v) : v(v) {}
+    IScalable operator*(int s) const { return IScalable(v * s); }
+};
+struct ScalableImpl {
+    int v;
+    ScalableImpl(int v) : v(v) {}
+    ScalableImpl operator*(int s) const { return ScalableImpl(v * s); }
+};
+
+// For Proxy overloaded-operator dispatch tests — operator+(int) and
+// operator+(double) with distinct return values so we can tell which
+// overload ran.
+struct IOverOp {
+    int v;
+    IOverOp(int v) : v(v) {}
+    IOverOp operator+(int x) const;
+    IOverOp operator+(double x) const;
+};
+struct OverOpImpl {
+    int v;
+    OverOpImpl(int v) : v(v) {}
+    // Declared in reverse order vs the interface — dispatch must match
+    // by argument type, not by declaration order.
+    OverOpImpl operator+(double) const { return OverOpImpl(7070); }
+    OverOpImpl operator+(int) const { return OverOpImpl(1010); }
+};
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
@@ -109,6 +139,8 @@ struct Vec2Other {
 [[maybe_unused]] static refl::Reg<SimpleImpl> reg_simple_impl;
 [[maybe_unused]] static refl::Reg<Vec2Impl> reg_vec2_impl;
 [[maybe_unused]] static refl::Reg<Vec2Other> reg_vec2_other;
+[[maybe_unused]] static refl::Reg<ScalableImpl> reg_scalable_impl;
+[[maybe_unused]] static refl::Reg<OverOpImpl> reg_overop_impl;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -444,6 +476,31 @@ int main() {
             threw = true;
         }
         CHECK(threw, "pv1 + pv2 with mismatched impls should throw runtime_error");
+    }
+
+    // === Proxy operator with concrete value ===
+    // operator*(int) — the generic template<U> path, not Proxy+Proxy.
+    {
+        auto sp = std::make_shared<ScalableImpl>(5);
+        refl::Proxy<IScalable> p(sp);
+        auto scaled = p * 3;
+        CHECK(scaled->v == 15, "p * 3 should be 15 (5*3)");
+    }
+
+    // === Proxy overloaded-operator dispatch ===
+    // operator+(int) and operator+(double) must dispatch to the correct
+    // overload based on the argument type, not the declaration order.
+    {
+        auto sp = std::make_shared<OverOpImpl>(1);
+        refl::Proxy<IOverOp> p(sp);
+
+        // int argument → operator+(int), returns 1010
+        auto ri = p + 3;
+        CHECK(ri->v == 1010, "p + 3 (int) should dispatch to operator+(int) → 1010");
+
+        // double argument → operator+(double), returns 7070
+        auto rd = p + 3.0;
+        CHECK(rd->v == 7070, "p + 3.0 (double) should dispatch to operator+(double) → 7070");
     }
 
     std::printf("dyn dispatch test ok\n");
