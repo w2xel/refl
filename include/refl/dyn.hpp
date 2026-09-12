@@ -4,13 +4,12 @@
 // pool).  Proxy<T> synthesizes a compile-time dispatch struct (via
 // define_aggregate) with named callable fields for each member function and
 // data member of T, so you get real return types at the call site — no
-// std::any, no std::variant.  The object behind the proxy can be any type
-// whose interface is structurally compatible with T (same method names and
-// signatures), not just T itself.
+// std::any, no std::variant.  The object behind the proxy is a type-erased
+// refl::Object — any registered type with compatible public methods works,
+// no inheritance required.
 //
-//   refl::Proxy<IShape> p;
-//   p.bind<Circle>(5);       // Circle need not inherit IShape
-//   int a = p->area(2);      // real return type, calls Circle::area
+//   refl::Proxy<IDrawable> p(obj);   // obj is a type-erased refl::Object
+//   int a = p->render(2);            // real return type, calls obj's method
 //
 // Dyn<T> extends this with runtime method implementation (mocking), Qt-style
 // hooks (connect / on_change / emit), and dynamic properties.
@@ -26,24 +25,33 @@
 #include <map>
 namespace refl {
 // ---------------------------------------------------------------------------
-// Proxy<T> — typed dispatch struct with structural implementation binding.
+// Proxy<T> — typed dispatch struct with type-erased object binding.
 //
 // Synthesizes a Dispatch struct from T's public interface at compile time
 // (same field types as Dyn<T>: TypedMethod, TypedProperty, etc.).  At
-// runtime, bind<Impl>(args...) constructs an Impl object and wires the
-// dispatch fields from Impl's ClassInfo — so calls through the proxy
-// dispatch to Impl's methods with T's typed return types.
+// runtime, bind(Object) wires the dispatch fields from the Object's
+// ClassInfo — so calls through the proxy dispatch to the object's methods
+// with T's typed return types.
 //
-// Impl need not inherit T.  Matching is by method name (overloads in
-// declaration order, same as Dyn).  This is structural typing through the
-// reflection pool: any type with compatible public methods works.
+// The object behind the proxy can be any type whose interface is
+// structurally compatible with T (same method names and signatures),
+// not just T itself.  Matching is by method name (overloads in
+// declaration order, same as Dyn).  This is structural typing through
+// the reflection pool: any type with compatible public methods works.
 //
-//   struct IShape { virtual int area(int) = 0; virtual ~IShape() = default; };
-//   struct Circle { int r; Circle(int r) : r(r) {} int area(int s) const { ... } };
+// T need not be abstract or have pure-virtual methods — it is a
+// compile-time interface descriptor only.  Its methods are never called;
+// they exist solely for signature extraction via reflection.
 //
-//   refl::Proxy<IShape> p;
-//   p.bind<Circle>(5);
-//   int a = p->area(2);   // calls Circle::area, returns int
+//   struct IDrawable { int render(int) { __builtin_unreachable(); } };
+//   struct Square { int side; Square(int s) : side(s) {}
+//                  int render(int scale) const { ... } };
+//
+//   refl::ensure_registered<Square>();
+//   auto cls = *refl::find_class("Square");
+//   auto obj = *cls.constructors()[0].call(4);  // type-erased Object
+//   refl::Proxy<IDrawable> p(obj);
+//   int a = p->render(2);   // calls Square::render, returns int
 //
 // Proxy<T> is non-copyable, non-movable (dispatch fields point into it).
 // ---------------------------------------------------------------------------
@@ -147,24 +155,23 @@ class Proxy {
     }
 
     Dispatch dispatch_;
-    std::shared_ptr<void> obj_;
+    Object obj_;
     // ponytail: overload matching is by name + declaration order, same as Dyn.
-    // If Impl reorders overloads relative to T, the wrong invoker may be picked.
-    // Match by param-type signature would fix this; deferred until needed.
+    // If the impl type reorders overloads relative to T, the wrong invoker may
+    // be picked.  Match by param-type signature would fix this; deferred.
     std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
 
-    template <typename Impl>
-    static const ClassInfo* lookup_impl_info() {
+    static const ClassInfo* lookup_class_info(std::string_view name) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        auto it = class_pool().find(std::string(detail::type_name<Impl>()));
+        auto it = class_pool().find(std::string(name));
         return it != class_pool().end() ? it->second.get() : nullptr;
     }
 
-    template <typename Impl>
     void populate() {
         if constexpr (std::is_class_v<T>) {
+            if (!obj_.valid()) return;
             overload_storage_.clear();
-            const ClassInfo* info = lookup_impl_info<Impl>();
+            const ClassInfo* info = lookup_class_info(obj_.class_name());
             if (!info) return;
             static constexpr auto dm = std::define_static_array(
                 std::meta::nonstatic_data_members_of(^^Dispatch,
@@ -174,9 +181,9 @@ class Proxy {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Non-static method → bind from Impl's ClassInfo.
-                        dispatch_.[:field:].obj = obj_.get();
-                        dispatch_.[:field:].owner = obj_;
+                        // Non-static method → bind from Object's ClassInfo.
+                        dispatch_.[:field:].obj = obj_.raw();
+                        dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
@@ -187,7 +194,7 @@ class Proxy {
                         dispatch_.[:field:].num = vec.size();
                     } else if constexpr (detail::is_typed_static_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Static method → bind from Impl's ClassInfo.
+                        // Static method → bind from Object's ClassInfo.
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         for (const auto& fi : info->static_functions)
@@ -197,7 +204,7 @@ class Proxy {
                             }
                     } else if constexpr (detail::is_typed_static_property_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Static property → bind from Impl's ClassInfo.
+                        // Static property → bind from Object's ClassInfo.
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         for (const auto& fi : info->static_fields)
@@ -207,9 +214,9 @@ class Proxy {
                                 break;
                             }
                     } else {
-                        // Non-static data member → bind from Impl's ClassInfo.
-                        dispatch_.[:field:].obj = obj_.get();
-                        dispatch_.[:field:].owner = obj_;
+                        // Non-static data member → bind from Object's ClassInfo.
+                        dispatch_.[:field:].obj = obj_.raw();
+                        dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         for (const auto& fi : info->fields)
@@ -229,21 +236,18 @@ class Proxy {
 public:
     Proxy() = default;
 
-    // Construct an Impl object and wire T's dispatch fields to Impl's
-    // methods.  Impl need not inherit T — matching is by method name.
-    template <typename Impl, typename... Args>
-    void bind(Args&&... args) {
-        ensure_registered<Impl>();
-        if constexpr (std::is_class_v<T> && std::is_class_v<Impl>) {
-            obj_ = std::make_shared<Impl>(std::forward<Args>(args)...);
-            populate<Impl>();
-        }
-    }
+    // Bind a type-erased Object — wires T's dispatch fields to the
+    // Object's methods via its ClassInfo.  The Object's type must be
+    // registered in the pool (e.g. via ensure_registered<T>() or
+    // Constructor::call).  The Object need not be owning — for non-owning
+    // Objects the caller must keep the source alive.
+    explicit Proxy(Object obj) : obj_(std::move(obj)) { populate(); }
+    void bind(Object obj) { obj_ = std::move(obj); populate(); }
 
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }
 
-    bool is_bound() const { return obj_ != nullptr; }
+    bool is_bound() const { return obj_.valid(); }
 
     Proxy(const Proxy&) = delete;
     Proxy(Proxy&&) = delete;
