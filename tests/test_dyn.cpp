@@ -576,6 +576,39 @@ int main() {
             "calls should still dispatch to original object (value 11) after failed rebind");
     }
 
+    // === Proxy: failed rebind to owning-but-incompatible object leaves
+    // the original binding intact (no use-after-free) ===
+    // bind() validates the new object's structural compatibility via
+    // populate() BEFORE releasing the existing binding.  Before the fix,
+    // populate() cleared overload_storage_ and could throw partway through
+    // (after obj_ was already moved to the new object), leaving dispatch_
+    // overloads pointers dangling into the freed overload_storage_ vectors
+    // while obj_ pointed at the new (incompatible) object — a use-after-free
+    // on the next call.  Now the rebind is transactional: a failed populate
+    // leaves the proxy bound to its original object.
+    {
+        auto sp1 = std::make_shared<SimpleImpl>(11);
+        refl::Proxy<ISimple> p(sp1);
+        CHECK(p->get_value() == 11, "original binding value 11");
+
+        // HasPartial is registered and owning, but has no get_value() —
+        // populate() throws "no matching overload" after clearing storage.
+        auto sp2 = std::make_shared<HasPartial>();
+        refl::Object incompatible(sp2);  // owning Object
+        bool threw = false;
+        try {
+            p.bind(incompatible);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw, "rebind to structurally incompatible owning object should throw");
+        CHECK(p.is_bound(), "proxy should still be bound after failed rebind");
+        CHECK(std::string(p.get_class().name()) == "SimpleImpl",
+            "get_class should still report original type SimpleImpl after failed rebind");
+        CHECK(p->get_value() == 11,
+            "calls should still dispatch to original object (value 11) after failed rebind — no use-after-free");
+    }
+
     // === Proxy: cross-base ambiguous name-lookup rejected at bind ===
     // DiamondAmbig inherits two bases each declaring method(int).  The lookup
     // hits two distinct base subobjects — an ambiguity C++ rejects — so the

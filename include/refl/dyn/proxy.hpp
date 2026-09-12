@@ -96,37 +96,6 @@ consteval std::meta::info make_fn_sig(std::meta::info m) {
     return std::meta::substitute(^^fn_type, args);
 }
 
-// consteval: collect the const-ness of all overloads for a named method
-// on the interface type, in Sigs-pack order.  Used by populate() to
-// verify the impl's method const-ness matches the interface's.
-// Respects C++ name-hiding: if the type declares any own method of this
-// name, base methods of the same name are hidden and not collected —
-// matching find_function_in_hierarchy on the impl side.
-consteval std::vector<bool> collect_const_quals(std::meta::info type,
-                                                   std::string_view name) {
-    std::vector<bool> result;
-    bool found_own = false;
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (is_public_method(m) && !std::meta::is_static_member(m)
-            && std::meta::has_identifier(m)
-            && std::meta::identifier_of(m) == name) {
-            result.push_back(is_const_method(m));
-            found_own = true;
-        }
-    }
-    if (!found_own) {
-        for (auto b : std::meta::bases_of(type,
-                std::meta::access_context::unchecked())) {
-            if (std::meta::is_public(b)) {
-                auto inherited = collect_const_quals(std::meta::type_of(b), name);
-                for (bool c : inherited) result.push_back(c);
-            }
-        }
-    }
-    return result;
-}
-
 }  // namespace detail
 
 template <typename... Sigs>
@@ -390,6 +359,25 @@ consteval void collect_all_methods(std::meta::info type,
             }
         }
     }
+}
+
+// consteval: collect the const-ness of all overloads for a named method
+// on the interface type, in Sigs-pack order.  Used by populate() to
+// verify the impl's method const-ness matches the interface's.
+// Reuses collect_all_methods (the single hierarchy walker with name-
+// hiding) and filters by name, so the walk + name-hiding logic lives in
+// one place.  Order is preserved: own methods in declaration order, then
+// inherited non-hidden — matching the Sigs-pack order built by
+// make_dispatch_specs, so exp_const_arr[i] pairs with exp_params[i].
+consteval std::vector<bool> collect_const_quals(std::meta::info type,
+                                                   std::string_view name) {
+    std::vector<std::meta::info> all;
+    collect_all_methods(type, all);
+    std::vector<bool> result;
+    for (auto m : all)
+        if (std::meta::identifier_of(m) == name)
+            result.push_back(is_const_method(m));
+    return result;
 }
 
 // consteval: build the dispatch struct member specs for T's public
@@ -696,7 +684,22 @@ public:
     //   auto sp = std::make_shared<Square>(4);
     //   refl::Proxy<IDrawable> p(sp);   // implicit, owning
     explicit Proxy(Object obj) : obj_(std::move(obj)) { check_owned(obj_); populate(); }
-    void bind(Object obj) { check_owned(obj); obj_ = std::move(obj); populate(); }
+    // Transactional rebind: build a temporary proxy bound to the new object
+    // (which validates structural compatibility via populate()) before
+    // releasing the existing binding.  populate() clears overload_storage_
+    // then walks the ClassInfo and can throw partway through (missing
+    // overload, return-type mismatch, const-ness mismatch, missing field).
+    // Before this fix, a throw there left dispatch_ overloads pointers
+    // dangling into the freed overload_storage_ vectors while obj_ already
+    // pointed at the new object — a use-after-free on the next call.  Now
+    // the failed populate destroys the temporary without touching *this.
+    // ponytail: double populate() walk (once in the temporary, once in the
+    // move-assign) on success — O(members), negligible for realistic types.
+    void bind(Object obj) {
+        check_owned(obj);
+        Proxy tmp(std::move(obj));
+        *this = std::move(tmp);
+    }
 
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }
