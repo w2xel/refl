@@ -66,6 +66,61 @@ struct OverloadEntry {
     InvokerFn invoker;
 };
 
+// Runtime: search a ClassInfo and its registered public bases for a
+// field by name.  Returns the FieldInfo and accumulated byte offset to
+// the base subobject (0 for direct fields), or {nullptr, 0} if not found.
+// Used by Proxy and Dyn populate() to bind inherited data members.
+// The pool is append-only (no unregister), so ClassInfo pointers remain
+// valid after the lock is released.
+struct FieldSearchResult {
+    const FieldInfo* fi;
+    std::ptrdiff_t offset;
+};
+inline FieldSearchResult find_field_in_hierarchy(
+        const ClassInfo* info, std::string_view name) {
+    for (const auto& fi : info->fields)
+        if (fi.name == name) return {&fi, 0};
+    for (const auto& b : info->bases) {
+        const ClassInfo* base_info;
+        {
+            std::lock_guard<std::mutex> lk(pool_mutex());
+            auto it = class_pool().find(b.name);
+            if (it == class_pool().end()) continue;
+            base_info = it->second.get();
+        }
+        auto r = find_field_in_hierarchy(base_info, name);
+        if (r.fi) return {r.fi, b.offset + r.offset};
+    }
+    return {nullptr, 0};
+}
+
+// Runtime: search a ClassInfo and its registered public bases for a
+// function by name + param-type signature.  Returns the FunctionInfo
+// and accumulated byte offset, or {nullptr, 0} if not found.
+struct FunctionSearchResult {
+    const FunctionInfo* fi;
+    std::ptrdiff_t offset;
+};
+inline FunctionSearchResult find_function_in_hierarchy(
+        const ClassInfo* info, std::string_view name,
+        const std::vector<std::string>& param_types) {
+    for (const auto& fi : info->functions)
+        if (fi.name == name && fi.param_types == param_types)
+            return {&fi, 0};
+    for (const auto& b : info->bases) {
+        const ClassInfo* base_info;
+        {
+            std::lock_guard<std::mutex> lk(pool_mutex());
+            auto it = class_pool().find(b.name);
+            if (it == class_pool().end()) continue;
+            base_info = it->second.get();
+        }
+        auto r = find_function_in_hierarchy(base_info, name, param_types);
+        if (r.fi) return {r.fi, b.offset + r.offset};
+    }
+    return {nullptr, 0};
+}
+
 // consteval: build a function-type reflection R(Args...) from a member.
 consteval std::meta::info make_fn_sig(std::meta::info m) {
     auto rt = std::meta::return_type_of(m);
@@ -76,7 +131,8 @@ consteval std::meta::info make_fn_sig(std::meta::info m) {
     return std::meta::substitute(^^fn_type, args);
 }
 
-// consteval: collect all overload signatures for a function name.
+// consteval: collect all overload signatures for a function name,
+// walking the base hierarchy for inherited methods.
 // Applies the same filters as make_info: public, non-deleted, non-consteval.
 consteval std::vector<std::meta::info>
 collect_sigs(std::meta::info type, std::string_view name) {
@@ -87,6 +143,14 @@ collect_sigs(std::meta::info type, std::string_view name) {
             && !std::meta::is_static_member(m)
             && std::meta::identifier_of(m) == name)
             result.push_back(make_fn_sig(m));
+    }
+    // Walk public bases for inherited methods.
+    for (auto b : std::meta::bases_of(type,
+            std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b)) {
+            auto inherited = collect_sigs(std::meta::type_of(b), name);
+            for (auto s : inherited) result.push_back(s);
+        }
     }
     return result;
 }
@@ -147,7 +211,8 @@ public:
         if constexpr (matches_sig<Sig, Args...>) {
             using R = typename sig_traits<Sig>::return_type;
             if (!overloads || I >= num)
-                throw std::bad_cast{};
+                throw std::runtime_error(
+                    "Proxy: call to unbound or missing overload");
             // Build Object arg array from forwarded args.
             std::tuple<std::decay_t<Args>...> storage(
                 std::forward<Args>(args)...);
@@ -164,11 +229,18 @@ public:
             if (after_call) after_call(hook_ctx, result);
             if constexpr (std::is_void_v<R>) return;
             else {
-                // Extract the return value from the Object.
+                // Extract the return value from the Object, throwing
+                // runtime_error (not bad_expected_access) on type mismatch.
                 if constexpr (std::is_reference_v<R>) {
-                    return *result.template cast_ref<std::remove_cvref_t<R>>().value();
+                    auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
+                    if (!cr) throw std::runtime_error(
+                        "Proxy: return type mismatch on method call");
+                    return *cr.value();
                 } else {
-                    return std::move(*result.template cast_ref<R>().value());
+                    auto cr = result.template cast_ref<R>();
+                    if (!cr) throw std::runtime_error(
+                        "Proxy: return type mismatch on method call");
+                    return std::move(*cr.value());
                 }
             }
         } else {
@@ -199,9 +271,13 @@ struct TypedProperty {
 
     // Implicit conversion to T (read).
     operator T() const {
-        if (!getter || !obj) throw std::bad_cast{};
+        if (!getter || !obj) throw std::runtime_error(
+            "Proxy: read from unbound property");
         Object result = getter(obj);
-        return std::move(*result.template cast_ref<T>().value());
+        auto cr = result.template cast_ref<T>();
+        if (!cr) throw std::runtime_error(
+            "Proxy: property type mismatch on read");
+        return std::move(*cr.value());
     }
 
     // Assignment from T (write).  Compile error when Readonly=true.
@@ -244,59 +320,12 @@ struct TypedProperty {
 };
 
 // ---------------------------------------------------------------------------
-// TypedStaticProperty<T, Readonly> — static data member proxy.  No obj
-// pointer needed; accesses static storage via function pointers.
-//
-// Retained for Dyn<T>'s dispatch struct.  Proxy<T> does not synthesize
-// static fields — it exposes get_class() for static access instead.
-// ---------------------------------------------------------------------------
-template <typename T, bool Readonly = false>
-struct TypedStaticProperty {
-    StaticGetterFn getter = nullptr;
-    StaticSetterFn setter = nullptr;
-
-    operator T() const {
-        if (!getter) throw std::bad_cast{};
-        Object result = getter();
-        return std::move(*result.template cast_ref<T>().value());
-    }
-
-    void operator=(T val) requires (!Readonly) {
-        if (!setter) return;
-        std::decay_t<T> storage(std::move(val));
-        Object val_ref(storage);
-        setter(&val_ref);
-    }
-
-    static constexpr bool is_readonly() { return Readonly; }
-};
-
-// ---------------------------------------------------------------------------
-// TypedStaticMethod<R> — static member function proxy.  No obj pointer.
-//
-// Retained for Dyn<T>'s dispatch struct.  Proxy<T> does not synthesize
-// static methods — it exposes get_class() for static access instead.
-// ---------------------------------------------------------------------------
-template <typename R>
-struct TypedStaticMethod {
-    using is_static_method = void;
-    StaticInvokerFn invoker = nullptr;
-
-    R operator()() {
-        Object result = invoker(nullptr);
-        if constexpr (std::is_void_v<R>) return;
-        else return std::move(*result.template cast_ref<R>().value());
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Field-type builders — must be after TypedMethod/TypedProperty definitions
 // because they use ^^TypedMethod / ^^TypedProperty in consteval substitute().
 //
-// Proxy<T> does not synthesize static fields or methods into its dispatch
-// struct: statics are class-level, not instance-level, and belong on
-// refl::Class.  Proxy<T>::get_class() returns the bound object's Class for
-// static access.  The static builders/traits below are retained for Dyn<T>.
+// Statics are not proxied: they are class-level, not instance-level, and
+// belong on refl::Class.  Proxy<T>::get_class() and Dyn<T>::get_class()
+// return the bound object's Class for static access.
 // ---------------------------------------------------------------------------
 namespace detail {
 
@@ -307,46 +336,14 @@ template <typename... Sigs> struct is_typed_method<TypedMethod<Sigs...>>
 template <typename T> inline constexpr bool is_typed_method_v =
     is_typed_method<T>::value;
 
-// Check if a dispatch field type is a TypedStaticMethod (used by Dyn<T>).
-template <typename T> struct is_typed_static_method : std::false_type {};
-template <typename R>
-struct is_typed_static_method<TypedStaticMethod<R>> : std::true_type {};
-template <typename T> inline constexpr bool is_typed_static_method_v =
-    is_typed_static_method<T>::value;
-
-// Check if a dispatch field type is a TypedStaticProperty (used by Dyn<T>).
-template <typename T> struct is_typed_static_property : std::false_type {};
-template <typename T2, bool R>
-struct is_typed_static_property<TypedStaticProperty<T2, R>> : std::true_type {};
-template <typename T> inline constexpr bool is_typed_static_property_v =
-    is_typed_static_property<T>::value;
-
 // consteval: build the TypedMethod<Sigs...> type for a function name.
 consteval std::meta::info make_typed_method_type(std::meta::info type,
                                                     std::string_view name) {
     return std::meta::substitute(^^TypedMethod, collect_sigs(type, name));
 }
 
-// consteval: build the TypedStaticMethod<R> type for a static function.
-// Used by Dyn<T>; Proxy<T> does not synthesize static methods.
-consteval std::meta::info make_static_method_type(std::meta::info m) {
-    auto rt = std::meta::return_type_of(m);
-    return std::meta::substitute(^^TypedStaticMethod,
-        std::initializer_list<std::meta::info>{rt});
-}
-
-// consteval: build the TypedStaticProperty<T, Readonly> type for a static member.
-// Used by Dyn<T>; Proxy<T> does not synthesize static fields.
-consteval std::meta::info make_static_property_type(std::meta::info m) {
-    auto mt = std::meta::type_of(m);
-    bool is_const = std::meta::is_const_type(mt);
-    auto clean_mt = std::meta::substitute(^^std::remove_cv_t,
-        std::initializer_list<std::meta::info>{mt});
-    return std::meta::substitute(^^TypedStaticProperty,
-        {clean_mt, std::meta::reflect_constant(is_const)});
-}
-
-// consteval: build the TypedProperty field type for a data member name.
+// consteval: build the TypedProperty field type for a data member name,
+// walking the base hierarchy for inherited data members.
 // Passes Readonly=true for const members (deletes operator= at compile time).
 consteval std::meta::info make_property_field_type(std::meta::info type,
                                                        std::string_view name) {
@@ -363,7 +360,115 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
                 {clean_mt, std::meta::reflect_constant(is_const)});
         }
     }
+    // Walk public bases for inherited data members.
+    for (auto b : std::meta::bases_of(type,
+            std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b)) {
+            auto found = make_property_field_type(std::meta::type_of(b), name);
+            if (found != std::meta::info{}) return found;
+        }
+    }
     return std::meta::info{};
+}
+
+// consteval: collect inherited non-static data members from public bases.
+// ponytail: recursive base walk, O(n) per base level; fine for realistic
+// hierarchies.  Virtual inheritance unsupported (offset_of is not constant
+// for virtual bases), matching the rest of the framework.
+consteval void collect_inherited_dms(std::meta::info type,
+        std::vector<std::meta::info>& out) {
+    for (auto b : std::meta::bases_of(type,
+            std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b)) {
+            auto bt = std::meta::type_of(b);
+            for (auto m : std::meta::nonstatic_data_members_of(bt,
+                    std::meta::access_context::unchecked()))
+                out.push_back(m);
+            collect_inherited_dms(bt, out);
+        }
+    }
+}
+
+// consteval: collect all non-static method member reflections from a
+// type and its public bases (for inherited methods).
+consteval void collect_all_methods(std::meta::info type,
+        std::vector<std::meta::info>& out) {
+    for (auto m : std::meta::members_of(type,
+            std::meta::access_context::unchecked())) {
+        if (is_public_method(m) && std::meta::has_identifier(m)
+            && !std::meta::is_static_member(m))
+            out.push_back(m);
+    }
+    for (auto b : std::meta::bases_of(type,
+            std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b))
+            collect_all_methods(std::meta::type_of(b), out);
+    }
+}
+
+// consteval: build the dispatch struct member specs for T's public
+// interface — non-static methods (TypedMethod) and data members
+// (TypedProperty), including inherited members via base hierarchy walk.
+// Shared by Proxy<T> and Dyn<T>.  When add_obj is true, an obj field
+// (std::shared_ptr<T>) is appended (Dyn<T> concrete mode only).
+// Fills the output vector in-place (consteval functions returning
+// std::vector by value are not yet reliably supported by GCC 16.2).
+consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
+        std::vector<std::meta::info>& specs) {
+
+    // Non-static member functions → TypedMethod (one field per name,
+    // carrying all overloads).  Walks the base hierarchy via collect_sigs
+    // and collect_all_methods for inherited methods.
+    std::vector<std::string> seen_fns;
+    std::vector<std::meta::info> all_methods;
+    collect_all_methods(type, all_methods);
+    for (auto m : all_methods) {
+        auto nm = std::string(std::meta::identifier_of(m));
+        bool dup = false;
+        for (const auto& s : seen_fns)
+            if (s == nm) { dup = true; break; }
+        if (!dup) {
+            seen_fns.push_back(nm);
+            auto field_type = make_typed_method_type(type,
+                std::meta::identifier_of(m));
+            specs.push_back(std::meta::data_member_spec(
+                field_type, {.name=nm}));
+        }
+    }
+
+    // Non-static data members → TypedProperty.  Walks the base hierarchy
+    // via make_property_field_type.
+    std::vector<std::string> seen_fields;
+    std::vector<std::meta::info> all_dms;
+    for (auto m : std::meta::nonstatic_data_members_of(type,
+            std::meta::access_context::unchecked()))
+        all_dms.push_back(m);
+    collect_inherited_dms(type, all_dms);
+
+    for (auto m : all_dms) {
+        if (is_public_data_member(m) && std::meta::has_identifier(m)) {
+            auto nm = std::string(std::meta::identifier_of(m));
+            bool dup = false;
+            for (const auto& s : seen_fields)
+                if (s == nm) { dup = true; break; }
+            if (!dup) {
+                seen_fields.push_back(nm);
+                auto field_type = make_property_field_type(type,
+                    std::meta::identifier_of(m));
+                if (field_type != std::meta::info{})
+                    specs.push_back(std::meta::data_member_spec(
+                        field_type, {.name=nm}));
+            }
+        }
+    }
+
+    // Dyn<T> concrete mode: append the obj field.
+    if (add_obj) {
+        auto sp_type = std::meta::substitute(^^std::shared_ptr,
+            std::initializer_list<std::meta::info>{type});
+        specs.push_back(std::meta::data_member_spec(
+            sp_type, {.name="obj"}));
+    }
 }
 
 }  // namespace detail
@@ -403,9 +508,9 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
 //   1. The Object is non-owning (not backed by a shared_ptr) — the proxy
 //      outlives a borrow, so non-owning Objects are rejected.
 //   2. The object's type is not registered in the reflection pool.
-//   3. Any interface method, field, or static member has no match in the
-//      object's ClassInfo.
-//   4. A matched method's return type differs from the interface's.
+//   3. Any interface method or field has no match in the object's ClassInfo.
+//   4. A matched method's return type or a matched field's type differs
+//      from the interface's.
 // This catches structural mismatches and lifetime issues as early as
 // possible — before any call through the proxy.
 //
@@ -421,52 +526,8 @@ class Proxy {
     struct Dispatch;
     consteval {
         if constexpr (std::is_class_v<T>) {
-            static constexpr auto members = std::define_static_array(
-                std::meta::members_of(^^T,
-                    std::meta::access_context::unchecked()));
             std::vector<std::meta::info> specs;
-            std::vector<std::string> seen_fns;
-            template for (constexpr auto m : members) {
-                if constexpr (detail::is_public_method(m)
-                              && std::meta::has_identifier(m)
-                              && !std::meta::is_static_member(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_fns)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_fns.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_typed_method_type(^^T, nm);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            static constexpr auto data_members = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::string> seen_fields;
-            template for (constexpr auto m : data_members) {
-                if constexpr (detail::is_public_data_member(m)
-                              && std::meta::has_identifier(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_fields)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_fields.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_property_field_type(^^T, nm);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // No obj field — Proxy stores the object separately as
-            // Object since the actual type differs from T.
+            detail::make_dispatch_specs(^^T, false, specs);
             std::meta::define_aggregate(^^Dispatch, specs);
         } else {
             std::meta::define_aggregate(^^Dispatch, {});
@@ -518,69 +579,65 @@ class Proxy {
                             std::remove_cv_t<FieldType>>) {
                         // Non-static method → bind from Object's ClassInfo,
                         // matching by param-type signature + return type.
+                        // Searches the base hierarchy for inherited methods.
                         using TM = std::remove_cv_t<FieldType>;
-                        dispatch_.[:field:].obj = obj_.raw();
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
                         auto exp_params = TM::expected_param_types();
                         auto exp_returns = TM::expected_return_types();
+                        std::ptrdiff_t method_off = 0;
                         for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
-                            bool found = false;
-                            for (const auto& fi : info->functions)
-                                if (fi.name == key
-                                    && fi.param_types == exp_params[oi]) {
-                                    if (fi.return_type != exp_returns[oi])
-                                        throw std::runtime_error(
-                                            "Proxy: return type mismatch on '" +
-                                            key + "' — interface expects '" +
-                                            exp_returns[oi] +
-                                            "', impl returns '" +
-                                            fi.return_type + "'");
-                                    vec.push_back({fi.invoker});
-                                    found = true;
-                                    break;
-                                }
-                            if (!found)
+                            auto r = detail::find_function_in_hierarchy(
+                                info, key, exp_params[oi]);
+                            if (!r.fi)
                                 throw std::runtime_error(
                                     "Proxy: no matching overload for '" + key +
                                     "' with params [" +
                                     join_types(exp_params[oi]) +
                                     "] in type '" +
                                     std::string(obj_.class_name()) + "'");
+                            if (r.fi->return_type != exp_returns[oi])
+                                throw std::runtime_error(
+                                    "Proxy: return type mismatch on '" +
+                                    key + "' — interface expects '" +
+                                    exp_returns[oi] +
+                                    "', impl returns '" +
+                                    r.fi->return_type + "'");
+                            vec.push_back({r.fi->invoker});
+                            method_off = r.offset;
                         }
+                        dispatch_.[:field:].obj =
+                            static_cast<char*>(obj_.raw()) + method_off;
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
                     } else {
                         // Non-static data member → bind from Object's ClassInfo.
+                        // Searches the base hierarchy for inherited fields.
                         using TP = std::remove_cv_t<FieldType>;
-                        dispatch_.[:field:].obj = obj_.raw();
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto exp_type = TP::expected_type();
-                        bool found = false;
-                        for (const auto& fi : info->fields)
-                            if (fi.name == key) {
-                                auto impl_type = detail::normalize_type(fi.type);
-                                if (impl_type != exp_type)
-                                    throw std::runtime_error(
-                                        "Proxy: field type mismatch on '" + key +
-                                        "' — interface expects '" + exp_type +
-                                        "', impl has '" + impl_type + "'");
-                                dispatch_.[:field:].member_offset =
-                                    static_cast<std::size_t>(fi.offset);
-                                dispatch_.[:field:].getter = fi.getter;
-                                dispatch_.[:field:].setter = fi.setter;
-                                found = true;
-                                break;
-                            }
-                        if (!found)
+                        auto r = detail::find_field_in_hierarchy(info, key);
+                        if (!r.fi)
                             throw std::runtime_error(
                                 "Proxy: no field '" + key +
                                 "' in type '" +
                                 std::string(obj_.class_name()) + "'");
+                        auto impl_type = detail::normalize_type(r.fi->type);
+                        if (impl_type != exp_type)
+                            throw std::runtime_error(
+                                "Proxy: field type mismatch on '" + key +
+                                "' — interface expects '" + exp_type +
+                                "', impl has '" + impl_type + "'");
+                        dispatch_.[:field:].obj =
+                            static_cast<char*>(obj_.raw()) + r.offset;
+                        dispatch_.[:field:].member_offset =
+                            static_cast<std::size_t>(r.fi->offset);
+                        dispatch_.[:field:].getter = r.fi->getter;
+                        dispatch_.[:field:].setter = r.fi->setter;
                     }
                 }
             }

@@ -150,22 +150,28 @@ int main() {
     int c1 = rp->coords[1];
     CHECK(c1 == 20, "coords[1] read via operator[] should be 20");
 
-    // === static members in the dispatch struct ===
-    int ic = rp->instance_count;
-    CHECK(ic >= 1, "instance_count via dispatch should be >= 1");
-    rp->instance_count = 50;
+    // === static members accessed via get_class() ===
+    // Statics are class-level, not instance-level — they live on refl::Class,
+    // not the dispatch struct.
+    auto rp_cls = rp.get_class();
+    CHECK(rp_cls.valid(), "get_class should return a valid Class for Point");
+
+    auto ic_field = *rp_cls.find_static_field("instance_count");
+    int ic = *ic_field.get()->cast_ref<int>().value();
+    CHECK(ic >= 1, "instance_count via get_class should be >= 1");
+    (void)ic_field.set(50);
     CHECK(Point::instance_count == 50, "after instance_count=50, static should be 50");
 
-    int max = rp->max_instances;
+    auto max_field = *rp_cls.find_static_field("max_instances");
+    int max = *max_field.get()->cast_ref<int>().value();
     CHECK(max == 100, "max_instances should be 100");
-    // rp->max_instances = 200;  // COMPILE ERROR — readonly
-    static_assert(decltype(rp->max_instances)::is_readonly(), "max must be readonly");
-    static_assert(!decltype(rp->instance_count)::is_readonly(), "instance_count must be writable");
+    CHECK(max_field.is_const(), "max_instances should be const (readonly)");
 
-    int gi = rp->get_instance_count();
-    CHECK(gi == 50, "get_instance_count() via dispatch should be 50");
+    auto gi_fn = *rp_cls.find_static_function("get_instance_count");
+    int gi = *gi_fn.invoke()->cast_ref<int>().value();
+    CHECK(gi == 50, "get_instance_count() via get_class should be 50");
 
-    rp->reset_count();
+    (void)(*rp_cls.find_static_function("reset_count")).invoke();
     CHECK(Point::instance_count == 0, "after reset_count(), instance_count should be 0");
 
     // === swap via reset() ===

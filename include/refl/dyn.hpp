@@ -58,97 +58,9 @@ class Dyn {
     struct Dispatch;
     consteval {
         if constexpr (std::is_class_v<T>) {
-            static constexpr auto members = std::define_static_array(
-                std::meta::members_of(^^T,
-                    std::meta::access_context::unchecked()));
+            constexpr bool add_obj = !std::meta::is_abstract_type(^^T);
             std::vector<std::meta::info> specs;
-            std::vector<std::string> seen_fns;
-            template for (constexpr auto m : members) {
-                if constexpr (detail::is_public_method(m)
-                              && std::meta::has_identifier(m)
-                              && !std::meta::is_static_member(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_fns)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_fns.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_typed_method_type(^^T, nm);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            static constexpr auto data_members = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::string> seen_fields;
-            template for (constexpr auto m : data_members) {
-                if constexpr (detail::is_public_data_member(m)
-                              && std::meta::has_identifier(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_fields)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_fields.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_property_field_type(^^T, nm);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Static data members → TypedStaticProperty.
-            static constexpr auto static_data = std::define_static_array(
-                std::meta::static_data_members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::string> seen_static;
-            template for (constexpr auto m : static_data) {
-                if constexpr (std::meta::has_identifier(m)
-                              && std::meta::is_public(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_static)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_static.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_static_property_type(m);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Static member functions → TypedStaticMethod.
-            std::vector<std::string> seen_static_fns;
-            template for (constexpr auto m : members) {
-                if constexpr (detail::is_public_method(m)
-                              && std::meta::has_identifier(m)
-                              && std::meta::is_static_member(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_static_fns)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_static_fns.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_static_method_type(m);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Only add the obj field when T is constructible (not abstract).
-            if constexpr (!std::meta::is_abstract_type(^^T)) {
-                specs.push_back(std::meta::data_member_spec(
-                    ^^std::shared_ptr<T>, {.name="obj"}));
-            }
+            detail::make_dispatch_specs(^^T, add_obj, specs);
             std::meta::define_aggregate(^^Dispatch, specs);
         } else {
             std::meta::define_aggregate(^^Dispatch, {});
@@ -172,59 +84,43 @@ class Dyn {
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
                         // Non-static member function → bind from ClassInfo,
-                        // matching by param-type signature.
+                        // matching by param-type signature.  Searches the
+                        // base hierarchy for inherited methods.
                         using TM = std::remove_cv_t<FieldType>;
-                        dispatch_.[:field:].obj = dispatch_.obj.get();
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
-                        for (const auto& exp : TM::expected_param_types())
-                            for (const auto& fi : info->functions)
-                                if (fi.name == key
-                                    && fi.param_types == exp) {
-                                    vec.push_back({fi.invoker});
-                                    break;
-                                }
+                        std::ptrdiff_t method_off = 0;
+                        for (const auto& exp : TM::expected_param_types()) {
+                            auto r = detail::find_function_in_hierarchy(
+                                info, key, exp);
+                            if (r.fi) {
+                                vec.push_back({r.fi->invoker});
+                                method_off = r.offset;
+                            }
+                        }
+                        dispatch_.[:field:].obj =
+                            static_cast<char*>(static_cast<void*>(dispatch_.obj.get())) + method_off;
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
-                    } else if constexpr (detail::is_typed_static_method_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Static member function → bind invoker from ClassInfo.
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        auto key = std::string(nm_sv);
-                        for (const auto& fi : info->static_functions)
-                            if (fi.name == key) {
-                                dispatch_.[:field:].invoker = fi.invoker;
-                                break;
-                            }
-                    } else if constexpr (detail::is_typed_static_property_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Static data member → bind from ClassInfo.
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        auto key = std::string(nm_sv);
-                        for (const auto& fi : info->static_fields)
-                            if (fi.name == key) {
-                                dispatch_.[:field:].getter = fi.getter;
-                                dispatch_.[:field:].setter = fi.setter;
-                                break;
-                            }
                     } else {
                         // Non-static data member → bind from ClassInfo.
-                        dispatch_.[:field:].obj = dispatch_.obj.get();
+                        // Searches the base hierarchy for inherited fields.
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
-                        for (const auto& fi : info->fields)
-                            if (fi.name == key) {
-                                dispatch_.[:field:].member_offset =
-                                    static_cast<std::size_t>(fi.offset);
-                                dispatch_.[:field:].getter = fi.getter;
-                                dispatch_.[:field:].setter = fi.setter;
-                                break;
-                            }
+                        auto r = detail::find_field_in_hierarchy(info, key);
+                        if (r.fi) {
+                            dispatch_.[:field:].obj =
+                                static_cast<char*>(static_cast<void*>(dispatch_.obj.get())) + r.offset;
+                            dispatch_.[:field:].member_offset =
+                                static_cast<std::size_t>(r.fi->offset);
+                            dispatch_.[:field:].getter = r.fi->getter;
+                            dispatch_.[:field:].setter = r.fi->setter;
+                        }
                     }
                 }
             }
@@ -532,6 +428,13 @@ public:
     // Check if this Dyn is in dynamic (runtime-implemented) mode.
     bool is_dynamic() const { return dynamic_mode_; }
 
+    // The Class of T (the bound type).  Statics are class-level, not
+    // instance-level — access them through this Class instead of the
+    // dispatch struct.  Returns an invalid Class if T is unregistered.
+    Class get_class() const {
+        return find_class(detail::type_name<T>()).value_or(Class{});
+    }
+
     // Connect a callback to a method (multi-listener).  Multiple connect()
     // calls on the same method name accumulate — all callbacks fire.
     //
@@ -579,9 +482,7 @@ public:
             if constexpr (std::meta::has_identifier(f)
                           && std::meta::identifier_of(f) != "obj") {
                 using FT = [:std::meta::type_of(f):];
-                if constexpr (!detail::is_typed_method_v<std::remove_cv_t<FT>>
-                              && !detail::is_typed_static_method_v<std::remove_cv_t<FT>>
-                              && !detail::is_typed_static_property_v<std::remove_cv_t<FT>>) {
+                if constexpr (!detail::is_typed_method_v<std::remove_cv_t<FT>>) {
                     constexpr auto nm_sv = std::meta::identifier_of(f);
                     constexpr auto nm = std::define_static_string(nm_sv);
                     if (name == std::string_view(nm)) {
