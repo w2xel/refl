@@ -664,15 +664,15 @@ public:
     // Operators — looked up at call time via Object::invoke_op, which
     // resolves overloads by the argument's runtime type.
     //
-    // Value-returning operators (+, -, *, /, %) return Proxy<T> wrapping
-    // the result, so you can chain: p1 + p2 + p3.  Comparison operators
-    // (==, !=, <, >, <=, >=) return bool.
+    // The return type depends on the interface's operator return type:
+    //   - void:           returns nothing
+    //   - bool:           returns bool (comparison operators)
+    //   - class type:     returns Proxy<R> wrapping the result (chainable)
+    //   - non-class type: returns the raw value (int, double, etc.)
     //
     // Each operator generates two methods:
-    //   1. Same-type: operator+(const Proxy& other) — runtime lookup by
-    //      the other proxy's bound object type.
-    //   2. Generic: template<U> operator+(U&& val) — runtime lookup by
-    //      val's type.
+    //   1. Same-type: operator+(const Proxy& other)
+    //   2. Generic: template<U> operator+(U&& val)
     //
     // Neither exists if T has no such operator.  The constraint uses
     // decltype — no consteval helpers needed for the return type.
@@ -693,8 +693,11 @@ public:
         if constexpr (std::is_void_v<R>) return; \
         else if constexpr (std::is_same_v<R, bool>) \
             return std::move(*static_cast<bool*>(result->raw())); \
-        else \
+        else if constexpr (std::is_class_v<std::remove_cvref_t<R>>) \
             return Proxy(std::move(*result)); \
+        else \
+            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
+                result->raw())); \
     } \
     template <typename U> \
         requires (!std::is_same_v<std::remove_cvref_t<U>, Proxy>) \
@@ -712,8 +715,11 @@ public:
         if constexpr (std::is_void_v<R>) return; \
         else if constexpr (std::is_same_v<R, bool>) \
             return std::move(*static_cast<bool*>(result->raw())); \
-        else \
+        else if constexpr (std::is_class_v<std::remove_cvref_t<R>>) \
             return Proxy(std::move(*result)); \
+        else \
+            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
+                result->raw())); \
     }
 
     PROXY_BINARY_OP(+, "operator+")

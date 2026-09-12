@@ -114,20 +114,21 @@ struct ScalableImpl {
 
 // For Proxy overloaded-operator dispatch tests — operator+(int) and
 // operator+(double) with distinct return values so we can tell which
-// overload ran.
+// overload ran.  Returns non-class types (int) to verify the raw-value
+// return path.
 struct IOverOp {
     int v;
     IOverOp(int v) : v(v) {}
-    IOverOp operator+(int x) const;
-    IOverOp operator+(double x) const;
+    int operator+(int x) const;
+    int operator+(double x) const;
 };
 struct OverOpImpl {
     int v;
     OverOpImpl(int v) : v(v) {}
     // Declared in reverse order vs the interface — dispatch must match
     // by argument type, not by declaration order.
-    OverOpImpl operator+(double) const { return OverOpImpl(7070); }
-    OverOpImpl operator+(int) const { return OverOpImpl(1010); }
+    int operator+(double) const { return 7070; }
+    int operator+(int) const { return 1010; }
 };
 
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
@@ -490,17 +491,18 @@ int main() {
     // === Proxy overloaded-operator dispatch ===
     // operator+(int) and operator+(double) must dispatch to the correct
     // overload based on the argument type, not the declaration order.
+    // Returns int (non-class) — verifies the raw-value return path.
     {
         auto sp = std::make_shared<OverOpImpl>(1);
         refl::Proxy<IOverOp> p(sp);
 
         // int argument → operator+(int), returns 1010
-        auto ri = p + 3;
-        CHECK(ri->v == 1010, "p + 3 (int) should dispatch to operator+(int) → 1010");
+        int ri = p + 3;
+        CHECK(ri == 1010, "p + 3 (int) should dispatch to operator+(int) -> 1010");
 
         // double argument → operator+(double), returns 7070
-        auto rd = p + 3.0;
-        CHECK(rd->v == 7070, "p + 3.0 (double) should dispatch to operator+(double) → 7070");
+        int rd = p + 3.0;
+        CHECK(rd == 7070, "p + 3.0 (double) should dispatch to operator+(double) -> 7070");
     }
 
     std::printf("dyn dispatch test ok\n");
