@@ -285,6 +285,180 @@ public:
         }
     }
 
+    // --- wrap: wrap the current invoker with a user lambda ---
+    // The lambda receives: an invocable `original` (callable with the
+    // method's arguments, returns the method's return type), the Dyn<T>&
+    // self-reference, and the method's arguments.
+    //
+    //   p.wrap<^^T::method>([](auto& orig, Dyn<T>& self, int x) {
+    //       // pre-hook
+    //       auto r = orig(x);
+    //       // post-hook
+    //       return r;
+    //   });
+    //
+    // `original` boxes the typed args into Objects and calls the saved
+    // invoker with the saved ctx.  Works after Proxy bind.
+    struct WrapCtx {
+        InvokerFn saved_invoker;
+        void* saved_ctx;
+        std::shared_ptr<SelfRef> self_ref;
+        std::any wrap_fn;  // std::function<R(Orig, Dyn<T>&, Args...)>
+    };
+
+    template <std::meta::info Method>
+    static Object wrap_trampoline(const std::shared_ptr<void>& owner,
+                                    void* ctx, const Object* args) {
+        using R = [: std::meta::return_type_of(Method) :];
+        constexpr auto params = std::define_static_array(
+            std::meta::parameters_of(Method));
+        auto* wc = static_cast<WrapCtx*>(ctx);
+
+        auto& dyn = *wc->self_ref->dyn;
+
+        if constexpr (params.size() == 0) {
+            using Orig = std::function<R()>;
+            auto orig = Orig([owner, sv = wc->saved_invoker,
+                              sc = wc->saved_ctx]() -> R {
+                Object result = sv(owner, sc, nullptr);
+                if constexpr (std::is_void_v<R>) return;
+                else {
+                    auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
+                    if (!cr) throw std::runtime_error("wrap: return type mismatch");
+                    return R(std::move(*cr.value()));
+                }
+            });
+            using Fn = std::function<R(Orig&, Dyn<T>&)>;
+            auto& fn = std::any_cast<Fn&>(wc->wrap_fn);
+            if constexpr (std::is_void_v<R>) {
+                fn(orig, dyn);
+                return Object{};
+            } else {
+                return Object(std::make_shared<R>(fn(orig, dyn)),
+                    detail::ensure_class_info<R>());
+            }
+        } else if constexpr (params.size() == 1) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            auto& a0 = *static_cast<C0*>(args[0].raw());
+            using Orig = std::function<R(C0)>;
+            auto orig = Orig([owner, sv = wc->saved_invoker,
+                              sc = wc->saved_ctx](C0 x) -> R {
+                C0 storage(std::move(x));
+                Object ref(storage);
+                Object result = sv(owner, sc, &ref);
+                if constexpr (std::is_void_v<R>) return;
+                else {
+                    auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
+                    if (!cr) throw std::runtime_error("wrap: return type mismatch");
+                    return R(std::move(*cr.value()));
+                }
+            });
+            using Fn = std::function<R(Orig&, Dyn<T>&, C0)>;
+            auto& fn = std::any_cast<Fn&>(wc->wrap_fn);
+            if constexpr (std::is_void_v<R>) {
+                fn(orig, dyn, a0);
+                return Object{};
+            } else {
+                return Object(std::make_shared<R>(fn(orig, dyn, a0)),
+                    detail::ensure_class_info<R>());
+            }
+        } else if constexpr (params.size() == 2) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using P1 = [: std::meta::type_of(params[1]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            using C1 = std::remove_cvref_t<P1>;
+            auto& a0 = *static_cast<C0*>(args[0].raw());
+            auto& a1 = *static_cast<C1*>(args[1].raw());
+            using Orig = std::function<R(C0, C1)>;
+            auto orig = Orig([owner, sv = wc->saved_invoker,
+                              sc = wc->saved_ctx](C0 x0, C1 x1) -> R {
+                C0 s0(std::move(x0));
+                C1 s1(std::move(x1));
+                std::array<Object, 2> refs = {Object(s0), Object(s1)};
+                Object result = sv(owner, sc, refs.data());
+                if constexpr (std::is_void_v<R>) return;
+                else {
+                    auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
+                    if (!cr) throw std::runtime_error("wrap: return type mismatch");
+                    return R(std::move(*cr.value()));
+                }
+            });
+            using Fn = std::function<R(Orig&, Dyn<T>&, C0, C1)>;
+            auto& fn = std::any_cast<Fn&>(wc->wrap_fn);
+            if constexpr (std::is_void_v<R>) {
+                fn(orig, dyn, a0, a1);
+                return Object{};
+            } else {
+                return Object(std::make_shared<R>(fn(orig, dyn, a0, a1)),
+                    detail::ensure_class_info<R>());
+            }
+        } else {
+            // ponytail: 3+ args not yet supported.
+            return Object{};
+        }
+    }
+
+    // consteval helper for the wrap trampoline address.
+    template <std::meta::info Method>
+    consteval static InvokerFn get_wrap_tramp() {
+        return &wrap_trampoline<Method>;
+    }
+
+    template <std::meta::info Method, typename F>
+    void wrap(F fn) {
+        using R = [: std::meta::return_type_of(Method) :];
+        constexpr auto params = std::define_static_array(
+            std::meta::parameters_of(Method));
+        constexpr auto nm_sv = std::meta::identifier_of(Method);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto key = std::string(nm);
+
+        // Save the current slot.
+        auto saved = mockable_->template slot<Method>();
+
+        // Build the WrapCtx — stored on the Dyn, kept alive by the
+        // shared_ptr in wrap_ctxs_.  The Mockable slot points at it.
+        auto& wc = wrap_ctxs_[key];
+        wc.saved_invoker = saved.invoker;
+        wc.saved_ctx = saved.ctx;
+        wc.self_ref = make_self_ref();
+
+        // Store the user's lambda, typed by arity.  The first arg is
+        // std::function<R(Args...)> — the callable `original`.
+        if constexpr (params.size() == 0) {
+            using Orig = std::function<R()>;
+            wc.wrap_fn = std::function<R(Orig&, Dyn<T>&)>(
+                [fn = std::move(fn)](Orig& orig, Dyn<T>& self) -> R {
+                    return fn(orig, self);
+                });
+        } else if constexpr (params.size() == 1) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            using Orig = std::function<R(C0)>;
+            wc.wrap_fn = std::function<R(Orig&, Dyn<T>&, C0)>(
+                [fn = std::move(fn)](Orig& orig, Dyn<T>& self, C0 a0) -> R {
+                    return fn(orig, self, a0);
+                });
+        } else if constexpr (params.size() == 2) {
+            using P0 = [: std::meta::type_of(params[0]) :];
+            using P1 = [: std::meta::type_of(params[1]) :];
+            using C0 = std::remove_cvref_t<P0>;
+            using C1 = std::remove_cvref_t<P1>;
+            using Orig = std::function<R(C0, C1)>;
+            wc.wrap_fn = std::function<R(Orig&, Dyn<T>&, C0, C1)>(
+                [fn = std::move(fn)](Orig& orig, Dyn<T>& self, C0 a0, C1 a1) -> R {
+                    return fn(orig, self, a0, a1);
+                });
+        }
+
+        // Install the wrap trampoline as the new slot.
+        mockable_->template set_slot<Method>(
+            {get_wrap_tramp<Method>(), &wc});
+    }
+
+    std::map<std::string, WrapCtx> wrap_ctxs_;
+
     // --- restore: remove an override, go back to the real invoker ---
     template <std::meta::info Method>
     void restore() requires (!std::meta::is_abstract_type(^^T)) {
