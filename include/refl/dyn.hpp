@@ -21,6 +21,19 @@
 #include <functional>
 #include <map>
 namespace refl {
+// Structural fixed-size string for use as a non-type template parameter.
+// Enables implement<"method_name">(...) without exposing ^^ syntax.
+template <std::size_t N>
+struct FixedString {
+    char data[N] = {};
+    static constexpr std::size_t size = N;
+    constexpr FixedString(const char (&str)[N]) {
+        for (std::size_t i = 0; i < N; ++i) data[i] = str[i];
+    }
+    constexpr std::string_view sv() const {
+        return std::string_view(data, N - 1);
+    }
+};
 // ---------------------------------------------------------------------------
 // Dyn<T> — typed proxy with compile-time-synthesized dispatch struct.
 //

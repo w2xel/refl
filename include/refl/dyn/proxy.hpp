@@ -206,7 +206,9 @@ struct TypedProperty {
 
     // Assignment from T (write).  Compile error when Readonly=true.
     void operator=(T val) requires (!Readonly) {
-        if (!setter || !obj) return;
+        if (!obj) throw std::runtime_error("Proxy: write to unbound property");
+        if (!setter) throw std::runtime_error(
+            "Proxy: property has no setter (move-only or non-assignable)");
         std::decay_t<T> storage(std::move(val));
         Object val_ref(storage);
         setter(obj, &val_ref);
@@ -218,6 +220,8 @@ struct TypedProperty {
 
     // operator[] — returns a reference to the element in the actual object.
     // Only available when T is subscriptable (std::array, std::vector, etc.).
+    // ponytail: no bounds check — out-of-range index is UB, same as raw
+    // operator[] on the underlying container.  The caller owns the index.
     template <typename Self>
     auto& operator[](this Self&& self, std::size_t i)
         requires requires { typename std::remove_cvref_t<T>::value_type; }
@@ -363,20 +367,6 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
 }
 
 }  // namespace detail
-
-// Structural fixed-size string for use as a non-type template parameter.
-// Enables implement<"method_name">(...) without exposing ^^ syntax.
-template <std::size_t N>
-struct FixedString {
-    char data[N] = {};
-    static constexpr std::size_t size = N;
-    constexpr FixedString(const char (&str)[N]) {
-        for (std::size_t i = 0; i < N; ++i) data[i] = str[i];
-    }
-    constexpr std::string_view sv() const {
-        return std::string_view(data, N - 1);
-    }
-};
 
 // ---------------------------------------------------------------------------
 // Proxy<T> — typed dispatch struct with type-erased object binding.
