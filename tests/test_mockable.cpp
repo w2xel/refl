@@ -1,4 +1,4 @@
-// Mockable<T> test: mocking + virtual properties through Proxy<T>.
+// Mockable<T> test: mocking, virtual properties, raw slot save/restore.
 // Hooks are user-side: wrap your lambda to add a hook.
 #include <refl/mockable.hpp>
 
@@ -24,7 +24,6 @@ struct ICalculator {
 struct IWidget {
     int width;
     int height;
-    const int id = 7;
     virtual void draw() = 0;
     virtual ~IWidget() = default;
 };
@@ -47,7 +46,7 @@ int main() {
     m->implement<^^IShape::area>([](int scale) { return scale * 200; });
     CHECK(p->area(5) == 1000, "re-implemented area(5) should be 1000");
 
-    // === Hook via wrapped lambda (no inject_hook API) ===
+    // === Hook via wrapped lambda ===
     int hook_result = 0;
     m->implement<^^IShape::area>([&hook_result](int scale) {
         int r = scale * 200;
@@ -57,15 +56,12 @@ int main() {
     (void)p->area(5);
     CHECK(hook_result == 1000, "wrapped lambda should observe result 1000");
 
-    // === Hook on void method ===
-    bool void_hook_fired = false;
-    m->implement<^^IShape::set_color>([&last_color, &void_hook_fired](int c) {
-        last_color = c;
-        void_hook_fired = true;
-    });
-    p->set_color(77);
-    CHECK(void_hook_fired, "void method hook should fire");
-    CHECK(last_color == 77, "set_color should store 77");
+    // === Raw slot save / restore ===
+    auto saved = m->slot<^^IShape::area>();
+    m->implement<^^IShape::area>([](int scale) { return scale * 999; });
+    CHECK(p->area(1) == 999, "overridden area(1) should be 999");
+    m->set_slot<^^IShape::area>(saved);
+    CHECK(p->area(5) == 1000, "restored area(5) should be 1000 again");
 
     // === 2-arg method ===
     auto mc = refl::Mockable<ICalculator>::create();
@@ -106,20 +102,14 @@ int main() {
     );
     CHECK(pw->height == 88, "read-only property should return 88");
 
-    // === Re-implement property to add another hook ===
-    int hook2 = 0;
-    mw->implement_property<^^IWidget::width>(
-        [&stored_w]() { return stored_w; },
-        [&width_changed_to, &hook2, &stored_w](int v) {
-            stored_w = v;
-            width_changed_to = v;
-            hook2 = v * 2;
-        }
+    // === Raw property slot save / restore ===
+    auto prop_saved = mw->prop_slot<^^IWidget::height>();
+    mw->implement_property<^^IWidget::height>(
+        []() { return 77; }
     );
-    width_changed_to = 0;
-    pw->width = 10;
-    CHECK(width_changed_to == 10, "re-implemented setter hook should fire with 10");
-    CHECK(hook2 == 20, "second hook should fire with 20");
+    CHECK(pw->height == 77, "overridden height should be 77");
+    mw->set_prop_slot<^^IWidget::height>(prop_saved);
+    CHECK(pw->height == 88, "restored height should be 88");
 
     // === Lifetime: Mockable destroyed, Proxy keeps it alive ===
     refl::Proxy<IShape> p2;

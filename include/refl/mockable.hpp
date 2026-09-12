@@ -2,24 +2,26 @@
 //
 // Mockable<T> synthesizes a per-instance ClassInfo whose method invokers
 // and property getter/setters are static trampolines that read swappable
-// slots at call time.  implement() sets a method slot.  implement_property()
-// sets a property slot with user-provided getter/setter lambdas.
-// set_property() is sugar for a stored-value property.  All work after
-// Proxy bind — the Proxy holds the static trampoline pointers, which
-// always re-read the slots.
+// slots at call time.  The core API is slot/set_slot (methods) and
+// prop_slot/set_prop_slot (properties) — raw access to the swappable
+// (InvokerFn, void* ctx) pairs.  implement(), implement_property(), and
+// set_property() are sugar over the raw slot API.
 //
 //   auto m = refl::Mockable<IWidget>::create();
 //   m->implement<^^IWidget::draw>([]() { ... });
 //   m->set_property<^^IWidget::width>(42);
-//   m->implement_property<^^IWidget::height>(
-//       []() { return 24; },
-//       [](int v) { ... });
 //   auto p = m->proxy();
-//   p->width = 99;
+//
+// Hybrid mode: initialize slots with real invokers from outside, then
+// override individual methods via implement().  Restore by saving the
+// original slot and calling set_slot() with it.
+//
+//   auto saved = m->slot<^^T::method>();
+//   m->implement<^^T::method>([](int x) { return x * 2; });
+//   m->set_slot<^^T::method>(saved);  // restore
 //
 // Hooks are user-side: wrap your lambda before passing it to implement
-// or implement_property.  Re-implement to add a hook — the slot swap is
-// picked up by all bound Proxies at call time.
+// or implement_property.
 #pragma once
 
 #include <refl/refl.hpp>
@@ -66,27 +68,23 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
         return it->second.invoker(owner, it->second.ctx, args);
     }
 
+    // Call the user's lambda.  ctx points at the std::function itself
+    // (held alive by a shared_ptr in callables_).
     template <std::meta::info Method>
     static Object impl_trampoline(const std::shared_ptr<void>&,
-                                    void* obj, const Object* args) {
-        auto* self = static_cast<Mockable<T>*>(obj);
+                                    void* ctx, const Object* args) {
         using R = [: std::meta::return_type_of(Method) :];
         constexpr auto params = std::define_static_array(
             std::meta::parameters_of(Method));
-        constexpr auto nm_sv = std::meta::identifier_of(Method);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        auto key = std::string(nm);
         if constexpr (params.size() == 0) {
-            auto& fn = std::any_cast<std::function<R()>&>(
-                self->callables_[key]);
+            auto& fn = *static_cast<std::function<R()>*>(ctx);
             if constexpr (std::is_void_v<R>) { fn(); return Object{}; }
             else return Object(std::make_shared<R>(fn()),
                              detail::ensure_class_info<R>());
         } else if constexpr (params.size() == 1) {
             using P0 = [: std::meta::type_of(params[0]) :];
             using C0 = std::remove_cvref_t<P0>;
-            auto& fn = std::any_cast<std::function<R(C0)>&>(
-                self->callables_[key]);
+            auto& fn = *static_cast<std::function<R(C0)>*>(ctx);
             auto& a0 = *static_cast<C0*>(args[0].raw());
             if constexpr (std::is_void_v<R>) { fn(a0); return Object{}; }
             else return Object(std::make_shared<R>(fn(a0)),
@@ -96,8 +94,7 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
             using P1 = [: std::meta::type_of(params[1]) :];
             using C0 = std::remove_cvref_t<P0>;
             using C1 = std::remove_cvref_t<P1>;
-            auto& fn = std::any_cast<std::function<R(C0, C1)>&>(
-                self->callables_[key]);
+            auto& fn = *static_cast<std::function<R(C0, C1)>*>(ctx);
             auto& a0 = *static_cast<C0*>(args[0].raw());
             auto& a1 = *static_cast<C1*>(args[1].raw());
             if constexpr (std::is_void_v<R>) { fn(a0, a1); return Object{}; }
@@ -145,35 +142,25 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
         it->second.setter(it->second.set_ctx, val);
     }
 
-    // Call the user's getter lambda.  ctx is the Mockable*.
+    // Call the user's getter lambda.  ctx points at the std::function.
     template <std::meta::info Member>
     static Object prop_get_impl(void* ctx) {
-        auto* self = static_cast<Mockable<T>*>(ctx);
         using MemberType = [:std::meta::type_of(Member):];
         using Bare = std::remove_cvref_t<MemberType>;
-        constexpr auto nm_sv = std::meta::identifier_of(Member);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        auto key = std::string(nm);
-        auto& fn = std::any_cast<std::function<Bare()>&>(
-            self->prop_getters_[key]);
+        auto& fn = *static_cast<std::function<Bare()>*>(ctx);
         return Object(std::make_shared<Bare>(fn()),
                      detail::ensure_class_info<Bare>());
     }
 
-    // Call the user's setter lambda.  ctx is the Mockable*.
+    // Call the user's setter lambda.  ctx points at the std::function.
     template <std::meta::info Member>
     static void prop_set_impl(void* ctx, const Object* val) {
-        auto* self = static_cast<Mockable<T>*>(ctx);
         using MemberType = [:std::meta::type_of(Member):];
         using Bare = std::remove_cvref_t<MemberType>;
-        constexpr auto nm_sv = std::meta::identifier_of(Member);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        auto key = std::string(nm);
-        auto& fn = std::any_cast<std::function<void(Bare)>&>(
-            self->prop_setters_[key]);
+        auto& fn = *static_cast<std::function<void(Bare)>*>(ctx);
         auto cr = val->template cast_ref<Bare>();
         if (!cr) throw std::runtime_error(
-            "Mockable: property '" + key + "' type mismatch on set");
+            "Mockable: property type mismatch on set");
         fn(std::move(*cr.value()));
     }
 
@@ -280,6 +267,48 @@ public:
     }
 
     // ======================================================================
+    // Raw slot API — get/set the swappable (InvokerFn, ctx) pairs.
+    // This is the low-level surface.  implement() and implement_property()
+    // are sugar over set_slot()/set_prop_slot().  Hybrid mode: initialize
+    // slots with real invokers from outside, override via implement(),
+    // restore by saving and re-setting the original slot.
+    // ======================================================================
+
+    // Get the current method slot (by method reflection).
+    template <std::meta::info Method>
+    MethodSlot slot() const {
+        constexpr auto nm_sv = std::meta::identifier_of(Method);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto it = method_slots_.find(std::string(nm));
+        return it != method_slots_.end() ? it->second : MethodSlot{};
+    }
+
+    // Set the method slot (raw InvokerFn + ctx).
+    template <std::meta::info Method>
+    void set_slot(MethodSlot s) {
+        constexpr auto nm_sv = std::meta::identifier_of(Method);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        method_slots_[std::string(nm)] = s;
+    }
+
+    // Get the current property slot (by member reflection).
+    template <std::meta::info Member>
+    PropertySlot prop_slot() const {
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        auto it = prop_slots_.find(std::string(nm));
+        return it != prop_slots_.end() ? it->second : PropertySlot{};
+    }
+
+    // Set the property slot (raw getter/setter + ctxs).
+    template <std::meta::info Member>
+    void set_prop_slot(PropertySlot s) {
+        constexpr auto nm_sv = std::meta::identifier_of(Member);
+        constexpr auto nm = std::define_static_string(nm_sv);
+        prop_slots_[std::string(nm)] = s;
+    }
+
+    // ======================================================================
     // Method API
     // ======================================================================
 
@@ -291,20 +320,28 @@ public:
         constexpr auto nm_sv = std::meta::identifier_of(Method);
         constexpr auto nm = std::define_static_string(nm_sv);
         auto key = std::string(nm);
+        // Store the lambda in a shared_ptr so the slot's ctx can point
+        // at it independently — saving the slot captures the specific
+        // lambda, not the shared callables_ map entry.
         if constexpr (params.size() == 0) {
-            callables_[key] = std::function<R()>(std::move(fn));
+            auto holder = std::make_shared<std::function<R()>>(std::move(fn));
+            callables_[key] = holder;
+            method_slots_[key] = {get_impl_tramp<Method>(), holder.get()};
         } else if constexpr (params.size() == 1) {
             using P0 = [: std::meta::type_of(params[0]) :];
             using C0 = std::remove_cvref_t<P0>;
-            callables_[key] = std::function<R(C0)>(std::move(fn));
+            auto holder = std::make_shared<std::function<R(C0)>>(std::move(fn));
+            callables_[key] = holder;
+            method_slots_[key] = {get_impl_tramp<Method>(), holder.get()};
         } else if constexpr (params.size() == 2) {
             using P0 = [: std::meta::type_of(params[0]) :];
             using P1 = [: std::meta::type_of(params[1]) :];
             using C0 = std::remove_cvref_t<P0>;
             using C1 = std::remove_cvref_t<P1>;
-            callables_[key] = std::function<R(C0, C1)>(std::move(fn));
+            auto holder = std::make_shared<std::function<R(C0, C1)>>(std::move(fn));
+            callables_[key] = holder;
+            method_slots_[key] = {get_impl_tramp<Method>(), holder.get()};
         }
-        method_slots_[key] = {get_impl_tramp<Method>(), this};
     }
 
     // ======================================================================
@@ -313,8 +350,7 @@ public:
 
     // Virtual property: user provides getter and setter lambdas.
     // The getter must return the property type; the setter takes it by
-    // value.  For read-only properties, pass nullptr as the setter (or
-    // omit it — see the one-argument overload below).
+    // value.  For read-only properties, use the one-argument overload.
     template <std::meta::info Member, typename G, typename S>
     void implement_property(G getter, S setter) {
         using MemberType = [:std::meta::type_of(Member):];
@@ -322,11 +358,13 @@ public:
         constexpr auto nm_sv = std::meta::identifier_of(Member);
         constexpr auto nm = std::define_static_string(nm_sv);
         auto key = std::string(nm);
-        prop_getters_[key] = std::function<Bare()>(std::move(getter));
-        prop_setters_[key] = std::function<void(Bare)>(std::move(setter));
+        auto gh = std::make_shared<std::function<Bare()>>(std::move(getter));
+        auto sh = std::make_shared<std::function<void(Bare)>>(std::move(setter));
+        prop_getters_[key] = gh;
+        prop_setters_[key] = sh;
         prop_slots_[key] = {
-            get_prop_get_impl<Member>(), this,
-            get_prop_set_impl<Member>(), this
+            get_prop_get_impl<Member>(), gh.get(),
+            get_prop_set_impl<Member>(), sh.get()
         };
     }
 
@@ -338,9 +376,10 @@ public:
         constexpr auto nm_sv = std::meta::identifier_of(Member);
         constexpr auto nm = std::define_static_string(nm_sv);
         auto key = std::string(nm);
-        prop_getters_[key] = std::function<Bare()>(std::move(getter));
+        auto gh = std::make_shared<std::function<Bare()>>(std::move(getter));
+        prop_getters_[key] = gh;
         prop_slots_[key] = {
-            get_prop_get_impl<Member>(), this,
+            get_prop_get_impl<Member>(), gh.get(),
             nullptr, nullptr
         };
     }
@@ -356,13 +395,15 @@ public:
         constexpr auto nm = std::define_static_string(nm_sv);
         auto key = std::string(nm);
         auto stored = std::make_shared<Bare>(std::forward<V>(val));
-        prop_getters_[key] = std::function<Bare()>(
+        auto gh = std::make_shared<std::function<Bare()>>(
             [stored] { return *stored; });
-        prop_setters_[key] = std::function<void(Bare)>(
+        auto sh = std::make_shared<std::function<void(Bare)>>(
             [stored](Bare v) { *stored = std::move(v); });
+        prop_getters_[key] = gh;
+        prop_setters_[key] = sh;
         prop_slots_[key] = {
-            get_prop_get_impl<Member>(), this,
-            get_prop_set_impl<Member>(), this
+            get_prop_get_impl<Member>(), gh.get(),
+            get_prop_set_impl<Member>(), sh.get()
         };
     }
 
