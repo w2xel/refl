@@ -93,6 +93,7 @@ struct FunctionInfo {
     std::vector<std::string> param_types;
     std::string return_type;
     InvokerFn invoker;
+    bool is_const = false;
 };
 
 struct StaticFunctionInfo {
@@ -279,6 +280,14 @@ consteval bool is_consteval_fn(std::meta::info Fn) {
     std::string_view ds = std::meta::display_string_of(Fn);
     if (ds.starts_with("static ")) ds.remove_prefix(7);
     return ds.starts_with("consteval ");
+}
+
+// Detect a const-qualified member function by its display string, which
+// suffixes " const" on the function type (e.g. "int() const").  Same
+// display-string-parsing approach as is_consteval_fn above.
+consteval bool is_const_method(std::meta::info m) {
+    return std::meta::display_string_of(std::meta::type_of(m))
+               .ends_with(" const");
 }
 
 // Shared member filters — used by both make_info (refl core) and Dyn<T>'s
@@ -1073,6 +1082,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             } else {
                 FunctionInfo fi;
                 fi.name = fname;
+                fi.is_const = detail::is_const_method(m);
                 fi.return_type = std::string(
                     std::meta::display_string_of(std::meta::return_type_of(m)));
                 fi.invoker = &detail::invoker<T, m>;

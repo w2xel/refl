@@ -321,6 +321,98 @@ consteval bool is_op_field(std::string_view fname) {
     return fname.starts_with("_op_");
 }
 
+// consteval: collect the const-ness of all overloads for a named method
+// or operator on the interface type, in Sigs-pack order.  Used by
+// populate() to verify the impl's method const-ness matches the interface's.
+consteval std::vector<bool> collect_const_quals(std::meta::info type,
+                                                   std::string_view name) {
+    std::vector<bool> result;
+    for (auto m : std::meta::members_of(type,
+            std::meta::access_context::unchecked())) {
+        if (is_public_method(m) && !std::meta::is_static_member(m)
+            && std::meta::has_identifier(m)
+            && std::meta::identifier_of(m) == name)
+            result.push_back(is_const_method(m));
+    }
+    for (auto b : std::meta::bases_of(type,
+            std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b)) {
+            auto inherited = collect_const_quals(std::meta::type_of(b), name);
+            for (bool c : inherited) result.push_back(c);
+        }
+    }
+    return result;
+}
+
+// consteval: collect the const-ness of all overloads for a specific
+// operator on the interface type, in Sigs-pack order.
+consteval std::vector<bool> collect_const_quals_op(std::meta::info type,
+                                                      std::meta::operators op) {
+    std::vector<bool> result;
+    for (auto m : std::meta::members_of(type,
+            std::meta::access_context::unchecked())) {
+        if (is_public_method(m) && !std::meta::is_static_member(m)
+            && !std::meta::has_identifier(m)
+            && std::meta::is_operator_function(m)
+            && std::meta::operator_of(m) == op)
+            result.push_back(is_const_method(m));
+    }
+    for (auto b : std::meta::bases_of(type,
+            std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b)) {
+            auto inherited = collect_const_quals_op(std::meta::type_of(b), op);
+            for (bool c : inherited) result.push_back(c);
+        }
+    }
+    return result;
+}
+
+// consteval: return the const-ness vector for a dispatch field.  For
+// named methods, uses collect_const_quals; for operator fields, maps
+// the field name back to the operator and uses collect_const_quals_op.
+consteval std::vector<bool> field_const_quals(std::meta::info type,
+                                                 std::string_view fname) {
+    if (!is_op_field(fname)) {
+        return collect_const_quals(type, fname);
+    }
+    // Map field name to operator enum — reverse of op_field_name.
+    using enum std::meta::operators;
+    auto op = std::meta::operators(-1);
+    if (fname == "_op_add")          op = op_plus;
+    else if (fname == "_op_sub")     op = op_minus;
+    else if (fname == "_op_mul")     op = op_star;
+    else if (fname == "_op_div")     op = op_slash;
+    else if (fname == "_op_mod")     op = op_percent;
+    else if (fname == "_op_add_eq")  op = op_plus_equals;
+    else if (fname == "_op_sub_eq")  op = op_minus_equals;
+    else if (fname == "_op_mul_eq")  op = op_star_equals;
+    else if (fname == "_op_div_eq")  op = op_slash_equals;
+    else if (fname == "_op_mod_eq")  op = op_percent_equals;
+    else if (fname == "_op_eq")      op = op_equals_equals;
+    else if (fname == "_op_ne")      op = op_exclamation_equals;
+    else if (fname == "_op_lt")      op = op_less;
+    else if (fname == "_op_gt")      op = op_greater;
+    else if (fname == "_op_le")      op = op_less_equals;
+    else if (fname == "_op_ge")      op = op_greater_equals;
+    else if (fname == "_op_spaceship") op = op_spaceship;
+    else if (fname == "_op_band")    op = op_ampersand;
+    else if (fname == "_op_bor")      op = op_pipe;
+    else if (fname == "_op_bxor")     op = op_caret;
+    else if (fname == "_op_bnot")    op = op_tilde;
+    else if (fname == "_op_shl")     op = op_less_less;
+    else if (fname == "_op_shr")     op = op_greater_greater;
+    else if (fname == "_op_land")    op = op_ampersand_ampersand;
+    else if (fname == "_op_lor")     op = op_pipe_pipe;
+    else if (fname == "_op_lnot")    op = op_exclamation;
+    else if (fname == "_op_inc")     op = op_plus_plus;
+    else if (fname == "_op_dec")     op = op_minus_minus;
+    else if (fname == "_op_comma")   op = op_comma;
+    else if (fname == "_op_call")    op = op_parentheses;
+    else if (fname == "_op_subscript") op = op_square_brackets;
+    if (op == std::meta::operators(-1)) return {};
+    return collect_const_quals_op(type, op);
+}
+
 }  // namespace detail
 
 template <typename... Sigs>
@@ -809,6 +901,13 @@ class Proxy {
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         constexpr auto ci_name = detail::field_to_classinfo_name(nm_sv);
+                        // Compute expected const-ness per overload at compile time.
+                        // GCC 16.2 can't return std::vector from constexpr, so we
+                        // use define_static_array + template-for to build it.
+                        static constexpr auto exp_const_arr = []() consteval {
+                            return std::define_static_array(
+                                detail::field_const_quals(^^T, nm_sv));
+                        }();
                         auto key = std::string(ci_name);
                         auto& vec = overload_storage_[key];
                         auto exp_params = TM::expected_param_types();
@@ -824,11 +923,19 @@ class Proxy {
                                         "Proxy: no operator '" + key +
                                         "' in type '" +
                                         std::string(obj_.class_name()) + "'");
+                                if (oi < exp_const_arr.size()
+                                    && r.fi->is_const != exp_const_arr[oi])
+                                    throw std::runtime_error(
+                                        "Proxy: const-ness mismatch on '" + key +
+                                        "' — interface expects " +
+                                        (exp_const_arr[oi] ? "const" : "non-const") +
+                                        ", impl is " +
+                                        (r.fi->is_const ? "const" : "non-const"));
                                 vec.push_back({r.fi->invoker});
                                 method_off = r.offset;
                             }
                         } else {
-                            // Named method: match by name + param-type + return type.
+                            // Named method: match by name + param-type + return type + const.
                             for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
                                 auto r = detail::find_function_in_hierarchy(
                                     info, key, exp_params[oi]);
@@ -846,6 +953,14 @@ class Proxy {
                                         exp_returns[oi] +
                                         "', impl returns '" +
                                         r.fi->return_type + "'");
+                                if (oi < exp_const_arr.size()
+                                    && r.fi->is_const != exp_const_arr[oi])
+                                    throw std::runtime_error(
+                                        "Proxy: const-ness mismatch on '" + key +
+                                        "' — interface expects " +
+                                        (exp_const_arr[oi] ? "const" : "non-const") +
+                                        ", impl is " +
+                                        (r.fi->is_const ? "const" : "non-const"));
                                 vec.push_back({r.fi->invoker});
                                 method_off = r.offset;
                             }

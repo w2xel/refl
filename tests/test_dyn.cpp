@@ -68,6 +68,10 @@ struct HasPartial { int exists(int x) { return x; } };
 struct IBadReturn { int compute(int); };
 struct DoubleReturn { double compute(int x) { return x * 1.5; } };
 
+// For const-ness validation tests: interface declares const, impl doesn't.
+struct IConstMethod { int compute(int) const; };
+struct NonConstImpl { int compute(int x) { return x; } };
+
 // For non-owning/shared_ptr Proxy tests.
 struct ISimple { int get_value(); };
 struct SimpleImpl { int v; SimpleImpl(int v) : v(v) {} int get_value() { return v; } };
@@ -101,6 +105,7 @@ struct Vec2Other {
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
 [[maybe_unused]] static refl::Reg<HasPartial> reg_has_partial;
 [[maybe_unused]] static refl::Reg<DoubleReturn> reg_double_return;
+[[maybe_unused]] static refl::Reg<NonConstImpl> reg_nonconst_impl;
 [[maybe_unused]] static refl::Reg<SimpleImpl> reg_simple_impl;
 [[maybe_unused]] static refl::Reg<Vec2Impl> reg_vec2_impl;
 [[maybe_unused]] static refl::Reg<Vec2Other> reg_vec2_other;
@@ -366,6 +371,18 @@ int main() {
         threw_return = true;
     }
     CHECK(threw_return, "Proxy<IBadReturn> should throw — return type mismatch (int vs double)");
+
+    // Const-ness mismatch — must throw at bind time.
+    // Interface declares compute(int) const, impl declares compute(int) non-const.
+    auto nc_cls = *refl::find_class("NonConstImpl");
+    auto nc_obj = *nc_cls.constructors()[0].call();
+    bool threw_const = false;
+    try {
+        refl::Proxy<IConstMethod> bad3(nc_obj);
+    } catch (const std::runtime_error&) {
+        threw_const = true;
+    }
+    CHECK(threw_const, "Proxy<IConstMethod> should throw — const-ness mismatch (interface const, impl non-const)");
 
     // === Proxy: non-owning Object rejected ===
     // A non-owning Object (borrow) must be rejected — the proxy outlives it.
