@@ -402,6 +402,16 @@ inline bool is_base_of(std::string_view derived_name, std::string_view base_name
     return is_base_of_unlocked(derived_name, base_name);
 }
 
+// Lookup a registered class by name, returning the raw ClassInfo*.
+// The pool is append-only, so the pointer stays valid after the lock is
+// released.  Used by the dyn/proxy dispatch layer to bind type-erased
+// Objects to their ClassInfo at runtime.
+inline const ClassInfo* lookup_class_info(std::string_view name) {
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    auto it = class_pool().find(std::string(name));
+    return it != class_pool().end() ? it->second.get() : nullptr;
+}
+
 // Upcast offset with diamond-ambiguity check.  Returns the byte offset
 // if the base is uniquely reachable; Error::Ambiguous if reachable via
 // 2+ distinct offsets (a diamond — C++ rejects an unqualified upcast
@@ -1861,6 +1871,95 @@ void collect_all_unlocked(const ClassInfo* C,
                 results.push_back(std::move(h));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hierarchy search for the dyn/proxy dispatch layer.  These return the
+// raw FunctionInfo/FieldInfo pointer plus the byte offset from the derived
+// class to the declaring base, using the same name-hiding and diamond-
+// ambiguity policy as find_named / find_named_sig above.  Returning
+// {nullptr, 0} means not-found or ambiguous (diamond) — the caller must
+// treat both as a bind failure.
+// ---------------------------------------------------------------------------
+
+struct FunctionSearchResult {
+    const FunctionInfo* fi;
+    std::ptrdiff_t offset;
+};
+
+struct FieldSearchResult {
+    const FieldInfo* fi;
+    std::ptrdiff_t offset;
+};
+
+// Search the hierarchy for a function by name + param-type signature.
+// Own members hide bases (if any own member has the name, base overloads
+// are hidden even when none matches the signature, matching C++).  Among
+// base hits, diamond-ambiguous lookups (2+ distinct base subobjects) are
+// rejected.  param_types must already be normalized.
+inline FunctionSearchResult find_function_in_hierarchy(
+        const ClassInfo* C, std::string_view name,
+        const std::vector<std::string>& param_types) {
+    bool name_exists = false;
+    for (std::size_t i = 0; i < C->functions.size(); ++i) {
+        if (C->functions[i].name == name) {
+            name_exists = true;
+            if (match_signature(C->functions[i].param_types, param_types))
+                return {&C->functions[i], 0};
+        }
+    }
+    if (name_exists) return {nullptr, 0};
+
+    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    collect_base_named(C, name, &ClassInfo::functions, decls);
+    dedup_decl(decls);
+    if (subobject_count(C, decls) >= 2) return {nullptr, 0};
+    for (const auto& [ci, idx] : decls)
+        if (match_signature(ci->functions[idx].param_types, param_types))
+            return {&ci->functions[idx],
+                    base_offset_unlocked(C->name, ci->name).value_or(0)};
+    return {nullptr, 0};
+}
+
+// Search the hierarchy for a function by name only (first overload).
+// Used by operator binding where interface and impl param types are
+// structurally different.  Same name-hiding and ambiguity policy.
+inline FunctionSearchResult find_function_by_name_in_hierarchy(
+        const ClassInfo* C, std::string_view name) {
+    for (std::size_t i = 0; i < C->functions.size(); ++i)
+        if (C->functions[i].name == name)
+            return {&C->functions[i], 0};
+
+    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    collect_base_named(C, name, &ClassInfo::functions, decls);
+    dedup_decl(decls);
+    if (subobject_count(C, decls) >= 2) return {nullptr, 0};
+    if (!decls.empty())
+        return {&decls[0].first->functions[decls[0].second],
+                base_offset_unlocked(C->name, decls[0].first->name).value_or(0)};
+    return {nullptr, 0};
+}
+
+// Search the hierarchy for a field by name.  Same name-hiding and
+// ambiguity policy.
+inline FieldSearchResult find_field_in_hierarchy(
+        const ClassInfo* C, std::string_view name) {
+    for (std::size_t i = 0; i < C->fields.size(); ++i)
+        if (C->fields[i].name == name)
+            return {&C->fields[i], 0};
+
+    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::lock_guard<std::mutex> lk(pool_mutex());
+    collect_base_named(C, name, &ClassInfo::fields, decls);
+    dedup_decl(decls);
+    if (subobject_count(C, decls) >= 2) return {nullptr, 0};
+    if (!decls.empty())
+        return {&decls[0].first->fields[decls[0].second],
+                base_offset_unlocked(C->name, decls[0].first->name).value_or(0)};
+    return {nullptr, 0};
+}
+
 }  // namespace detail
 
 inline std::expected<Constructor, Error> Class::find_constructor(

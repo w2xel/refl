@@ -19,7 +19,7 @@
 // No link error: the methods are never odr-used (Proxy reflects their
 // signatures, not their addresses).
 struct IDrawable {
-    int render(int scale);
+    int render(int scale) const;
     void set_tint(int t);
 };
 

@@ -70,90 +70,6 @@ struct OverloadEntry {
     InvokerFn invoker;
 };
 
-// Runtime: look up a base class's ClassInfo by name from the pool.
-// Returns nullptr if not registered.  The pool is append-only, so the
-// pointer stays valid after the lock is released.
-inline const ClassInfo* lookup_base_info(std::string_view name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    auto it = class_pool().find(std::string(name));
-    return it != class_pool().end() ? it->second.get() : nullptr;
-}
-
-// Runtime: search a ClassInfo's direct fields by name.
-inline const FieldInfo* find_field_direct(
-        const ClassInfo* info, std::string_view name) {
-    for (const auto& fi : info->fields)
-        if (fi.name == name) return &fi;
-    return nullptr;
-}
-
-// Runtime: search a ClassInfo and its registered public bases for a
-// field by name.  Returns the FieldInfo and accumulated byte offset to
-// the base subobject (0 for direct fields), or {nullptr, 0} if not found.
-struct FieldSearchResult {
-    const FieldInfo* fi;
-    std::ptrdiff_t offset;
-};
-inline FieldSearchResult find_field_in_hierarchy(
-        const ClassInfo* info, std::string_view name) {
-    if (auto* fi = find_field_direct(info, name))
-        return {fi, 0};
-    for (const auto& b : info->bases) {
-        if (auto* base_info = lookup_base_info(b.name)) {
-            auto r = find_field_in_hierarchy(base_info, name);
-            if (r.fi) return {r.fi, b.offset + r.offset};
-        }
-    }
-    return {nullptr, 0};
-}
-
-// Runtime: search a ClassInfo's direct functions by name + param types.
-inline const FunctionInfo* find_function_direct(
-        const ClassInfo* info, std::string_view name,
-        const std::vector<std::string>& param_types) {
-    for (const auto& fi : info->functions)
-        if (fi.name == name && fi.param_types == param_types)
-            return &fi;
-    return nullptr;
-}
-
-// Runtime: search a ClassInfo and its registered public bases for a
-// function by name + param-type signature.
-struct FunctionSearchResult {
-    const FunctionInfo* fi;
-    std::ptrdiff_t offset;
-};
-inline FunctionSearchResult find_function_in_hierarchy(
-        const ClassInfo* info, std::string_view name,
-        const std::vector<std::string>& param_types) {
-    if (auto* fi = find_function_direct(info, name, param_types))
-        return {fi, 0};
-    for (const auto& b : info->bases) {
-        if (auto* base_info = lookup_base_info(b.name)) {
-            auto r = find_function_in_hierarchy(base_info, name, param_types);
-            if (r.fi) return {r.fi, b.offset + r.offset};
-        }
-    }
-    return {nullptr, 0};
-}
-
-// Runtime: search a ClassInfo and its registered public bases for a
-// function by name only (ignoring param types).  Used for operator binding
-// where the interface and impl parameter types are structurally different
-// types (e.g. IVec2 vs Vec2Impl).  Returns the first match by name.
-inline FunctionSearchResult find_function_by_name_in_hierarchy(
-        const ClassInfo* info, std::string_view name) {
-    for (const auto& fi : info->functions)
-        if (fi.name == name) return {&fi, 0};
-    for (const auto& b : info->bases) {
-        if (auto* base_info = lookup_base_info(b.name)) {
-            auto r = find_function_by_name_in_hierarchy(base_info, name);
-            if (r.fi) return {r.fi, b.offset + r.offset};
-        }
-    }
-    return {nullptr, 0};
-}
-
 // consteval: build a function-type reflection R(Args...) from a member.
 consteval std::meta::info make_fn_sig(std::meta::info m) {
     auto rt = std::meta::return_type_of(m);
@@ -584,8 +500,7 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
                                                        std::string_view name) {
     for (auto m : std::meta::nonstatic_data_members_of(type,
             std::meta::access_context::unchecked())) {
-        if (!std::meta::is_bit_field(m) && std::meta::has_identifier(m)
-            && std::meta::is_public(m)
+        if (detail::is_public_data_member(m) && std::meta::has_identifier(m)
             && std::meta::identifier_of(m) == name) {
             auto mt = std::meta::type_of(m);
             bool is_const = std::meta::is_const_type(mt);
@@ -787,12 +702,6 @@ class Proxy {
     Object obj_;
     std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
 
-    static const ClassInfo* lookup_class_info(std::string_view name) {
-        std::lock_guard<std::mutex> lk(pool_mutex());
-        auto it = class_pool().find(std::string(name));
-        return it != class_pool().end() ? it->second.get() : nullptr;
-    }
-
     void check_owned() {
         if (obj_.valid() && !obj_.is_owned())
             throw std::runtime_error(
@@ -826,7 +735,7 @@ class Proxy {
         if constexpr (std::is_class_v<T>) {
             if (!obj_.valid()) return;
             overload_storage_.clear();
-            const ClassInfo* info = lookup_class_info(obj_.class_name());
+            const ClassInfo* info = detail::lookup_class_info(obj_.class_name());
             if (!info)
                 throw std::runtime_error(
                     "Proxy: object type '" + std::string(obj_.class_name()) +
