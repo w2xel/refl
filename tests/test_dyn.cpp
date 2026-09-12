@@ -152,6 +152,18 @@ struct ConstArrImpl {
     ConstArrImpl() : data{10, 20} {}
 };
 
+// For const-Proxy operator[] tests — a non-readonly array member accessed
+// through a const Proxy must yield a const reference (read-only element
+// access), matching the const-correctness of operator->() const.
+struct IArr {
+    std::array<int, 2> data;
+    IArr() : data{10, 20} {}
+};
+struct ArrImpl {
+    std::array<int, 2> data;
+    ArrImpl() : data{10, 20} {}
+};
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
@@ -165,6 +177,7 @@ struct ConstArrImpl {
 [[maybe_unused]] static refl::Reg<OverOpImpl> reg_overop_impl;
 [[maybe_unused]] static refl::Reg<LongAddImpl> reg_long_add;
 [[maybe_unused]] static refl::Reg<ConstArrImpl> reg_const_arr;
+[[maybe_unused]] static refl::Reg<ArrImpl> reg_arr;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -590,6 +603,41 @@ int main() {
         // Read the whole array via the copy conversion still works too.
         std::array<int, 2> copy = p->data;
         CHECK(copy[1] == 20, "readonly array read via copy: data[1] == 20");
+    }
+
+    // === Proxy: const-proxy operator[] — const-correctness on non-readonly
+    // arrays ===
+    // A non-readonly array member accessed through a const Proxy must yield
+    // a const reference: element reads work, element writes are a compile
+    // error.  This matches operator->() const as a read-only view — before
+    // the fix, const Proxy<T> still allowed mutation through operator[].
+    {
+        auto sp = std::make_shared<ArrImpl>();
+        const refl::Proxy<IArr> cp(sp);
+        // Element reads work through the const proxy:
+        CHECK(cp->data[0] == 10, "const proxy: non-readonly array element read data[0] == 10");
+        CHECK(cp->data[1] == 20, "const proxy: non-readonly array element read data[1] == 20");
+        // operator[] on a const proxy yields a const reference (compile-time
+        // check on the return type — the [0] call is an operator invocation,
+        // so decltype preserves cv-qualifiers through the return type).
+        static_assert(std::is_const_v<std::remove_reference_t<
+            decltype(cp->data[std::size_t{}])>>,
+            "const proxy operator[] must yield a const reference");
+        static_assert(!std::is_assignable_v<
+            decltype(cp->data[std::size_t{}]), int>,
+            "const proxy element must not be assignable");
+        // The same member on a non-const proxy yields a mutable reference:
+        refl::Proxy<IArr> mp(sp);
+        static_assert(!std::is_const_v<std::remove_reference_t<
+            decltype(mp->data[std::size_t{}])>>,
+            "non-const proxy operator[] must yield a mutable reference");
+        static_assert(std::is_assignable_v<
+            decltype(mp->data[std::size_t{}]), int>,
+            "non-const proxy element must be assignable");
+        mp->data[0] = 99;
+        CHECK(mp->data[0] == 99, "non-const proxy element write: data[0] == 99");
+        // The const proxy sees the mutation (same underlying object):
+        CHECK(cp->data[0] == 99, "const proxy reads mutation from non-const proxy: data[0] == 99");
     }
 
     std::printf("dyn dispatch test ok\n");
