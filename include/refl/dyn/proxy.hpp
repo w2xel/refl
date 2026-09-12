@@ -208,7 +208,7 @@ struct TypedProperty {
     void operator=(T val) requires (!Readonly) {
         if (!setter || !obj) return;
         std::decay_t<T> storage(std::move(val));
-        Object val_ref(&storage, detail::type_name<std::decay_t<T>>());
+        Object val_ref(storage);
         setter(obj, &val_ref);
         if (after_set) {
             Object current = getter(obj);
@@ -247,7 +247,7 @@ struct TypedStaticProperty {
     void operator=(T val) requires (!Readonly) {
         if (!setter) return;
         std::decay_t<T> storage(std::move(val));
-        Object val_ref(&storage, detail::type_name<std::decay_t<T>>());
+        Object val_ref(storage);
         setter(&val_ref);
     }
 

@@ -327,6 +327,10 @@ class Enum;
 class Enumerator;
 
 namespace detail {
+Object borrow_object(void* ptr, std::string_view class_name);
+}  // namespace detail
+
+namespace detail {
 
 // Unlocked helper — caller must hold pool_mutex.
 // Returns the byte offset of `base_name` within `derived_name` (accumulated
@@ -506,15 +510,6 @@ public:
         , ptr_(ptr)
         , class_name_(class_name) {}
 
-    // Non-owning construction — raw pointer + class name.
-    // Call-scoped only: the caller must keep the source alive for the
-    // duration of the call.  Storing a non-owning Object past its
-    // source's lifetime is UB.  Used for argument passing and
-    // introspection of stack objects; not suitable for long-lived
-    // containers like Proxy.
-    Object(void* ptr, std::string_view class_name)
-        : ptr_(ptr), class_name_(class_name) {}
-
     // From shared_ptr<T> — implicit owning construction.  This is the
     // idiomatic way to create an Object from a heap-managed instance;
     // the shared_ptr keeps the object alive for the Object's lifetime.
@@ -627,6 +622,12 @@ public:
     const std::shared_ptr<void>& owner() const { return owner_; }
 
 private:
+    // Non-owning construction — raw pointer + class name.  Private:
+    // use Object(T&) for borrowing lvalues, or detail::borrow_object()
+    // for the one internal site that can't use the lvalue ctor.
+    Object(void* ptr, std::string_view class_name)
+        : ptr_(ptr), class_name_(class_name) {}
+
     std::shared_ptr<void> owner_;
     void* ptr_ = nullptr;
     // Borrows static storage: always type_name<T>() (consteval).
@@ -634,14 +635,21 @@ private:
 
     friend class Function;
     friend class Field;
+    friend Object detail::borrow_object(void*, std::string_view);
 };
 
 // ---------------------------------------------------------------------------
 // detail templates that need Object to be complete.
 // Defined here (after Object) but still in namespace detail.
-// ---------------------------------------------------------------------------
 
 namespace detail {
+
+// Factory for non-owning borrow Objects from a raw pointer.  Used by
+// static_invoker for reference returns (where the lvalue ctor can't be
+// used because the reference may be const-qualified).  Call-scoped only.
+Object borrow_object(void* ptr, std::string_view class_name) {
+    return Object(ptr, class_name);
+}
 
 // Build an Object from argument I.  Non-const lvalue args borrow the
 // caller's variable directly (so functions with T& out-params write through
@@ -853,7 +861,7 @@ Object static_invoker(const Object* args) {
             return Object{};
         } else if constexpr (std::is_reference_v<R>) {
             auto& ref = fn(extract(std::integral_constant<std::size_t, I>{})...);
-            return Object(std::addressof(ref), type_name<RStore>());
+            return borrow_object(std::addressof(ref), type_name<RStore>());
         } else {
             return Object(std::make_shared<RStore>(
                 fn(extract(std::integral_constant<std::size_t, I>{})...)),
@@ -1263,7 +1271,7 @@ public:
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         std::decay_t<V> storage(std::forward<V>(val));
-        Object val_ref(&storage, detail::type_name<std::decay_t<V>>());
+        Object val_ref(storage);
         return detail::checked_call(owner_->fields[idx_].setter,
                                     adj, &val_ref);
     }
@@ -1334,7 +1342,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!has_setter()) return std::unexpected(Error::ReadOnly);
         std::decay_t<V> storage(std::forward<V>(val));
-        Object val_ref(&storage, detail::type_name<std::decay_t<V>>());
+        Object val_ref(storage);
         return detail::checked_call(owner_->static_fields[idx_].setter,
                                     &val_ref);
     }
