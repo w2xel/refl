@@ -232,6 +232,9 @@ struct TypedProperty {
 // ---------------------------------------------------------------------------
 // TypedStaticProperty<T, Readonly> — static data member proxy.  No obj
 // pointer needed; accesses static storage via function pointers.
+//
+// Retained for Dyn<T>'s dispatch struct.  Proxy<T> does not synthesize
+// static fields — it exposes get_class() for static access instead.
 // ---------------------------------------------------------------------------
 template <typename T, bool Readonly = false>
 struct TypedStaticProperty {
@@ -256,6 +259,9 @@ struct TypedStaticProperty {
 
 // ---------------------------------------------------------------------------
 // TypedStaticMethod<R> — static member function proxy.  No obj pointer.
+//
+// Retained for Dyn<T>'s dispatch struct.  Proxy<T> does not synthesize
+// static methods — it exposes get_class() for static access instead.
 // ---------------------------------------------------------------------------
 template <typename R>
 struct TypedStaticMethod {
@@ -272,6 +278,11 @@ struct TypedStaticMethod {
 // ---------------------------------------------------------------------------
 // Field-type builders — must be after TypedMethod/TypedProperty definitions
 // because they use ^^TypedMethod / ^^TypedProperty in consteval substitute().
+//
+// Proxy<T> does not synthesize static fields or methods into its dispatch
+// struct: statics are class-level, not instance-level, and belong on
+// refl::Class.  Proxy<T>::get_class() returns the bound object's Class for
+// static access.  The static builders/traits below are retained for Dyn<T>.
 // ---------------------------------------------------------------------------
 namespace detail {
 
@@ -282,14 +293,14 @@ template <typename... Sigs> struct is_typed_method<TypedMethod<Sigs...>>
 template <typename T> inline constexpr bool is_typed_method_v =
     is_typed_method<T>::value;
 
-// Check if a dispatch field type is a TypedStaticMethod.
+// Check if a dispatch field type is a TypedStaticMethod (used by Dyn<T>).
 template <typename T> struct is_typed_static_method : std::false_type {};
 template <typename R>
 struct is_typed_static_method<TypedStaticMethod<R>> : std::true_type {};
 template <typename T> inline constexpr bool is_typed_static_method_v =
     is_typed_static_method<T>::value;
 
-// Check if a dispatch field type is a TypedStaticProperty.
+// Check if a dispatch field type is a TypedStaticProperty (used by Dyn<T>).
 template <typename T> struct is_typed_static_property : std::false_type {};
 template <typename T2, bool R>
 struct is_typed_static_property<TypedStaticProperty<T2, R>> : std::true_type {};
@@ -303,6 +314,7 @@ consteval std::meta::info make_typed_method_type(std::meta::info type,
 }
 
 // consteval: build the TypedStaticMethod<R> type for a static function.
+// Used by Dyn<T>; Proxy<T> does not synthesize static methods.
 consteval std::meta::info make_static_method_type(std::meta::info m) {
     auto rt = std::meta::return_type_of(m);
     return std::meta::substitute(^^TypedStaticMethod,
@@ -310,6 +322,7 @@ consteval std::meta::info make_static_method_type(std::meta::info m) {
 }
 
 // consteval: build the TypedStaticProperty<T, Readonly> type for a static member.
+// Used by Dyn<T>; Proxy<T> does not synthesize static fields.
 consteval std::meta::info make_static_property_type(std::meta::info m) {
     auto mt = std::meta::type_of(m);
     bool is_const = std::meta::is_const_type(mt);
@@ -452,48 +465,6 @@ class Proxy {
                     }
                 }
             }
-            // Static data members → TypedStaticProperty.
-            static constexpr auto static_data = std::define_static_array(
-                std::meta::static_data_members_of(^^T,
-                    std::meta::access_context::unchecked()));
-            std::vector<std::string> seen_static;
-            template for (constexpr auto m : static_data) {
-                if constexpr (std::meta::has_identifier(m)
-                              && std::meta::is_public(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_static)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_static.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_static_property_type(m);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
-            // Static member functions → TypedStaticMethod.
-            std::vector<std::string> seen_static_fns;
-            template for (constexpr auto m : members) {
-                if constexpr (detail::is_public_method(m)
-                              && std::meta::has_identifier(m)
-                              && std::meta::is_static_member(m)) {
-                    constexpr auto nm = std::meta::identifier_of(m);
-                    auto nm_str = std::string(nm);
-                    bool dup = false;
-                    for (const auto& s : seen_static_fns)
-                        if (s == nm_str) { dup = true; break; }
-                    if (!dup) {
-                        seen_static_fns.push_back(nm_str);
-                        constexpr auto field_type =
-                            detail::make_static_method_type(m);
-                        specs.push_back(std::meta::data_member_spec(
-                            field_type, {.name=nm_str}));
-                    }
-                }
-            }
             // No obj field — Proxy stores the object separately as
             // Object since the actual type differs from T.
             std::meta::define_aggregate(^^Dispatch, specs);
@@ -581,41 +552,6 @@ class Proxy {
                         }
                         dispatch_.[:field:].overloads = vec.data();
                         dispatch_.[:field:].num = vec.size();
-                    } else if constexpr (detail::is_typed_static_method_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Static method → bind from Object's ClassInfo.
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        auto key = std::string(nm_sv);
-                        bool found = false;
-                        for (const auto& fi : info->static_functions)
-                            if (fi.name == key) {
-                                dispatch_.[:field:].invoker = fi.invoker;
-                                found = true;
-                                break;
-                            }
-                        if (!found)
-                            throw std::runtime_error(
-                                "Proxy: no static method '" + key +
-                                "' in type '" +
-                                std::string(obj_.class_name()) + "'");
-                    } else if constexpr (detail::is_typed_static_property_v<
-                            std::remove_cv_t<FieldType>>) {
-                        // Static property → bind from Object's ClassInfo.
-                        constexpr auto nm_sv = std::meta::identifier_of(field);
-                        auto key = std::string(nm_sv);
-                        bool found = false;
-                        for (const auto& fi : info->static_fields)
-                            if (fi.name == key) {
-                                dispatch_.[:field:].getter = fi.getter;
-                                dispatch_.[:field:].setter = fi.setter;
-                                found = true;
-                                break;
-                            }
-                        if (!found)
-                            throw std::runtime_error(
-                                "Proxy: no static field '" + key +
-                                "' in type '" +
-                                std::string(obj_.class_name()) + "'");
                     } else {
                         // Non-static data member → bind from Object's ClassInfo.
                         dispatch_.[:field:].obj = obj_.raw();
@@ -661,6 +597,18 @@ public:
     const auto* operator->() const { return &dispatch_; }
 
     bool is_bound() const { return obj_.valid(); }
+
+    // The Class of the bound object's actual runtime type (not T).
+    // Statics are class-level, not instance-level — access them through
+    // this Class instead of the dispatch struct:
+    //   auto c = p.get_class();
+    //   int n = *c.find_static_function("instance_count")->invoke().value()
+    //                .cast_ref<int>().value();
+    // Returns an invalid Class if not bound or the type is unregistered.
+    Class get_class() const {
+        if (!obj_.valid()) return {};
+        return find_class(obj_.class_name()).value_or(Class{});
+    }
 
     Proxy(const Proxy&) = delete;
     Proxy(Proxy&&) = delete;
