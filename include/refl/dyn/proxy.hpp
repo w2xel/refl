@@ -386,11 +386,15 @@ struct FixedString {
 //   int a = p->render(2);   // calls Square::render, returns int
 //
 // Validation: bind() and the constructor throw std::runtime_error at bind
-// time if the object's type is not registered, if any interface method,
-// field, or static member has no match in the object's ClassInfo, or if
-// a matched method's return type differs from the interface's.  This
-// catches structural mismatches as early as possible — before any call
-// through the proxy.
+// time if:
+//   1. The Object is non-owning (not backed by a shared_ptr) — the proxy
+//      outlives a borrow, so non-owning Objects are rejected.
+//   2. The object's type is not registered in the reflection pool.
+//   3. Any interface method, field, or static member has no match in the
+//      object's ClassInfo.
+//   4. A matched method's return type differs from the interface's.
+// This catches structural mismatches and lifetime issues as early as
+// possible — before any call through the proxy.
 //
 // Thread safety: NOT thread-safe.  Concurrent bind() + operator->(), or
 // concurrent bind() from multiple threads, is a data race on the dispatch
@@ -506,6 +510,13 @@ class Proxy {
         std::lock_guard<std::mutex> lk(pool_mutex());
         auto it = class_pool().find(std::string(name));
         return it != class_pool().end() ? it->second.get() : nullptr;
+    }
+
+    void check_owned() {
+        if (obj_.valid() && !obj_.is_owned())
+            throw std::runtime_error(
+                "Proxy: non-owning Object cannot be bound — the proxy "
+                "outlives the borrow. Use a shared_ptr-backed Object.");
     }
 
     static std::string join_types(const std::vector<std::string>& types) {
@@ -636,12 +647,15 @@ public:
     Proxy() = default;
 
     // Bind a type-erased Object — wires T's dispatch fields to the
-    // Object's methods via its ClassInfo.  The Object's type must be
-    // registered in the pool (e.g. via ensure_registered<T>() or
-    // Constructor::call).  The Object need not be owning — for non-owning
-    // Objects the caller must keep the source alive.
-    explicit Proxy(Object obj) : obj_(std::move(obj)) { populate(); }
-    void bind(Object obj) { obj_ = std::move(obj); populate(); }
+    // Object's methods via its ClassInfo.  The Object must be owning
+    // (backed by a shared_ptr); non-owning Objects are rejected because
+    // the proxy outlives the borrow.  Use shared_ptr-backed Objects or
+    // the implicit shared_ptr<T> → Object conversion:
+    //
+    //   auto sp = std::make_shared<Square>(4);
+    //   refl::Proxy<IDrawable> p(sp);   // implicit, owning
+    explicit Proxy(Object obj) : obj_(std::move(obj)) { check_owned(); populate(); }
+    void bind(Object obj) { obj_ = std::move(obj); check_owned(); populate(); }
 
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }

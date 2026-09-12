@@ -68,11 +68,16 @@ struct HasPartial { int exists(int x) { return x; } };
 struct IBadReturn { int compute(int); };
 struct DoubleReturn { double compute(int x) { return x * 1.5; } };
 
+// For non-owning/shared_ptr Proxy tests.
+struct ISimple { int get_value(); };
+struct SimpleImpl { int v; SimpleImpl(int v) : v(v) {} int get_value() { return v; } };
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
 [[maybe_unused]] static refl::Reg<HasPartial> reg_has_partial;
 [[maybe_unused]] static refl::Reg<DoubleReturn> reg_double_return;
+[[maybe_unused]] static refl::Reg<SimpleImpl> reg_simple_impl;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -329,6 +334,25 @@ int main() {
         threw_return = true;
     }
     CHECK(threw_return, "Proxy<IBadReturn> should throw — return type mismatch (int vs double)");
+
+    // === Proxy: non-owning Object rejected ===
+    // A non-owning Object (borrow) must be rejected — the proxy outlives it.
+    SimpleImpl stack_impl(42);
+    refl::Object borrowed(stack_impl);  // non-owning borrow
+    CHECK(!borrowed.is_owned(), "borrowed Object should not be owned");
+    bool threw_borrow = false;
+    try {
+        refl::Proxy<ISimple> bad3(borrowed);
+    } catch (const std::runtime_error&) {
+        threw_borrow = true;
+    }
+    CHECK(threw_borrow, "Proxy should reject non-owning Object");
+
+    // shared_ptr path works — implicit conversion to owning Object.
+    auto sp = std::make_shared<SimpleImpl>(42);
+    refl::Proxy<ISimple> psp(sp);
+    CHECK(psp.is_bound(), "Proxy from shared_ptr should be bound");
+    CHECK(psp->get_value() == 42, "shared_ptr-backed Proxy get_value() should be 42");
 
     std::printf("dyn dispatch test ok\n");
     return 0;

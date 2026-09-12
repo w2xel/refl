@@ -259,6 +259,13 @@ consteval std::string_view type_name() {
     return std::meta::display_string_of(^^T);
 }
 
+// Type trait: is T a shared_ptr specialization?
+// Used to disambiguate the Object lvalue-borrow constructor from the
+// shared_ptr owning constructor.
+template <typename T> struct is_shared_ptr : std::false_type {};
+template <typename T> struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {};
+template <typename T> inline constexpr bool is_shared_ptr_v = is_shared_ptr<T>::value;
+
 // Detect a consteval member function by its display string.  GCC 16.2's
 // <meta> has no is_consteval query (added in a later P2996 revision), so we
 // inspect display_string_of, which prefixes the specifier: "[static ]consteval
@@ -500,24 +507,48 @@ public:
         , class_name_(class_name) {}
 
     // Non-owning construction — raw pointer + class name.
+    // Call-scoped only: the caller must keep the source alive for the
+    // duration of the call.  Storing a non-owning Object past its
+    // source's lifetime is UB.  Used for argument passing and
+    // introspection of stack objects; not suitable for long-lived
+    // containers like Proxy.
     Object(void* ptr, std::string_view class_name)
         : ptr_(ptr), class_name_(class_name) {}
 
+    // From shared_ptr<T> — implicit owning construction.  This is the
+    // idiomatic way to create an Object from a heap-managed instance;
+    // the shared_ptr keeps the object alive for the Object's lifetime.
+    //
+    //   auto sp = std::make_shared<Point>(1, 2);
+    //   refl::Object obj = sp;           // implicit, owning
+    //   refl::Proxy<IDrawable> p(sp);    // implicit, owning
+    template <typename T>
+        requires (not std::same_as<std::remove_cvref_t<T>, void>) &&
+                 (not std::same_as<std::remove_cvref_t<T>, Object>)
+    Object(const std::shared_ptr<T>& sp) noexcept
+        : owner_(std::static_pointer_cast<void>(sp))
+        , ptr_(sp.get())
+        , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
+
     // From a concrete lvalue — non-owning borrow.
-    // The caller must keep obj alive.  Rejected for const T: a mutable
-    // borrow of a const object would let cast_ref<T>() write through it
-    // (UB).  A const lvalue instead falls through to the rvalue ctor,
-    // which makes an owning copy.
+    // Call-scoped only: safe for passing to invoke/get/set where the
+    // Object is consumed within the call.  Storing the resulting Object
+    // past the source's lifetime (e.g. in a Proxy) is UB.  Rejected for
+    // const T: a mutable borrow of a const object would let cast_ref<T>()
+    // write through it (UB).  A const lvalue instead falls through to the
+    // rvalue ctor, which makes an owning copy.
     template <typename T>
         requires (not std::same_as<std::remove_cvref_t<T>, Object>) &&
-                 (not std::is_const_v<T>)
+                 (not std::is_const_v<T>) &&
+                 (not detail::is_shared_ptr_v<std::remove_cvref_t<T>>)
     Object(T& obj) noexcept
         : ptr_(static_cast<void*>(std::addressof(obj)))
         , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
 
     // From a concrete rvalue — owning (moves into shared_ptr).
     template <typename T>
-        requires (not std::same_as<std::remove_cvref_t<T>, Object>)
+        requires (not std::same_as<std::remove_cvref_t<T>, Object>) &&
+                 (not detail::is_shared_ptr_v<std::remove_cvref_t<T>>)
     Object(T&& obj)
         : owner_(std::make_shared<std::remove_cvref_t<T>>(std::move(obj)))
         , ptr_(owner_.get())

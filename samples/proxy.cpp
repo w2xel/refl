@@ -1,14 +1,18 @@
 // Sample: structural proxy — call a concrete type through an interface
 // it does not inherit from, using a type-erased Object.
 //
-// IDrawable is a non-abstract interface with __builtin_unreachable stubs.
-// Square and Triangle are concrete types with compatible methods but no
-// inheritance relationship to IDrawable.  Proxy<IDrawable> synthesizes a
-// typed dispatch struct from IDrawable's interface, then a type-erased
-// Object (from Constructor::call) is bound — all type/signature checking
-// happens at runtime via the reflection pool.
+// IDrawable is a declaration-only interface.  Square and Triangle are
+// concrete types with compatible methods but no inheritance relationship
+// to IDrawable.  Proxy<IDrawable> synthesizes a typed dispatch struct from
+// IDrawable's interface, then an owning Object is bound — all type/signature
+// checking happens at runtime via the reflection pool.
+//
+// Two construction paths are shown:
+// 1. shared_ptr<T> → Object (implicit, idiomatic for known types)
+// 2. Constructor::call → Object (fully type-erased, for runtime dispatch)
 #include <refl/dyn.hpp>
 #include <cstdio>
+#include <memory>
 
 // Interface — declaration only, no bodies.  Proxy never calls these;
 // they exist solely for compile-time signature extraction via reflection.
@@ -42,16 +46,12 @@ struct Triangle {
 [[maybe_unused]] static refl::Reg<Triangle> reg_triangle;
 
 int main() {
-    // Fully type-erased construction: look up by name, construct by name.
-    // Proxy<IDrawable> never sees "Square" in its own code — it receives
-    // an Object and resolves everything at runtime.
-    auto square_cls = *refl::find_class("Square");
-    auto square_obj = *square_cls.constructors()[0].call(4);
-
-    std::printf("=== Proxy<IDrawable> → Square(4) via Object ===\n");
-    refl::Proxy<IDrawable> p(square_obj);
+    // Path 1: shared_ptr<T> → Object (implicit conversion).
+    // The idiomatic way when you know the type at compile time.
+    std::printf("=== Proxy<IDrawable> → Square(4) via shared_ptr ===\n");
+    auto sp = std::make_shared<Square>(4);
+    refl::Proxy<IDrawable> p(sp);
     std::printf("is_bound = %d\n", p.is_bound());
-    std::printf("object = %s\n", square_obj.to_string().c_str());
 
     int r1 = p->render(2);
     std::printf("render(2) = %d  (4*4*2*1 = 32)\n", r1);
@@ -60,11 +60,14 @@ int main() {
     int r2 = p->render(2);
     std::printf("render(2) after tint=3 = %d  (4*4*2*3 = 96)\n", r2);
 
-    // Same proxy type, different implementation — also via Object.
+    // Path 2: Constructor::call → Object (fully type-erased).
+    // Look up by name, construct by name.  Proxy<IDrawable> never sees
+    // "Triangle" in its own code — it receives an Object and resolves
+    // everything at runtime.
     auto tri_cls = *refl::find_class("Triangle");
     auto tri_obj = *tri_cls.constructors()[0].call(6, 8);
 
-    std::printf("\n=== Proxy<IDrawable> → Triangle(6, 8) via Object ===\n");
+    std::printf("\n=== Proxy<IDrawable> → Triangle(6, 8) via Constructor::call ===\n");
     refl::Proxy<IDrawable> p2(tri_obj);
     int r3 = p2->render(2);
     std::printf("render(2) = %d  (6*8*2*1/2 = 48)\n", r3);
@@ -88,3 +91,4 @@ int main() {
 
     return 0;
 }
+
