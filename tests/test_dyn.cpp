@@ -72,12 +72,38 @@ struct DoubleReturn { double compute(int x) { return x * 1.5; } };
 struct ISimple { int get_value(); };
 struct SimpleImpl { int v; SimpleImpl(int v) : v(v) {} int get_value() { return v; } };
 
+// For Proxy operator tests.
+struct IVec2 {
+    int x, y;
+    IVec2(int x, int y) : x(x), y(y) {}
+    IVec2 operator+(const IVec2& o) const { return IVec2(x + o.x, y + o.y); }
+    bool operator==(const IVec2& o) const { return x == o.x && y == o.y; }
+    bool operator<(const IVec2& o) const { return x + y < o.x + o.y; }
+};
+struct Vec2Impl {
+    int x, y;
+    Vec2Impl(int x, int y) : x(x), y(y) {}
+    Vec2Impl operator+(const Vec2Impl& o) const { return Vec2Impl(x + o.x, y + o.y); }
+    bool operator==(const Vec2Impl& o) const { return x == o.x && y == o.y; }
+    bool operator<(const Vec2Impl& o) const { return x + y < o.x + o.y; }
+};
+// A different impl type — same operator signatures, different type name.
+struct Vec2Other {
+    int x, y;
+    Vec2Other(int x, int y) : x(x), y(y) {}
+    Vec2Other operator+(const Vec2Other& o) const { return Vec2Other(x + o.x, y + o.y); }
+    bool operator==(const Vec2Other& o) const { return x == o.x && y == o.y; }
+    bool operator<(const Vec2Other& o) const { return x + y < o.x + o.y; }
+};
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
 [[maybe_unused]] static refl::Reg<HasPartial> reg_has_partial;
 [[maybe_unused]] static refl::Reg<DoubleReturn> reg_double_return;
 [[maybe_unused]] static refl::Reg<SimpleImpl> reg_simple_impl;
+[[maybe_unused]] static refl::Reg<Vec2Impl> reg_vec2_impl;
+[[maybe_unused]] static refl::Reg<Vec2Other> reg_vec2_other;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -359,6 +385,49 @@ int main() {
     refl::Proxy<ISimple> psp(sp);
     CHECK(psp.is_bound(), "Proxy from shared_ptr should be bound");
     CHECK(psp->get_value() == 42, "shared_ptr-backed Proxy get_value() should be 42");
+
+    // === Proxy operators ===
+    // Happy path: same impl type on both proxies.
+    {
+        auto sp1 = std::make_shared<Vec2Impl>(1, 2);
+        auto sp2 = std::make_shared<Vec2Impl>(3, 4);
+        refl::Proxy<IVec2> pv1(sp1);
+        refl::Proxy<IVec2> pv2(sp2);
+
+        // operator+ (Proxy + Proxy)
+        auto sum = pv1 + pv2;
+        CHECK(sum.x == 4, "pv1 + pv2: x should be 4 (1+3)");
+        CHECK(sum.y == 6, "pv1 + pv2: y should be 6 (2+4)");
+
+        // operator== (Proxy == Proxy)
+        bool eq = pv1 == pv2;
+        CHECK(!eq, "pv1 == pv2 should be false");
+        refl::Proxy<IVec2> pv1b(sp1);
+        bool eq2 = pv1 == pv1b;
+        CHECK(eq2, "pv1 == pv1b should be true (same values)");
+
+        // operator< (Proxy < Proxy)
+        bool lt = pv1 < pv2;
+        CHECK(lt, "pv1 < pv2 should be true (3 < 7)");
+    }
+
+    // Exception path: mismatched impl types — the invoker's type check
+    // should catch it at call time and throw std::runtime_error.
+    {
+        auto sp1 = std::make_shared<Vec2Impl>(1, 2);
+        auto sp2 = std::make_shared<Vec2Other>(3, 4);
+        refl::Proxy<IVec2> pv1(sp1);
+        refl::Proxy<IVec2> pv2(sp2);  // different impl type, same interface
+
+        bool threw = false;
+        try {
+            auto sum = pv1 + pv2;
+            (void)sum;
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw, "pv1 + pv2 with mismatched impls should throw runtime_error");
+    }
 
     std::printf("dyn dispatch test ok\n");
     return 0;
