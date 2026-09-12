@@ -167,8 +167,8 @@ struct LongAddImpl {
     long operator+(int x) const { return static_cast<long>(v) + x; }
 };
 
-// For Proxy readonly-array operator[] tests — a const array member must
-// not expose a mutable operator[] that bypasses the Readonly contract.
+// For Proxy readonly-array tests — a const array member has Readonly=true
+// (operator= deleted).  Element access is via whole-object copy.
 struct IConstArr {
     const std::array<int, 2> data;
     IConstArr() : data{10, 20} {}
@@ -178,9 +178,7 @@ struct ConstArrImpl {
     ConstArrImpl() : data{10, 20} {}
 };
 
-// For const-Proxy operator[] tests — a non-readonly array member accessed
-// through a const Proxy must yield a const reference (read-only element
-// access), matching the const-correctness of operator->() const.
+// For non-readonly array tests — whole-object read/write via TypedProperty.
 struct IArr {
     std::array<int, 2> data;
     IArr() : data{10, 20} {}
@@ -200,9 +198,9 @@ struct RefGet {
     int val() const { return x; }
 };
 
-// For move-only after_set tests — on_change on a move-only member must
-// not crash when the getter is null.  The hook fires with the value
-// that was just set instead.
+// For move-only on_change tests — on_change on a move-only member must
+// not crash when the getter is null.  The setter trampoline uses
+// borrow_object (member_offset + type_name) as the fallback.
 struct MoveOnlyProp {
     std::unique_ptr<int> ptr;
     MoveOnlyProp() : ptr(std::make_unique<int>(0)) {}
@@ -234,25 +232,6 @@ struct MoveOnlyProp {
         std::fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); \
         return 1; \
     } } while (0)
-
-// Trait: does a TypedProperty expose operator[]?  Uses void_t (SFINAE)
-// rather than a requires-expression, because GCC 16.2 reports a hard
-// error (not a soft false) when a deducing-this candidate's constraints
-// fail inside a requires-expression.
-template <typename, typename = void>
-struct has_subscript : std::false_type {};
-template <typename P>
-struct has_subscript<P, std::void_t<decltype(std::declval<P&>()[std::size_t{}])>>
-    : std::true_type {};
-
-// Trait: can the element returned by operator[] be assigned to?  False
-// for readonly properties, whose operator[] yields a const reference.
-template <typename, typename = void>
-struct is_assignable_subscript : std::false_type {};
-template <typename P>
-struct is_assignable_subscript<P,
-        std::void_t<decltype(std::declval<P&>()[std::size_t{}] = int{})>>
-    : std::true_type {};
 
 int main() {
     // === Dyn<T> dispatch-struct tests ===
@@ -309,15 +288,17 @@ int main() {
     // (Dyn<Point> reg_point above + rp(1,2) registered Point)
     CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
 
-    // === operator[] on array members ===
-    rp->coords[0] = 10;
-    rp->coords[1] = 20;
-    rp->coords[2] = 30;
+    // === array element access via get() ===
+    // TypedProperty no longer offers operator[] (removed to keep the field
+    // type hook-free).  Access elements via Dyn<T>::get() instead.
+    rp.get().coords[0] = 10;
+    rp.get().coords[1] = 20;
+    rp.get().coords[2] = 30;
     CHECK(rp.get().coords[0] == 10, "coords[0] should be 10");
     CHECK(rp.get().coords[1] == 20, "coords[1] should be 20");
     CHECK(rp.get().coords[2] == 30, "coords[2] should be 30");
-    int c1 = rp->coords[1];
-    CHECK(c1 == 20, "coords[1] read via operator[] should be 20");
+    int c1 = rp.get().coords[1];
+    CHECK(c1 == 20, "coords[1] read via get() should be 20");
 
     // === static members accessed via get_class() ===
     // Statics are class-level, not instance-level — they live on refl::Class,
@@ -349,7 +330,7 @@ int main() {
     CHECK(rp.get().y == 200, "after reset(100,200), y should be 200");
     rp->set(5, 6);
     CHECK(rp.get().x == 5, "after set(5,6) on swapped object, x should be 5");
-    rp->coords[0] = 999;
+    { auto c = rp.get().coords; c[0] = 999; rp.get().coords = c; }
     CHECK(rp.get().coords[0] == 999, "coords[0] on swapped object should be 999");
 
     // === typed overload dispatch: Mixed::compute(int) returns int, compute(double) returns double ===
@@ -720,68 +701,35 @@ int main() {
         CHECK(threw, "operator+ with mismatched primitive return (int vs long) should throw");
     }
 
-    // === Proxy: readonly array operator[] — read-only element access ===
-    // A const array member has Readonly=true. operator[] is still exposed
-    // but yields a const reference: element reads work, element writes are a
-    // compile error — the same contract as whole-object operator= (deleted
-    // for Readonly).  This avoids a copy when reading individual elements of
-    // a const container.
+    // === Proxy: readonly array — whole-object access only ===
+    // TypedProperty no longer offers operator[].  A const array member
+    // has Readonly=true (operator= deleted).  Element access is via
+    // whole-object copy (implicit conversion to T) then indexing the copy.
     {
         auto sp = std::make_shared<ConstArrImpl>();
         refl::Proxy<IConstArr> p(sp);
         using DataProp = decltype(p->data);
         CHECK(DataProp::is_readonly(), "const array data should be Readonly");
-        // operator[] exists for both readonly and non-readonly subscriptable T.
-        static_assert(has_subscript<DataProp>::value,
-            "readonly array must expose operator[] (read)");
-        static_assert(has_subscript<refl::TypedProperty<std::array<int,2>, false>>::value,
-            "non-readonly array must expose operator[]");
-        // Element reads through the const overload:
-        CHECK(p->data[0] == 10, "readonly array element read: data[0] == 10");
-        CHECK(p->data[1] == 20, "readonly array element read: data[1] == 20");
-        // Element writes through a readonly array are a compile error:
-        static_assert(!is_assignable_subscript<DataProp>::value,
-            "readonly array element must not be assignable (const ref)");
-        static_assert(is_assignable_subscript<refl::TypedProperty<std::array<int,2>, false>>::value,
-            "non-readonly array element must be assignable");
-        // Read the whole array via the copy conversion still works too.
+        // Read the whole array via the copy conversion.
         std::array<int, 2> copy = p->data;
+        CHECK(copy[0] == 10, "readonly array read via copy: data[0] == 10");
         CHECK(copy[1] == 20, "readonly array read via copy: data[1] == 20");
     }
 
-    // === Proxy: const-proxy operator[] — const-correctness on non-readonly
-    // arrays ===
-    // A non-readonly array member accessed through a const Proxy must yield
-    // a const reference: element reads work, element writes are a compile
-    // error.  This matches operator->() const as a read-only view — before
-    // the fix, const Proxy<T> still allowed mutation through operator[].
+    // === Proxy: non-readonly array — whole-object read/write ===
+    // Without operator[], element-level mutation goes through whole-object
+    // assignment: read the array, mutate the copy, write it back.
     {
         auto sp = std::make_shared<ArrImpl>();
-        const refl::Proxy<IArr> cp(sp);
-        // Element reads work through the const proxy:
-        CHECK(cp->data[0] == 10, "const proxy: non-readonly array element read data[0] == 10");
-        CHECK(cp->data[1] == 20, "const proxy: non-readonly array element read data[1] == 20");
-        // operator[] on a const proxy yields a const reference (compile-time
-        // check on the return type — the [0] call is an operator invocation,
-        // so decltype preserves cv-qualifiers through the return type).
-        static_assert(std::is_const_v<std::remove_reference_t<
-            decltype(cp->data[std::size_t{}])>>,
-            "const proxy operator[] must yield a const reference");
-        static_assert(!std::is_assignable_v<
-            decltype(cp->data[std::size_t{}]), int>,
-            "const proxy element must not be assignable");
-        // The same member on a non-const proxy yields a mutable reference:
         refl::Proxy<IArr> mp(sp);
-        static_assert(!std::is_const_v<std::remove_reference_t<
-            decltype(mp->data[std::size_t{}])>>,
-            "non-const proxy operator[] must yield a mutable reference");
-        static_assert(std::is_assignable_v<
-            decltype(mp->data[std::size_t{}]), int>,
-            "non-const proxy element must be assignable");
-        mp->data[0] = 99;
-        CHECK(mp->data[0] == 99, "non-const proxy element write: data[0] == 99");
-        // The const proxy sees the mutation (same underlying object):
-        CHECK(cp->data[0] == 99, "const proxy reads mutation from non-const proxy: data[0] == 99");
+        std::array<int, 2> arr = mp->data;
+        arr[0] = 99;
+        mp->data = arr;
+        { std::array<int, 2> chk = mp->data; CHECK(chk[0] == 99, "non-readonly array element write via whole-object: data[0] == 99"); }
+        // Const proxy still reads the whole array:
+        const refl::Proxy<IArr> cp(sp);
+        std::array<int, 2> ccopy = cp->data;
+        CHECK(ccopy[0] == 99, "const proxy reads mutation: data[0] == 99");
     }
 
     // === Proxy: reference-returning methods preserve references ===
@@ -814,9 +762,9 @@ int main() {
 
     // === Dyn: on_change on move-only member does not crash ===
     // The getter is null for move-only members (not copy-constructible).
-    // Before the fix, after_set called getter(obj) unconditionally —
-    // null function pointer dereference, segfault.  After the fix, the
-    // hook fires with the value that was just set.
+    // The setter trampoline falls back to borrow_object (using
+    // member_offset + type_name) instead of calling the null getter, so
+    // the hook fires with the value that was just set.
     {
         refl::Dyn<MoveOnlyProp> m;
         m.reset();

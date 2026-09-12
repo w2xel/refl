@@ -80,6 +80,7 @@ class Dyn {
         if constexpr (std::is_class_v<T> && !std::meta::is_abstract_type(^^T)) {
             overload_storage_.clear();
             hook_contexts_.clear();
+            prop_hook_contexts_.clear();
             const ClassInfo* info = lookup_class_info();
             if (!info) return;
             static constexpr auto dm = std::define_static_array(
@@ -135,24 +136,6 @@ class Dyn {
         }
     }
 
-    void* find_field(std::string_view name) {
-        if constexpr (std::is_class_v<T>) {
-            static constexpr auto dm = std::define_static_array(
-                std::meta::nonstatic_data_members_of(^^Dispatch,
-                    std::meta::access_context::unchecked()));
-            template for (constexpr auto field : dm) {
-                if constexpr (std::meta::has_identifier(field)
-                              && std::meta::identifier_of(field) != "obj") {
-                    constexpr auto nm_sv = std::meta::identifier_of(field);
-                    constexpr auto nm = std::define_static_string(nm_sv);
-                    if (name == std::string_view(nm))
-                        return &dispatch_.[:field:];
-                }
-            }
-        }
-        return nullptr;
-    }
-
     // Hook storage: multi-listener (vector of callbacks per name).
     // std::map nodes are stable — pointers to the vectors don't move.
     std::map<std::string, std::vector<std::function<void(Object&)>>> invoke_hooks_;
@@ -161,13 +144,44 @@ class Dyn {
     // Dynamic properties (runtime-added, not reflected from T).
     std::map<std::string, Object> dynamic_props_;
 
-    // Callback-dispatcher for property-change hooks (after_set).
-    // ctx points at the std::vector<std::function<void(Object&)>> stored
-    // in change_hooks_ (std::map nodes are stable).
-    static void fire_hooks(void* ctx, Object& result) {
-        auto* v = static_cast<
-            std::vector<std::function<void(Object&)>>*>(ctx);
-        for (auto& cb : *v) cb(result);
+    // --- Property hook wrapping (on_change).
+    //     Instead of a per-field callback on TypedProperty (removed from
+    //     proxy.hpp for simplicity), on_change() wraps the field's getter
+    //     and setter with trampolines.  The setter trampoline calls the
+    //     original setter, then reads the current value (via the original
+    //     getter, or borrow_object for move-only members where getter is
+    //     null) and fires the hook list.  The getter trampoline is a plain
+    //     passthrough (no hook fires on read).  Per-property state (original
+    //     getter/setter, original obj, member_offset, type name, hook list
+    //     pointer) is stored in PropertyHookCtx; obj is redirected to the
+    //     ctx so the trampolines can recover it.  One trampoline pair
+    //     handles all properties — no compile-time indexing needed since
+    //     each property has its own obj pointing to its own context.
+    struct PropertyHookCtx {
+        GetterFn original_getter;
+        SetterFn original_setter;
+        void* original_obj;
+        std::size_t member_offset;
+        std::string_view type_name;
+        std::vector<std::function<void(Object&)>>* hooks;
+    };
+    std::map<std::string, PropertyHookCtx> prop_hook_contexts_;
+
+    static Object prop_get_trampoline(void* ctx) {
+        return ctx ? static_cast<PropertyHookCtx*>(ctx)->original_getter(
+                         static_cast<PropertyHookCtx*>(ctx)->original_obj)
+                   : Object{};
+    }
+
+    static void prop_set_trampoline(void* ctx, const Object* val) {
+        auto* c = static_cast<PropertyHookCtx*>(ctx);
+        c->original_setter(c->original_obj, val);
+        Object current = c->original_getter
+            ? c->original_getter(c->original_obj)
+            : detail::borrow_object(
+                static_cast<char*>(c->original_obj) + c->member_offset,
+                c->type_name);
+        for (auto& cb : *c->hooks) cb(current);
     }
 
     // --- Method hook wrapping (connect).
@@ -353,6 +367,7 @@ public:
         dynamic_mode_ = true;
         dynamic_callables_.clear();
         hook_contexts_.clear();
+        prop_hook_contexts_.clear();
         // Don't populate — implement() will wire each method.
     }
 
@@ -528,13 +543,22 @@ public:
     }
 
     // on_change: connect a callback to a property change (multi-listener).
+    //
+    //   p.on_change("x", [](Object& v) { ... });
+    //
+    // Implementation: on first on_change for a property, the field's
+    // getter and setter are replaced with trampolines.  The setter
+    // trampoline calls the original setter, then reads the current
+    // value and fires the hook list.  obj is redirected to a
+    // PropertyHookCtx so the trampolines can recover the originals.
+    // Subsequent on_change calls just append to the list (already
+    // wrapped).  Repopulation (reset, populate) clears the wrapping —
+    // re-call on_change to restore hooks.
     void on_change(std::string_view name,
                     std::function<void(Object&)> cb) {
         auto key = std::string(name);
         auto& vec = change_hooks_[key];
         vec.push_back(std::move(cb));
-        void* field = find_field(name);
-        if (!field) return;
         static constexpr auto dm = std::define_static_array(
             std::meta::nonstatic_data_members_of(^^Dispatch,
                 std::meta::access_context::unchecked()));
@@ -546,9 +570,21 @@ public:
                     constexpr auto nm_sv = std::meta::identifier_of(f);
                     constexpr auto nm = std::define_static_string(nm_sv);
                     if (name == std::string_view(nm)) {
-                        auto* tp = static_cast<std::remove_cv_t<FT>*>(field);
-                        tp->hook_ctx = &vec;
-                        tp->after_set = &fire_hooks;
+                        auto& ctx = prop_hook_contexts_[key];
+                        if (ctx.hooks == nullptr) {
+                            auto* tp = &dispatch_.[:f:];
+                            ctx.original_getter = tp->getter;
+                            ctx.original_setter = tp->setter;
+                            ctx.original_obj = tp->obj;
+                            ctx.member_offset = tp->member_offset;
+                            ctx.type_name =
+                                detail::type_name<std::remove_cvref_t<
+                                    typename FT::value_type>>();
+                            ctx.hooks = &vec;
+                            tp->getter = &prop_get_trampoline;
+                            tp->setter = &prop_set_trampoline;
+                            tp->obj = &ctx;
+                        }
                     }
                 }
             }

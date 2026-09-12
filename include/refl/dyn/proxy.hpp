@@ -205,18 +205,20 @@ public:
 // TypedProperty<T, Readonly> — mimics a public data member via operator=
 // and implicit conversion.  p->x = 42 writes; int v = p->x reads.
 // Const members use Readonly=true, which deletes operator= at compile time.
-// Subscriptable members (std::array, std::vector) also offer operator[].
+// Subscriptable members (std::array, std::vector) do NOT offer operator[];
+// access elements via Dyn<T>::get() or through a Proxy<T> bound to the
+// object.  operator[] was removed to keep the field type hook-free — the
+// raw-pointer arithmetic it used is incompatible with Dyn's getter/setter
+// wrapping for on_change hooks (obj is redirected to a hook context).
 // ---------------------------------------------------------------------------
 template <typename T, bool Readonly = false>
 struct TypedProperty {
+    using value_type = T;
     GetterFn getter = nullptr;
     SetterFn setter = nullptr;  // always nullptr when Readonly=true
     void* obj = nullptr;
     std::shared_ptr<void> owner;  // shared_ptr for getter/setter calls
     std::size_t member_offset = 0;  // byte offset of the member within T
-
-    void (*after_set)(void* ctx, Object& val) = nullptr;
-    void* hook_ctx = nullptr;
 
     // Implicit conversion to T (read).
     operator T() const {
@@ -239,41 +241,6 @@ struct TypedProperty {
         std::decay_t<T> storage(std::move(val));
         Object val_ref(storage);
         setter(obj, &val_ref);
-        if (after_set) {
-            Object current = getter ? getter(obj) : detail::borrow_object(
-                static_cast<char*>(obj) + member_offset,
-                detail::type_name<std::remove_cvref_t<T>>());
-            after_set(hook_ctx, current);
-        }
-    }
-
-    // operator[] — returns a reference to the element in the actual object.
-    // Available whenever T is subscriptable (std::array, std::vector, etc.).
-    // For non-readonly members the reference is mutable (writes go through to
-    // the object); for Readonly members it is const-qualified, so element
-    // reads are allowed but element writes are a compile error — the same
-    // contract as whole-object operator= (deleted for Readonly).  A const
-    // Proxy also yields a const reference for non-readonly members, so a
-    // const view can't mutate the object through element access.  This keeps
-    // individual-element access on const containers without a copy.
-    // ponytail: no bounds check — out-of-range index is UB, same as raw
-    // operator[] on the underlying container.  The caller owns the index.
-    template <typename Self>
-    auto& operator[](this Self&& self, std::size_t i)
-        requires requires { typename std::remove_cvref_t<T>::value_type; }
-    {
-        if (!self.obj) throw std::runtime_error(
-            "Proxy: subscript on unbound property");
-        if constexpr (Readonly
-                      || std::is_const_v<std::remove_reference_t<Self>>) {
-            return reinterpret_cast<const std::remove_cvref_t<T>*>(
-                static_cast<const char*>(self.obj)
-                    + self.member_offset)->operator[](i);
-        } else {
-            return reinterpret_cast<std::remove_cv_t<T>*>(
-                static_cast<char*>(self.obj)
-                    + self.member_offset)->operator[](i);
-        }
     }
 
     static constexpr bool is_readonly() { return Readonly; }
