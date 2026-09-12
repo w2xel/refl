@@ -528,7 +528,9 @@ consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
 // fields.  The caller must synchronize.  Calls through operator->() from
 // multiple threads are safe only if no bind() is in progress.
 //
-// Proxy<T> is non-copyable, non-movable (dispatch fields point into it).
+// Proxy<T> is non-copyable.  Movable: move transfers the bound Object
+// and re-populates the dispatch fields (which point into overload_storage_,
+// a member of the Proxy, so they must be re-pointed after the move).
 // ---------------------------------------------------------------------------
 template <typename T>
 class Proxy {
@@ -761,9 +763,19 @@ public:
 #undef PROXY_BINARY_OP
 
     Proxy(const Proxy&) = delete;
-    Proxy(Proxy&&) = delete;
+    Proxy(Proxy&& other) noexcept
+        : obj_(std::move(other.obj_)) {
+        if (obj_.valid()) { check_owned(); populate(); }
+    }
     Proxy& operator=(const Proxy&) = delete;
-    Proxy& operator=(Proxy&&) = delete;
+    Proxy& operator=(Proxy&& other) noexcept {
+        if (this != &other) {
+            obj_ = std::move(other.obj_);
+            overload_storage_.clear();
+            if (obj_.valid()) { check_owned(); populate(); }
+        }
+        return *this;
+    }
 };
 
 }  // namespace refl
