@@ -633,6 +633,15 @@ public:
                std::to_string(reinterpret_cast<std::uintptr_t>(ptr_)) + ")";
     }
 
+    // Invoke a named member function with one Object argument, looking
+    // up the function by name + argument type at runtime via the object's
+    // ClassInfo.  Used by Proxy<T> for operator dispatch — the argument's
+    // type is only known at call time, so overload resolution happens
+    // per-call, not at bind time.  Returns Error::NotFound if the object
+    // type is unregistered or no matching function exists.
+    std::expected<Object, Error> invoke_op(
+        std::string_view name, const Object& arg) const;
+
     bool valid() const { return ptr_ != nullptr; }
     explicit operator bool() const { return valid(); }
 
@@ -1921,26 +1930,6 @@ inline FunctionSearchResult find_function_in_hierarchy(
     return {nullptr, 0};
 }
 
-// Search the hierarchy for a function by name only (first overload).
-// Used by operator binding where interface and impl param types are
-// structurally different.  Same name-hiding and ambiguity policy.
-inline FunctionSearchResult find_function_by_name_in_hierarchy(
-        const ClassInfo* C, std::string_view name) {
-    for (std::size_t i = 0; i < C->functions.size(); ++i)
-        if (C->functions[i].name == name)
-            return {&C->functions[i], 0};
-
-    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    collect_base_named(C, name, &ClassInfo::functions, decls);
-    dedup_decl(decls);
-    if (subobject_count(C, decls) >= 2) return {nullptr, 0};
-    if (!decls.empty())
-        return {&decls[0].first->functions[decls[0].second],
-                base_offset_unlocked(C->name, decls[0].first->name).value_or(0)};
-    return {nullptr, 0};
-}
-
 // Search the hierarchy for a field by name.  Same name-hiding and
 // ambiguity policy.
 inline FieldSearchResult find_field_in_hierarchy(
@@ -1961,6 +1950,20 @@ inline FieldSearchResult find_field_in_hierarchy(
 }
 
 }  // namespace detail
+
+inline std::expected<Object, Error>
+Object::invoke_op(std::string_view name, const Object& arg) const {
+    if (!valid()) return std::unexpected(Error::NullHandle);
+    if (!arg.valid()) return std::unexpected(Error::NullHandle);
+    const ClassInfo* info = detail::lookup_class_info(class_name());
+    if (!info) return std::unexpected(Error::NotFound);
+    std::vector<std::string> param_types = {
+        detail::normalize_type(arg.class_name())};
+    auto r = detail::find_function_in_hierarchy(info, name, param_types);
+    if (!r.fi) return std::unexpected(Error::NotFound);
+    void* adj = static_cast<char*>(ptr_) + r.offset;
+    return r.fi->invoker(owner_, adj, &arg);
+}
 
 inline std::expected<Constructor, Error> Class::find_constructor(
     std::initializer_list<std::string_view> types) const {

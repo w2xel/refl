@@ -104,100 +104,43 @@ collect_sigs(std::meta::info type, std::string_view name) {
     return result;
 }
 
-// consteval: collect all overload signatures for a specific operator
-// (identified by std::meta::operators), walking the base hierarchy.
-consteval std::vector<std::meta::info>
-collect_sigs_by_op(std::meta::info type, std::meta::operators op) {
-    std::vector<std::meta::info> result;
+// consteval: return the reflection of the return type of the first
+// overload of operator `op` on type (walking public bases).  Returns
+// ^^void if no overload exists — this keeps the splice [:R:] well-formed
+// even when the operator is absent, so -Wtemplate-body can check the
+// body without error.  The caller's requires-clause prevents the method
+// from existing when the operator is absent; the void fallback is never
+// reached at runtime.
+consteval std::meta::info op_return_type(std::meta::info type,
+                                           std::meta::operators op) {
     for (auto m : std::meta::members_of(type,
             std::meta::access_context::unchecked())) {
         if (is_public_method(m) && !std::meta::has_identifier(m)
             && !std::meta::is_static_member(m)
             && std::meta::is_operator_function(m)
             && std::meta::operator_of(m) == op)
-            result.push_back(make_fn_sig(m));
+            return std::meta::return_type_of(m);
     }
     for (auto b : std::meta::bases_of(type,
             std::meta::access_context::unchecked())) {
         if (std::meta::is_public(b)) {
-            auto inherited = collect_sigs_by_op(std::meta::type_of(b), op);
-            for (auto s : inherited) result.push_back(s);
+            auto rt = op_return_type(std::meta::type_of(b), op);
+            if (rt != ^^void) return rt;
         }
     }
-    return result;
+    return ^^void;
 }
 
-// consteval: map a std::meta::operators value to a valid C++ identifier
-// for use as a dispatch struct field name (e.g. op_plus → "_op_add").
-// Only the operators Proxy<T> defines overloads for are listed; others
-// return empty and are skipped by make_dispatch_specs.
-consteval std::string_view op_field_name(std::meta::operators op) {
-    using enum std::meta::operators;
-    switch (op) {
-    case op_plus:              return "_op_add";
-    case op_minus:             return "_op_sub";
-    case op_star:              return "_op_mul";
-    case op_slash:             return "_op_div";
-    case op_percent:           return "_op_mod";
-    case op_equals_equals:     return "_op_eq";
-    case op_exclamation_equals:return "_op_ne";
-    case op_less:              return "_op_lt";
-    case op_greater:           return "_op_gt";
-    case op_less_equals:       return "_op_le";
-    case op_greater_equals:    return "_op_ge";
-    default:                   return {};
-    }
-}
-
-// consteval: collect all distinct operator kinds from a type and its
-// public bases (deduplicated by operator enum value).
-consteval void collect_all_operators(std::meta::info type,
-        std::vector<std::meta::operators>& out) {
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (is_public_method(m) && !std::meta::has_identifier(m)
-            && !std::meta::is_static_member(m)
-            && std::meta::is_operator_function(m)) {
-            auto op = std::meta::operator_of(m);
-            bool dup = false;
-            for (auto o : out) if (o == op) { dup = true; break; }
-            if (!dup) out.push_back(op);
-        }
-    }
-    for (auto b : std::meta::bases_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b))
-            collect_all_operators(std::meta::type_of(b), out);
-    }
-}
-
-// consteval: given a dispatch field name, return the corresponding
-// ClassInfo function name.  Named methods map to themselves; operator
-// fields (_op_add, _op_eq, etc.) map to "operator+", "operator==", etc.
-// Returns empty string_view if the field is not a method/operator.
-consteval std::string_view field_to_classinfo_name(std::string_view fname) {
-    if (fname == "_op_add")  return "operator+";
-    if (fname == "_op_sub")  return "operator-";
-    if (fname == "_op_mul")  return "operator*";
-    if (fname == "_op_div")  return "operator/";
-    if (fname == "_op_mod")  return "operator%";
-    if (fname == "_op_eq")   return "operator==";
-    if (fname == "_op_ne")   return "operator!=";
-    if (fname == "_op_lt")   return "operator<";
-    if (fname == "_op_gt")   return "operator>";
-    if (fname == "_op_le")   return "operator<=";
-    if (fname == "_op_ge")   return "operator>=";
-    return fname;  // named method: identity
-}
-
-// consteval: is this dispatch field name an operator field?
-consteval bool is_op_field(std::string_view fname) {
-    return fname.starts_with("_op_");
+// consteval: does type (and its public bases) have any overload of
+// operator `op`?  Used as a compile-time constraint on Proxy<T>'s
+// operator methods — the method exists iff T declares the operator.
+consteval bool has_binary_op(std::meta::info type, std::meta::operators op) {
+    return op_return_type(type, op) != ^^void;
 }
 
 // consteval: collect the const-ness of all overloads for a named method
-// or operator on the interface type, in Sigs-pack order.  Used by
-// populate() to verify the impl's method const-ness matches the interface's.
+// on the interface type, in Sigs-pack order.  Used by populate() to
+// verify the impl's method const-ness matches the interface's.
 consteval std::vector<bool> collect_const_quals(std::meta::info type,
                                                    std::string_view name) {
     std::vector<bool> result;
@@ -216,53 +159,6 @@ consteval std::vector<bool> collect_const_quals(std::meta::info type,
         }
     }
     return result;
-}
-
-// consteval: collect the const-ness of all overloads for a specific
-// operator on the interface type, in Sigs-pack order.
-consteval std::vector<bool> collect_const_quals_op(std::meta::info type,
-                                                      std::meta::operators op) {
-    std::vector<bool> result;
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (is_public_method(m) && !std::meta::is_static_member(m)
-            && !std::meta::has_identifier(m)
-            && std::meta::is_operator_function(m)
-            && std::meta::operator_of(m) == op)
-            result.push_back(is_const_method(m));
-    }
-    for (auto b : std::meta::bases_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b)) {
-            auto inherited = collect_const_quals_op(std::meta::type_of(b), op);
-            for (bool c : inherited) result.push_back(c);
-        }
-    }
-    return result;
-}
-
-// consteval: return the const-ness vector for a dispatch field.  For
-// named methods, uses collect_const_quals; for operator fields, maps
-// the field name back to the operator and uses collect_const_quals_op.
-consteval std::vector<bool> field_const_quals(std::meta::info type,
-                                                 std::string_view fname) {
-    if (!is_op_field(fname))
-        return collect_const_quals(type, fname);
-    using enum std::meta::operators;
-    auto op = std::meta::operators(-1);
-    if (fname == "_op_add")  op = op_plus;
-    else if (fname == "_op_sub")  op = op_minus;
-    else if (fname == "_op_mul")  op = op_star;
-    else if (fname == "_op_div")  op = op_slash;
-    else if (fname == "_op_mod")  op = op_percent;
-    else if (fname == "_op_eq")   op = op_equals_equals;
-    else if (fname == "_op_ne")   op = op_exclamation_equals;
-    else if (fname == "_op_lt")   op = op_less;
-    else if (fname == "_op_gt")   op = op_greater;
-    else if (fname == "_op_le")   op = op_less_equals;
-    else if (fname == "_op_ge")   op = op_greater_equals;
-    if (op == std::meta::operators(-1)) return {};
-    return collect_const_quals_op(type, op);
 }
 
 }  // namespace detail
@@ -316,41 +212,6 @@ public:
     template <typename... Args>
     auto operator()(Args&&... args) {
         return call_dispatch<0, Args...>(std::forward<Args>(args)...);
-    }
-
-    // Call with a pre-built Object argument (for Proxy-to-Proxy operator
-    // calls where the argument is another Proxy's bound Object, not a
-    // concrete value).  Uses the first overload — operators typically
-    // have one.  The invoker's type check catches mismatched impl types.
-    // The return value is extracted without a type-name check: operators
-    // return a structurally-compatible type (e.g. Vec2Impl for IVec2),
-    // so cast_ref<R> would fail — instead we reinterpret the raw pointer.
-    template <typename... Objs>
-    auto call_with_object(Objs&&... objs)
-        requires (sizeof...(Objs) >= 1)
-    {
-        using Sig = std::tuple_element_t<0, std::tuple<Sigs...>>;
-        using R = typename sig_traits<Sig>::return_type;
-        if (!overloads || num == 0)
-            throw std::runtime_error(
-                "Proxy: call to unbound or missing overload");
-        Object objs_arr[] = { Object(std::forward<Objs>(objs))... };
-        Object result;
-        try {
-            result = overloads[0].invoker(owner, obj, objs_arr);
-        } catch (const std::bad_cast&) {
-            throw std::runtime_error(
-                "Proxy: operator argument type mismatch — "
-                "proxies bound to incompatible impl types");
-        }
-        if (after_call) after_call(hook_ctx, result);
-        if constexpr (std::is_void_v<R>) return;
-        else {
-            // Reinterpret the result as R — structurally compatible,
-            // not the same type.  The invoker guarantees the layout matches.
-            return std::move(*static_cast<std::remove_cvref_t<R>*>(
-                result.raw()));
-        }
     }
 
     template <std::size_t I, typename... Args>
@@ -491,12 +352,6 @@ consteval std::meta::info make_typed_method_type(std::meta::info type,
     return std::meta::substitute(^^TypedMethod, collect_sigs(type, name));
 }
 
-// consteval: build the TypedMethod<Sigs...> type for a specific operator.
-consteval std::meta::info make_typed_op_method_type(std::meta::info type,
-                                                       std::meta::operators op) {
-    return std::meta::substitute(^^TypedMethod, collect_sigs_by_op(type, op));
-}
-
 // consteval: build the TypedProperty field type for a data member name,
 // walking the base hierarchy for inherited data members.
 // Passes Readonly=true for const members (deletes operator= at compile time).
@@ -588,20 +443,6 @@ consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
             specs.push_back(std::meta::data_member_spec(
                 field_type, {.name=nm}));
         }
-    }
-
-    // Operators → TypedMethod (one field per operator kind, carrying all
-    // overloads).  Walks the base hierarchy via collect_sigs_by_op.
-    // Field names are valid C++ identifiers (e.g. _op_add, _op_eq) so
-    // operators get addressable dispatch fields.
-    std::vector<std::meta::operators> ops;
-    collect_all_operators(type, ops);
-    for (auto op : ops) {
-        auto fname = std::string(op_field_name(op));
-        if (fname.empty()) continue;  // unsupported operator kind
-        auto field_type = make_typed_op_method_type(type, op);
-        specs.push_back(std::meta::data_member_spec(
-            field_type, {.name=fname}));
     }
 
     // Non-static data members → TypedProperty.  Walks the base hierarchy
@@ -755,52 +596,36 @@ class Proxy {
                         using TM = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        constexpr auto ci_name = detail::field_to_classinfo_name(nm_sv);
                         static constexpr auto exp_const_arr = []() consteval {
                             return std::define_static_array(
-                                detail::field_const_quals(^^T, nm_sv));
+                                detail::collect_const_quals(^^T, nm_sv));
                         }();
-                        auto key = std::string(ci_name);
+                        auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
                         auto exp_params = TM::expected_param_types();
                         auto exp_returns = TM::expected_return_types();
                         std::ptrdiff_t method_off = 0;
-                        if constexpr (detail::is_op_field(nm_sv)) {
-                            for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
-                                auto r = detail::find_function_by_name_in_hierarchy(
-                                    info, key);
-                                if (!r.fi)
-                                    throw std::runtime_error(
-                                        "Proxy: no operator '" + key +
-                                        "' in type '" +
-                                        std::string(obj_.class_name()) + "'");
-                                check_const_qual(exp_const_arr, oi, r.fi, key);
-                                vec.push_back({r.fi->invoker});
-                                method_off = r.offset;
-                            }
-                        } else {
-                            for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
-                                auto r = detail::find_function_in_hierarchy(
-                                    info, key, exp_params[oi]);
-                                if (!r.fi)
-                                    throw std::runtime_error(
-                                        "Proxy: no matching overload for '" + key +
-                                        "' with params [" +
-                                        join_types(exp_params[oi]) +
-                                        "] in type '" +
-                                        std::string(obj_.class_name()) + "'");
-                                if (detail::normalize_type(r.fi->return_type)
-                                        != exp_returns[oi])
-                                    throw std::runtime_error(
-                                        "Proxy: return type mismatch on '" +
-                                        key + "' — interface expects '" +
-                                        exp_returns[oi] +
-                                        "', impl returns '" +
-                                        r.fi->return_type + "'");
-                                check_const_qual(exp_const_arr, oi, r.fi, key);
-                                vec.push_back({r.fi->invoker});
-                                method_off = r.offset;
-                            }
+                        for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
+                            auto r = detail::find_function_in_hierarchy(
+                                info, key, exp_params[oi]);
+                            if (!r.fi)
+                                throw std::runtime_error(
+                                    "Proxy: no matching overload for '" + key +
+                                    "' with params [" +
+                                    join_types(exp_params[oi]) +
+                                    "] in type '" +
+                                    std::string(obj_.class_name()) + "'");
+                            if (detail::normalize_type(r.fi->return_type)
+                                    != exp_returns[oi])
+                                throw std::runtime_error(
+                                    "Proxy: return type mismatch on '" +
+                                    key + "' — interface expects '" +
+                                    exp_returns[oi] +
+                                    "', impl returns '" +
+                                    r.fi->return_type + "'");
+                            check_const_qual(exp_const_arr, oi, r.fi, key);
+                            vec.push_back({r.fi->invoker});
+                            method_off = r.offset;
                         }
                         dispatch_.[:field:].obj =
                             static_cast<char*>(obj_.raw()) + method_off;
@@ -868,52 +693,70 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Operators — forward to the dispatch struct's _op_* fields.  Each
-    // is constrained by a requires clause so it only exists when T has
-    // the corresponding operator.  Binary operators accept either another
-    // Proxy<T> (same interface — both impls must be compatible at runtime)
-    // or a concrete T value.  The invoker's type check catches mismatched
-    // impl types at runtime with a std::runtime_error.
+    // Operators — looked up at call time via Object::invoke_op, which
+    // resolves overloads by the argument's runtime type.  Each operator
+    // generates two methods:
+    //
+    //   1. Same-type: operator+(const Proxy& other) — both operands are
+    //      Proxy<T>.  The runtime lookup matches the impl's operator by
+    //      the other proxy's bound object type, so mismatched impl types
+    //      are caught at call time.  Exists iff T has T op T.
+    //
+    //   2. Generic: template<U> operator+(U&& val) — any concrete value.
+    //      The lookup matches the impl's operator by val's type.  Exists
+    //      iff T declares the operator at all; the match is runtime —
+    //      if no compatible overload exists, it throws.
+    //
+    // Neither exists if T has no such operator.
     // -----------------------------------------------------------------------
-private:
-    // consteval: find a dispatch field by name, return its meta::info.
-    template <std::size_t N>
-    static consteval std::meta::info find_field(const char (&name)[N]) {
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        for (auto f : dm)
-            if (std::meta::has_identifier(f)
-                && std::meta::identifier_of(f) == std::string_view(name, N - 1))
-                return f;
-        return std::meta::info{};
-    }
-
 public:
-#define PROXY_BINARY_OP(symbol, field_name) \
-    template <typename Arg> \
-    auto operator symbol(Arg&& other) \
-        requires requires(T a, T b) { a symbol b; } \
+#define PROXY_BINARY_OP(symbol, op_enum, op_name) \
+    auto operator symbol(const Proxy& other) const \
+        requires (detail::has_binary_op(^^T, op_enum)) \
+              && requires(T a, T b) { a symbol b; } \
     { \
-        constexpr auto f = find_field(field_name); \
-        if constexpr (std::is_same_v<std::remove_cvref_t<Arg>, Proxy>) { \
-            return dispatch_.[:f:].call_with_object(other.obj_); \
-        } else { \
-            return dispatch_.[:f:](std::forward<Arg>(other)); \
-        } \
+        using R = [:detail::op_return_type(^^T, op_enum):]; \
+        auto result = obj_.invoke_op(op_name, other.obj_); \
+        if (!result) \
+            throw std::runtime_error( \
+                "Proxy: operator" #symbol " — no matching overload for '" + \
+                std::string(other.obj_.class_name()) + "' in '" + \
+                std::string(obj_.class_name()) + "'"); \
+        if constexpr (std::is_void_v<R>) return; \
+        else \
+            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
+                result->raw())); \
+    } \
+    template <typename U> \
+        requires (detail::has_binary_op(^^T, op_enum)) \
+              && (!std::is_same_v<std::remove_cvref_t<U>, Proxy>) \
+    auto operator symbol(U&& val) const \
+    { \
+        using R = [:detail::op_return_type(^^T, op_enum):]; \
+        Object arg(std::forward<U>(val)); \
+        auto result = obj_.invoke_op(op_name, arg); \
+        if (!result) \
+            throw std::runtime_error( \
+                "Proxy: operator" #symbol " — no matching overload for '" + \
+                std::string(arg.class_name()) + "' in '" + \
+                std::string(obj_.class_name()) + "'"); \
+        if constexpr (std::is_void_v<R>) return; \
+        else \
+            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
+                result->raw())); \
     }
 
-    PROXY_BINARY_OP(+, "_op_add")
-    PROXY_BINARY_OP(-, "_op_sub")
-    PROXY_BINARY_OP(*, "_op_mul")
-    PROXY_BINARY_OP(/ , "_op_div")
-    PROXY_BINARY_OP(%, "_op_mod")
-    PROXY_BINARY_OP(==, "_op_eq")
-    PROXY_BINARY_OP(!=, "_op_ne")
-    PROXY_BINARY_OP(< , "_op_lt")
-    PROXY_BINARY_OP(> , "_op_gt")
-    PROXY_BINARY_OP(<=, "_op_le")
-    PROXY_BINARY_OP(>=, "_op_ge")
+    PROXY_BINARY_OP(+, std::meta::operators::op_plus, "operator+")
+    PROXY_BINARY_OP(-, std::meta::operators::op_minus, "operator-")
+    PROXY_BINARY_OP(*, std::meta::operators::op_star, "operator*")
+    PROXY_BINARY_OP(/ , std::meta::operators::op_slash, "operator/")
+    PROXY_BINARY_OP(%, std::meta::operators::op_percent, "operator%")
+    PROXY_BINARY_OP(==, std::meta::operators::op_equals_equals, "operator==")
+    PROXY_BINARY_OP(!=, std::meta::operators::op_exclamation_equals, "operator!=")
+    PROXY_BINARY_OP(< , std::meta::operators::op_less, "operator<")
+    PROXY_BINARY_OP(> , std::meta::operators::op_greater, "operator>")
+    PROXY_BINARY_OP(<=, std::meta::operators::op_less_equals, "operator<=")
+    PROXY_BINARY_OP(>=, std::meta::operators::op_greater_equals, "operator>=")
 
 #undef PROXY_BINARY_OP
 

@@ -83,36 +83,22 @@ class Dyn {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Non-static method or operator → bind from ClassInfo.
-                        // Operators match by name only (param types differ
-                        // structurally between interface and impl).  Named
-                        // methods match by param-type signature.  Both
-                        // search the base hierarchy.
+                        // Non-static method → bind from ClassInfo.
+                        // Named methods match by param-type signature
+                        // and search the base hierarchy.
                         using TM = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        constexpr auto ci_name = detail::field_to_classinfo_name(nm_sv);
-                        auto key = std::string(ci_name);
+                        auto key = std::string(nm_sv);
                         auto& vec = overload_storage_[key];
                         std::ptrdiff_t method_off = 0;
-                        if constexpr (detail::is_op_field(nm_sv)) {
-                            for (std::size_t oi = 0; oi < TM::expected_param_types().size(); ++oi) {
-                                auto r = detail::find_function_by_name_in_hierarchy(
-                                    info, key);
-                                if (r.fi) {
-                                    vec.push_back({r.fi->invoker});
-                                    method_off = r.offset;
-                                }
-                            }
-                        } else {
-                            for (const auto& exp : TM::expected_param_types()) {
-                                auto r = detail::find_function_in_hierarchy(
-                                    info, key, exp);
-                                if (r.fi) {
-                                    vec.push_back({r.fi->invoker});
-                                    method_off = r.offset;
-                                }
+                        for (const auto& exp : TM::expected_param_types()) {
+                            auto r = detail::find_function_in_hierarchy(
+                                info, key, exp);
+                            if (r.fi) {
+                                vec.push_back({r.fi->invoker});
+                                method_off = r.offset;
                             }
                         }
                         dispatch_.[:field:].obj =
