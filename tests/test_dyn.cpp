@@ -164,6 +164,24 @@ struct ArrImpl {
     ArrImpl() : data{10, 20} {}
 };
 
+// For reference-return tests — a method returning T& must preserve the
+// reference through the proxy, not silently copy.  Writing through the
+// returned reference must mutate the underlying object.
+struct RefGet {
+    int x;
+    RefGet() : x(42) {}
+    int& get_ref() { return x; }
+    int val() const { return x; }
+};
+
+// For move-only after_set tests — on_change on a move-only member must
+// not crash when the getter is null.  The hook fires with the value
+// that was just set instead.
+struct MoveOnlyProp {
+    std::unique_ptr<int> ptr;
+    MoveOnlyProp() : ptr(std::make_unique<int>(0)) {}
+};
+
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
@@ -178,6 +196,8 @@ struct ArrImpl {
 [[maybe_unused]] static refl::Reg<LongAddImpl> reg_long_add;
 [[maybe_unused]] static refl::Reg<ConstArrImpl> reg_const_arr;
 [[maybe_unused]] static refl::Reg<ArrImpl> reg_arr;
+[[maybe_unused]] static refl::Dyn<RefGet> reg_ref_get;
+[[maybe_unused]] static refl::Dyn<MoveOnlyProp> reg_move_only;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -638,6 +658,55 @@ int main() {
         CHECK(mp->data[0] == 99, "non-const proxy element write: data[0] == 99");
         // The const proxy sees the mutation (same underlying object):
         CHECK(cp->data[0] == 99, "const proxy reads mutation from non-const proxy: data[0] == 99");
+    }
+
+    // === Proxy: reference-returning methods preserve references ===
+    // A method declared int& get_ref() must return a real int& through
+    // the proxy, not a silent copy.  Writing through the returned reference
+    // must mutate the underlying object.
+    {
+        refl::Dyn<RefGet> d;
+        d.reset();
+        d.get().x = 7;
+        auto& ref = d->get_ref();
+        static_assert(std::is_same_v<decltype(ref), int&>,
+            "reference-returning method must preserve the reference type");
+        ref = 99;
+        CHECK(d.get().x == 99,
+            "writing through reference return should mutate object (x == 99)");
+    }
+
+    // === Proxy: const-proxy can call const methods ===
+    // Before the fix, operator() was not const-qualified, so calling even
+    // a const method through a const Proxy failed to compile.
+    {
+        refl::Dyn<RefGet> d;
+        d.reset();
+        d.get().x = 42;
+        const refl::Dyn<RefGet>& cd = d;
+        int v = cd->val();  // const method through const proxy
+        CHECK(v == 42, "const proxy should call const method val() -> 42");
+    }
+
+    // === Dyn: on_change on move-only member does not crash ===
+    // The getter is null for move-only members (not copy-constructible).
+    // Before the fix, after_set called getter(obj) unconditionally —
+    // null function pointer dereference, segfault.  After the fix, the
+    // hook fires with the value that was just set.
+    {
+        refl::Dyn<MoveOnlyProp> m;
+        m.reset();
+        int hook_val = 0;
+        m.on_change("ptr", [&hook_val](refl::Object& v) {
+            // The value is a unique_ptr<int> — read via cast_ref.
+            auto cr = v.template cast_ref<std::unique_ptr<int>>();
+            if (cr) hook_val = **cr.value();
+        });
+        m->ptr = std::make_unique<int>(55);
+        CHECK(hook_val == 55,
+            "on_change on move-only member should fire with set value (55)");
+        CHECK(*m.get().ptr == 55,
+            "move-only member should be set to 55");
     }
 
     std::printf("dyn dispatch test ok\n");

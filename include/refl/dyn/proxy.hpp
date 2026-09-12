@@ -152,12 +152,12 @@ private:
 public:
 
     template <typename... Args>
-    auto operator()(Args&&... args) {
+    decltype(auto) operator()(Args&&... args) const {
         return call_dispatch<0, Args...>(std::forward<Args>(args)...);
     }
 
     template <std::size_t I, typename... Args>
-    auto call_dispatch(Args&&... args) {
+    decltype(auto) call_dispatch(Args&&... args) const {
         using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
         if constexpr (matches_sig<Sig, Args...>) {
             using R = typename sig_traits<Sig>::return_type;
@@ -183,7 +183,12 @@ public:
                 auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
                 if (!cr) throw std::runtime_error(
                     "Proxy: return type mismatch on method call");
-                return std::move(*cr.value());
+                // Preserve references: return *ptr as R& for reference
+                // return types, as R by value for non-reference types.
+                if constexpr (std::is_reference_v<R>)
+                    return static_cast<R>(*cr.value());
+                else
+                    return R(std::move(*cr.value()));
             }
         } else {
             if constexpr (I + 1 < sizeof...(Sigs))
@@ -214,8 +219,10 @@ struct TypedProperty {
 
     // Implicit conversion to T (read).
     operator T() const {
-        if (!getter || !obj) throw std::runtime_error(
+        if (!obj) throw std::runtime_error(
             "Proxy: read from unbound property");
+        if (!getter) throw std::runtime_error(
+            "Proxy: property has no getter (move-only or non-copyable)");
         Object result = getter(obj);
         auto cr = result.template cast_ref<T>();
         if (!cr) throw std::runtime_error(
@@ -232,7 +239,9 @@ struct TypedProperty {
         Object val_ref(storage);
         setter(obj, &val_ref);
         if (after_set) {
-            Object current = getter(obj);
+            Object current = getter ? getter(obj) : detail::borrow_object(
+                static_cast<char*>(obj) + member_offset,
+                detail::type_name<std::remove_cvref_t<T>>());
             after_set(hook_ctx, current);
         }
     }
