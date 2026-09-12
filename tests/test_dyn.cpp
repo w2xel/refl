@@ -267,22 +267,21 @@ int main() {
     static_assert(decltype(rp->id)::is_readonly(), "id must be Readonly=true");
     static_assert(!decltype(rp->x)::is_readonly(), "x must be Readonly=false");
 
-    // --- connect (function call hook) ---
+    // --- hooks are user-side: wrap your lambda in implement ---
+    // (connect/on_change removed; use implement with a wrapped lambda)
     int hook_result = 0;
-    rp.connect("sum", [&hook_result](refl::Object& r) {
-        hook_result = *r.template cast_ref<int>().value();
+    rp.implement<^^Point::sum>([&hook_result](refl::Dyn<Point>& self) {
+        int r = self.get().x + self.get().y;
+        hook_result = r;
+        return r;
     });
     (void)rp->sum();
-    CHECK(hook_result == 119, "connect hook should fire after sum() with result 119 (99+20)");
+    CHECK(hook_result == 119, "hook via wrapped lambda should fire after sum() with result 119 (99+20)");
+    rp.restore<^^Point::sum>();
 
-    // --- on_change (property change hook) ---
-    int change_result = 0;
-    rp.on_change("x", [&change_result](refl::Object& v) {
-        change_result = *v.template cast_ref<int>().value();
-    });
-    rp->x = 42;
-    CHECK(change_result == 42, "on_change hook should fire with new value 42");
-    CHECK(rp.get().x == 42, "after on_change set, x should be 42");
+    // --- on_change is user-side: wrap your setter via implement_property ---
+    // (on_change removed; use Mockable::implement_property with a hook in the setter)
+    // (property hooks on real objects need Mockable access; tested in test_mockable)
 
     // --- registration still works via default constructor ---
     // (Dyn<Point> reg_point above + rp(1,2) registered Point)
@@ -410,51 +409,18 @@ int main() {
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 3, "restored sum() should be 3 after self-ref test");
 
-    // === multi-listener hooks ===
+    // === hooks are user-side (multi-hook via wrapped lambda) ===
     int hook_a = 0, hook_b = 0;
-    rp2.connect("sum", [&hook_a](refl::Object& r) {
-        hook_a = *r.template cast_ref<int>().value();
-    });
-    rp2.connect("sum", [&hook_b](refl::Object& r) {
-        hook_b = *r.template cast_ref<int>().value();
+    rp2.implement<^^Point::sum>([&hook_a, &hook_b](refl::Dyn<Point>& self) {
+        int r = self.get().x + self.get().y;
+        hook_a = r;
+        hook_b = r;
+        return r;
     });
     (void)rp2->sum();
-    CHECK(hook_a == 3, "multi-listener hook A should fire with 3");
-    CHECK(hook_b == 3, "multi-listener hook B should fire with 3");
-
-    // === explicit emit ===
-    int emit_result = 0;
-    rp2.connect("custom_signal", [&emit_result](refl::Object& v) {
-        emit_result = *v.template cast_ref<int>().value();
-    });
-    rp2.emit("custom_signal", 42);
-    CHECK(emit_result == 42, "emit should fire connected callbacks");
-
-    // === dynamic properties ===
-    rp2.set_property("dynamic_val", 123);
-    int dp_val = *rp2.get_property("dynamic_val").template cast_ref<int>().value();
-    CHECK(dp_val == 123, "dynamic property should be 123");
-
-    // dynamic property with on_change
-    int dyn_change = 0;
-    rp2.on_change("dynamic_val", [&dyn_change](refl::Object& v) {
-        dyn_change = *v.template cast_ref<int>().value();
-    });
-    rp2.set_property("dynamic_val", 456);
-    CHECK(dyn_change == 456, "on_change should fire on dynamic property set");
-
-    // === cross-object connect ===
-    refl::Dyn<Point> rp3(10, 20);
-    int cross_result = 0;
-    rp3.connect("sum", [&cross_result](refl::Object& r) {
-        cross_result = *r.template cast_ref<int>().value();
-    });
-    // Connect rp2's "sum" to rp3's "sum" — when rp2->sum() fires,
-    // rp3's hooks receive rp2's result (forwarded via emit).
-    rp2.connect("sum", &rp3, "sum");
-    (void)rp2->sum();
-    // rp2->sum() returns 3 (1+2), forwarded to rp3's hook.
-    CHECK(cross_result == 3, "cross-object connect: rp3 hook should receive rp2's result (3)");
+    CHECK(hook_a == 3, "hook A should fire with 3");
+    CHECK(hook_b == 3, "hook B should fire with 3");
+    rp2.restore<^^Point::sum>();
 
     // === Proxy: signature-matched overload binding ===
     // IOverload declares compute(int) then compute(int,int).
@@ -760,23 +726,12 @@ int main() {
         CHECK(v == 42, "const proxy should call const method val() -> 42");
     }
 
-    // === Dyn: on_change on move-only member does not crash ===
-    // The getter is null for move-only members (not copy-constructible).
-    // The setter trampoline falls back to borrow_object (using
-    // member_offset + type_name) instead of calling the null getter, so
-    // the hook fires with the value that was just set.
+    // === Dyn: move-only member access via get() ===
+    // (on_change removed; move-only property hooks tested via Mockable)
     {
         refl::Dyn<MoveOnlyProp> m;
         m.reset();
-        int hook_val = 0;
-        m.on_change("ptr", [&hook_val](refl::Object& v) {
-            // The value is a unique_ptr<int> — read via cast_ref.
-            auto cr = v.template cast_ref<std::unique_ptr<int>>();
-            if (cr) hook_val = **cr.value();
-        });
         m->ptr = std::make_unique<int>(55);
-        CHECK(hook_val == 55,
-            "on_change on move-only member should fire with set value (55)");
         CHECK(*m.get().ptr == 55,
             "move-only member should be set to 55");
     }

@@ -2,7 +2,7 @@
 //
 // Demonstrates:
 // 1. Dyn<T> dispatch struct — typed method calls, member-like property
-//    access, and Qt-style hooks (connect / on_change).
+//    access.
 // 2. Building an object that implements an abstract interface at runtime.
 // 3. Starting with a real object, then switching to a mock at runtime.
 // 4. Switching back to a real object after mocking.
@@ -39,19 +39,14 @@ struct Rect {
 [[maybe_unused]] static refl::Dyn<Rect> reg_rect;
 
 int main() {
-    // --- Dyn<T> dispatch struct: typed calls + hooks.
+    // --- Dyn<T> dispatch struct: typed calls.
+    // Hooks are user-side: wrap your lambda in implement.
     std::printf("=== Dyn<Rect> dispatch (3, 4) ===\n");
     refl::Dyn<Rect> r(3, 4);
-    r.connect("resize", [](refl::Object&) {
-        std::printf("  hook: resize() was called\n");
-    });
-    r.on_change("w", [](refl::Object& v) {
-        std::printf("  hook: w changed to %d\n", *v.template cast_ref<int>().value());
-    });
     r->resize(5, 6);
-    std::printf("  after resize: w=%d h=%d\n", r.get().w, r.get().h);
-    r->w = 10;
-    std::printf("  after w = 10: w=%d\n", r.get().w);
+    std::printf("  after resize(5,6): w=%d h=%d\n", r.get().w, r.get().h);
+    r->resize(7);
+    std::printf("  after resize(7): w=%d h=%d\n", r.get().w, r.get().h);
 
     // --- Real object: Dyn<Circle> with a concrete instance.
     std::printf("\n=== Real Circle (radius=5) ===\n");
