@@ -265,8 +265,10 @@ consteval std::string_view type_name() {
 // <ret> ...".  Taking the address of an immediate function is ill-formed, so
 // such members would break detail::invoker / static_invoker if registered —
 // make_info skips them.  constexpr (non-consteval) functions are unaffected.
-template <std::meta::info Fn>
-consteval bool is_consteval_fn() {
+//
+// Takes std::meta::info by value (not as a template parameter) so it can be
+// called from regular for-loops in consteval functions, not just template-for.
+consteval bool is_consteval_fn(std::meta::info Fn) {
     std::string_view ds = std::meta::display_string_of(Fn);
     if (ds.starts_with("static ")) ds.remove_prefix(7);
     return ds.starts_with("consteval ");
@@ -987,7 +989,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
         } else if constexpr (std::meta::is_function(m) &&
                             !std::meta::is_deleted(m) &&
                             std::meta::is_public(m) &&
-                            !detail::is_consteval_fn<m>() &&
+                            !detail::is_consteval_fn(m) &&
                             (std::meta::has_identifier(m) ||
                              std::meta::is_operator_function(m))) {
             static constexpr auto fparams = std::define_static_array(

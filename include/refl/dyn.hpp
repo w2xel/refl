@@ -62,6 +62,13 @@ template <typename R, typename... Args> using fn_type = R(Args...);
 
 namespace detail {
 
+// Shared overload-entry type used by all TypedMethod<Sigs...> specializations.
+// Defined here (in detail) rather than nested in TypedMethod so Dyn<T> can
+// store std::vector<OverloadEntry> without knowing the specific Sigs pack.
+struct OverloadEntry {
+    InvokerFn invoker;
+};
+
 // consteval: build a function-type reflection R(Args...) from a member.
 consteval std::meta::info make_fn_sig(std::meta::info m) {
     auto rt = std::meta::return_type_of(m);
@@ -73,6 +80,7 @@ consteval std::meta::info make_fn_sig(std::meta::info m) {
 }
 
 // consteval: collect all overload signatures for a function name.
+// Applies the same filters as make_info: public, non-deleted, non-consteval.
 consteval std::vector<std::meta::info>
 collect_sigs(std::meta::info type, std::string_view name) {
     std::vector<std::meta::info> result;
@@ -80,6 +88,9 @@ collect_sigs(std::meta::info type, std::string_view name) {
             std::meta::access_context::unchecked())) {
         if (std::meta::is_function(m) && std::meta::has_identifier(m)
             && !std::meta::is_static_member(m)
+            && std::meta::is_public(m)
+            && !std::meta::is_deleted(m)
+            && !is_consteval_fn(m)
             && std::meta::identifier_of(m) == name)
             result.push_back(make_fn_sig(m));
     }
@@ -90,10 +101,7 @@ collect_sigs(std::meta::info type, std::string_view name) {
 
 template <typename... Sigs>
 struct TypedMethod {
-    struct OverloadEntry {
-        InvokerFn invoker;
-    };
-    const OverloadEntry* overloads = nullptr;
+    const detail::OverloadEntry* overloads = nullptr;
     std::size_t num = 0;
     void* obj = nullptr;
     std::shared_ptr<void> owner;  // shared_ptr for aliasing invoker calls
@@ -289,6 +297,7 @@ consteval std::meta::info make_property_field_type(std::meta::info type,
     for (auto m : std::meta::nonstatic_data_members_of(type,
             std::meta::access_context::unchecked())) {
         if (!std::meta::is_bit_field(m) && std::meta::has_identifier(m)
+            && std::meta::is_public(m)
             && std::meta::identifier_of(m) == name) {
             auto mt = std::meta::type_of(m);
             bool is_const = std::meta::is_const_type(mt);
@@ -349,7 +358,10 @@ class Dyn {
             template for (constexpr auto m : members) {
                 if constexpr (std::meta::is_function(m)
                               && std::meta::has_identifier(m)
-                              && !std::meta::is_static_member(m)) {
+                              && !std::meta::is_static_member(m)
+                              && std::meta::is_public(m)
+                              && !std::meta::is_deleted(m)
+                              && !detail::is_consteval_fn(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -370,7 +382,8 @@ class Dyn {
             std::vector<std::string> seen_fields;
             template for (constexpr auto m : data_members) {
                 if constexpr (!std::meta::is_bit_field(m)
-                              && std::meta::has_identifier(m)) {
+                              && std::meta::has_identifier(m)
+                              && std::meta::is_public(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -391,7 +404,8 @@ class Dyn {
                     std::meta::access_context::unchecked()));
             std::vector<std::string> seen_static;
             template for (constexpr auto m : static_data) {
-                if constexpr (std::meta::has_identifier(m)) {
+                if constexpr (std::meta::has_identifier(m)
+                              && std::meta::is_public(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -411,7 +425,10 @@ class Dyn {
             template for (constexpr auto m : members) {
                 if constexpr (std::meta::is_function(m)
                               && std::meta::has_identifier(m)
-                              && std::meta::is_static_member(m)) {
+                              && std::meta::is_static_member(m)
+                              && std::meta::is_public(m)
+                              && !std::meta::is_deleted(m)
+                              && !detail::is_consteval_fn(m)) {
                     constexpr auto nm = std::meta::identifier_of(m);
                     auto nm_str = std::string(nm);
                     bool dup = false;
@@ -441,6 +458,9 @@ class Dyn {
 
     void populate() {
         if constexpr (std::is_class_v<T> && !std::meta::is_abstract_type(^^T)) {
+            overload_storage_.clear();
+            const ClassInfo* info = lookup_class_info();
+            if (!info) return;
             static constexpr auto dm = std::define_static_array(
                 std::meta::nonstatic_data_members_of(^^Dispatch,
                     std::meta::access_context::unchecked()));
@@ -450,95 +470,54 @@ class Dyn {
                     using FieldType = [:std::meta::type_of(field):];
                     if constexpr (detail::is_typed_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Non-static member function → bind invokers.
+                        // Non-static member function → bind from ClassInfo.
                         dispatch_.[:field:].obj = dispatch_.obj.get();
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        constexpr auto entries = []() consteval {
-                            using OE = typename
-                                std::remove_cv_t<FieldType>::OverloadEntry;
-                            std::vector<OE> v;
-                            static constexpr auto tmembers =
-                                std::define_static_array(
-                                    std::meta::members_of(^^T,
-                                        std::meta::access_context::unchecked()));
-                            template for (constexpr auto m : tmembers) {
-                                if constexpr (std::meta::is_function(m)
-                                    && std::meta::has_identifier(m)
-                                    && !std::meta::is_static_member(m)
-                                    && std::meta::identifier_of(m) == nm_sv) {
-                                    v.push_back(OE{&detail::invoker<T, m>});
-                                }
-                            }
-                            return std::define_static_array(v);
-                        }();
-                        dispatch_.[:field:].overloads = entries.data();
-                        dispatch_.[:field:].num = entries.size();
+                        auto key = std::string(nm_sv);
+                        auto& vec = overload_storage_[key];
+                        for (const auto& fi : info->functions)
+                            if (fi.name == key)
+                                vec.push_back({fi.invoker});
+                        dispatch_.[:field:].overloads = vec.data();
+                        dispatch_.[:field:].num = vec.size();
                     } else if constexpr (detail::is_typed_static_method_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Static member function → bind invoker.
+                        // Static member function → bind invoker from ClassInfo.
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto tmembers =
-                            std::define_static_array(
-                                std::meta::members_of(^^T,
-                                    std::meta::access_context::unchecked()));
-                        template for (constexpr auto m : tmembers) {
-                            if constexpr (std::meta::is_function(m)
-                                          && std::meta::has_identifier(m)
-                                          && std::meta::is_static_member(m)
-                                          && std::meta::identifier_of(m)
-                                              == nm_sv) {
-                                dispatch_.[:field:].invoker =
-                                    &detail::static_invoker<m>;
+                        auto key = std::string(nm_sv);
+                        for (const auto& fi : info->static_functions)
+                            if (fi.name == key) {
+                                dispatch_.[:field:].invoker = fi.invoker;
+                                break;
                             }
-                        }
                     } else if constexpr (detail::is_typed_static_property_v<
                             std::remove_cv_t<FieldType>>) {
-                        // Static data member → bind getter/setter.
+                        // Static data member → bind from ClassInfo.
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto sdm = std::define_static_array(
-                            std::meta::static_data_members_of(^^T,
-                                std::meta::access_context::unchecked()));
-                        template for (constexpr auto m : sdm) {
-                            if constexpr (std::meta::has_identifier(m)
-                                          && std::meta::identifier_of(m)
-                                              == nm_sv) {
-                                using MT = [:std::meta::type_of(m):];
-                                if constexpr (!std::is_const_v<MT>) {
-                                    dispatch_.[:field:].setter =
-                                        &detail::static_setter<m>;
-                                }
-                                dispatch_.[:field:].getter =
-                                    &detail::static_getter<m>;
+                        auto key = std::string(nm_sv);
+                        for (const auto& fi : info->static_fields)
+                            if (fi.name == key) {
+                                dispatch_.[:field:].getter = fi.getter;
+                                dispatch_.[:field:].setter = fi.setter;
+                                break;
                             }
-                        }
                     } else {
-                        // Non-static data member → bind getter/setter/offset.
+                        // Non-static data member → bind from ClassInfo.
                         dispatch_.[:field:].obj = dispatch_.obj.get();
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
                         constexpr auto nm_sv = std::meta::identifier_of(field);
-                        static constexpr auto tdm = std::define_static_array(
-                            std::meta::nonstatic_data_members_of(^^T,
-                                std::meta::access_context::unchecked()));
-                        template for (constexpr auto m : tdm) {
-                            if constexpr (!std::meta::is_bit_field(m)
-                                          && std::meta::has_identifier(m)
-                                          && std::meta::identifier_of(m)
-                                              == nm_sv) {
-                                using MemberType = [:std::meta::type_of(m):];
-                                constexpr auto offset = std::meta::offset_of(m);
+                        auto key = std::string(nm_sv);
+                        for (const auto& fi : info->fields)
+                            if (fi.name == key) {
                                 dispatch_.[:field:].member_offset =
-                                    offset.bytes;
-                                if constexpr (!std::is_const_v<MemberType>) {
-                                    dispatch_.[:field:].setter =
-                                        &detail::setter<T, m>;
-                                }
-                                dispatch_.[:field:].getter =
-                                    &detail::getter<T, m>;
+                                    static_cast<std::size_t>(fi.offset);
+                                dispatch_.[:field:].getter = fi.getter;
+                                dispatch_.[:field:].setter = fi.setter;
+                                break;
                             }
-                        }
                     }
                 }
             }
@@ -579,6 +558,19 @@ class Dyn {
     //     through to the real object.  This enables per-method mocking.
     std::map<std::string, std::any> dynamic_callables_;
     bool dynamic_mode_ = false;  // true = fully dynamic (no real object)
+
+    // Stable storage for overload-entry vectors built from ClassInfo at
+    // runtime.  Dyn is non-movable and std::map nodes are stable, so
+    // .data() pointers remain valid for the Dyn's lifetime.
+    std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
+
+    // Look up T's ClassInfo from the global pool (T is registered via
+    // ensure_registered<T>() before populate() is called).
+    static const ClassInfo* lookup_class_info() {
+        std::lock_guard<std::mutex> lk(pool_mutex());
+        auto it = class_pool().find(std::string(detail::type_name<T>()));
+        return it != class_pool().end() ? it->second.get() : nullptr;
+    }
 
     // Trampoline: calls a stored std::function matching the method's signature.
     // The void* ctx points at the Dyn<T> itself (this).  The trampoline
@@ -672,8 +664,10 @@ public:
         constexpr auto nm_sv = std::meta::identifier_of(Method);
         constexpr auto nm = std::define_static_string(nm_sv);
         dynamic_callables_.erase(std::string(nm));
-        // Re-populate just this method with the real invoker.
+        // Re-populate just this method from ClassInfo.
         if constexpr (std::is_class_v<T>) {
+            const ClassInfo* info = lookup_class_info();
+            if (!info) return;
             static constexpr auto dm = std::define_static_array(
                 std::meta::nonstatic_data_members_of(^^Dispatch,
                     std::meta::access_context::unchecked()));
@@ -686,26 +680,14 @@ public:
                         dispatch_.[:field:].obj = dispatch_.obj.get();
                         dispatch_.[:field:].owner =
                             std::shared_ptr<void>(dispatch_.obj);
-                        constexpr auto entries = []() consteval {
-                            using OE = typename
-                                std::remove_cv_t<FT>::OverloadEntry;
-                            std::vector<OE> v;
-                            static constexpr auto tmembers =
-                                std::define_static_array(
-                                    std::meta::members_of(^^T,
-                                        std::meta::access_context::unchecked()));
-                            template for (constexpr auto m : tmembers) {
-                                if constexpr (std::meta::is_function(m)
-                                    && std::meta::has_identifier(m)
-                                    && !std::meta::is_static_member(m)
-                                    && std::meta::identifier_of(m) == nm_sv) {
-                                    v.push_back(OE{&detail::invoker<T, m>});
-                                }
-                            }
-                            return std::define_static_array(v);
-                        }();
-                        dispatch_.[:field:].overloads = entries.data();
-                        dispatch_.[:field:].num = entries.size();
+                        auto key = std::string(nm);
+                        auto& vec = overload_storage_[key];
+                        vec.clear();
+                        for (const auto& fi : info->functions)
+                            if (fi.name == key)
+                                vec.push_back({fi.invoker});
+                        dispatch_.[:field:].overloads = vec.data();
+                        dispatch_.[:field:].num = vec.size();
                     }
                 }
             }
@@ -764,10 +746,9 @@ public:
                 using FT = [:std::meta::type_of(field):];
                 if constexpr (detail::is_typed_method_v<std::remove_cv_t<FT>>) {
                     constexpr auto entries = []() consteval {
-                        using OE = typename
-                            std::remove_cv_t<FT>::OverloadEntry;
                         return std::define_static_array(
-                            std::vector<OE>{OE{&trampoline<Method>}});
+                            std::vector<detail::OverloadEntry>{
+                                detail::OverloadEntry{&trampoline<Method>}});
                     }();
                     dispatch_.[:field:].overloads = entries.data();
                     dispatch_.[:field:].num = 1;
