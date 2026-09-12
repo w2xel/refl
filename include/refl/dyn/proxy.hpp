@@ -80,30 +80,6 @@ consteval std::meta::info make_fn_sig(std::meta::info m) {
     return std::meta::substitute(^^fn_type, args);
 }
 
-// consteval: collect all overload signatures for a function name,
-// walking the base hierarchy for inherited methods.
-// Applies the same filters as make_info: public, non-deleted, non-consteval.
-consteval std::vector<std::meta::info>
-collect_sigs(std::meta::info type, std::string_view name) {
-    std::vector<std::meta::info> result;
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (is_public_method(m) && std::meta::has_identifier(m)
-            && !std::meta::is_static_member(m)
-            && std::meta::identifier_of(m) == name)
-            result.push_back(make_fn_sig(m));
-    }
-    // Walk public bases for inherited methods.
-    for (auto b : std::meta::bases_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b)) {
-            auto inherited = collect_sigs(std::meta::type_of(b), name);
-            for (auto s : inherited) result.push_back(s);
-        }
-    }
-    return result;
-}
-
 // consteval: collect the const-ness of all overloads for a named method
 // on the interface type, in Sigs-pack order.  Used by populate() to
 // verify the impl's method const-ness matches the interface's.
@@ -204,19 +180,10 @@ public:
             if (after_call) after_call(hook_ctx, result);
             if constexpr (std::is_void_v<R>) return;
             else {
-                // Extract the return value from the Object, throwing
-                // runtime_error (not bad_expected_access) on type mismatch.
-                if constexpr (std::is_reference_v<R>) {
-                    auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
-                    if (!cr) throw std::runtime_error(
-                        "Proxy: return type mismatch on method call");
-                    return *cr.value();
-                } else {
-                    auto cr = result.template cast_ref<R>();
-                    if (!cr) throw std::runtime_error(
-                        "Proxy: return type mismatch on method call");
-                    return std::move(*cr.value());
-                }
+                auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
+                if (!cr) throw std::runtime_error(
+                    "Proxy: return type mismatch on method call");
+                return std::move(*cr.value());
             }
         } else {
             if constexpr (I + 1 < sizeof...(Sigs))
@@ -329,40 +296,6 @@ template <typename... Sigs> struct is_typed_method<TypedMethod<Sigs...>>
 template <typename T> inline constexpr bool is_typed_method_v =
     is_typed_method<T>::value;
 
-// consteval: build the TypedMethod<Sigs...> type for a function name.
-consteval std::meta::info make_typed_method_type(std::meta::info type,
-                                                    std::string_view name) {
-    return std::meta::substitute(^^TypedMethod, collect_sigs(type, name));
-}
-
-// consteval: build the TypedProperty field type for a data member name,
-// walking the base hierarchy for inherited data members.
-// Passes Readonly=true for const members (deletes operator= at compile time).
-consteval std::meta::info make_property_field_type(std::meta::info type,
-                                                       std::string_view name) {
-    for (auto m : std::meta::nonstatic_data_members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (detail::is_public_data_member(m) && std::meta::has_identifier(m)
-            && std::meta::identifier_of(m) == name) {
-            auto mt = std::meta::type_of(m);
-            bool is_const = std::meta::is_const_type(mt);
-            auto clean_mt = std::meta::substitute(^^std::remove_cvref_t,
-                std::initializer_list<std::meta::info>{mt});
-            return std::meta::substitute(^^TypedProperty,
-                {clean_mt, std::meta::reflect_constant(is_const)});
-        }
-    }
-    // Walk public bases for inherited data members.
-    for (auto b : std::meta::bases_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b)) {
-            auto found = make_property_field_type(std::meta::type_of(b), name);
-            if (found != std::meta::info{}) return found;
-        }
-    }
-    return std::meta::info{};
-}
-
 // consteval: collect inherited non-static data members from public bases.
 // ponytail: recursive base walk, O(n) per base level; fine for realistic
 // hierarchies.  Virtual inheritance unsupported (offset_of is not constant
@@ -409,28 +342,40 @@ consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
         std::vector<std::meta::info>& specs) {
 
     // Non-static member functions → TypedMethod (one field per name,
-    // carrying all overloads).  Walks the base hierarchy via collect_sigs
-    // and collect_all_methods for inherited methods.
-    std::vector<std::string> seen_fns;
+    // carrying all overloads).  collect_all_methods walks the hierarchy
+    // once; we group by name and build the function-type sigs inline,
+    // avoiding a per-name re-walk.
+    std::vector<std::string> method_names;
+    std::vector<std::vector<std::meta::info>> method_sigs;
     std::vector<std::meta::info> all_methods;
     collect_all_methods(type, all_methods);
     for (auto m : all_methods) {
         auto nm = std::string(std::meta::identifier_of(m));
-        bool dup = false;
-        for (const auto& s : seen_fns)
-            if (s == nm) { dup = true; break; }
-        if (!dup) {
-            seen_fns.push_back(nm);
-            auto field_type = make_typed_method_type(type,
-                std::meta::identifier_of(m));
-            specs.push_back(std::meta::data_member_spec(
-                field_type, {.name=nm}));
+        bool found = false;
+        for (std::size_t i = 0; i < method_names.size(); ++i) {
+            if (method_names[i] == nm) {
+                method_sigs[i].push_back(make_fn_sig(m));
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            method_names.push_back(nm);
+            method_sigs.push_back({make_fn_sig(m)});
         }
     }
+    for (std::size_t i = 0; i < method_names.size(); ++i) {
+        auto field_type = std::meta::substitute(^^TypedMethod,
+            method_sigs[i]);
+        specs.push_back(std::meta::data_member_spec(
+            field_type, {.name=method_names[i]}));
+    }
 
-    // Non-static data members → TypedProperty.  Walks the base hierarchy
-    // via make_property_field_type.
-    std::vector<std::string> seen_fields;
+    // Non-static data members → TypedProperty.  All DMs (own + inherited)
+    // are collected in one walk; the property type is built inline from
+    // the member reflection, avoiding a per-name re-walk.  First
+    // occurrence of each name wins (own members shadow bases).
+    std::vector<std::string> field_names;
     std::vector<std::meta::info> all_dms;
     for (auto m : std::meta::nonstatic_data_members_of(type,
             std::meta::access_context::unchecked()))
@@ -441,15 +386,18 @@ consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
         if (is_public_data_member(m) && std::meta::has_identifier(m)) {
             auto nm = std::string(std::meta::identifier_of(m));
             bool dup = false;
-            for (const auto& s : seen_fields)
+            for (const auto& s : field_names)
                 if (s == nm) { dup = true; break; }
             if (!dup) {
-                seen_fields.push_back(nm);
-                auto field_type = make_property_field_type(type,
-                    std::meta::identifier_of(m));
-                if (field_type != std::meta::info{})
-                    specs.push_back(std::meta::data_member_spec(
-                        field_type, {.name=nm}));
+                field_names.push_back(nm);
+                auto mt = std::meta::type_of(m);
+                bool is_const = std::meta::is_const_type(mt);
+                auto clean_mt = std::meta::substitute(^^std::remove_cvref_t,
+                    std::initializer_list<std::meta::info>{mt});
+                auto field_type = std::meta::substitute(^^TypedProperty,
+                    {clean_mt, std::meta::reflect_constant(is_const)});
+                specs.push_back(std::meta::data_member_spec(
+                    field_type, {.name=nm}));
             }
         }
     }
@@ -764,7 +712,6 @@ public:
         if (this != &other) {
             obj_ = std::move(other.obj_);
             other.obj_ = {};
-            overload_storage_.clear();
             if (obj_.valid()) { populate(); }
         }
         return *this;
