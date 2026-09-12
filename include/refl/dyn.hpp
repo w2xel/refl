@@ -162,7 +162,7 @@ class Dyn {
         SetterFn original_setter;
         void* original_obj;
         std::size_t member_offset;
-        std::string_view type_name;
+        std::shared_ptr<const ClassInfo> class_info;
         std::vector<std::function<void(Object&)>>* hooks;
     };
     std::map<std::string, PropertyHookCtx> prop_hook_contexts_;
@@ -180,7 +180,7 @@ class Dyn {
             ? c->original_getter(c->original_obj)
             : detail::borrow_object(
                 static_cast<char*>(c->original_obj) + c->member_offset,
-                c->type_name);
+                c->class_info);
         for (auto& cb : *c->hooks) cb(current);
     }
 
@@ -256,7 +256,7 @@ class Dyn {
                 self->dynamic_callables_[key]);
             if constexpr (std::is_void_v<R>) { fn(*self); return Object{}; }
             else return Object(std::make_shared<R>(fn(*self)),
-                             detail::type_name<R>());
+                             detail::ensure_class_info<R>());
         } else if constexpr (params.size() == 1) {
             using P0 = [: std::meta::type_of(params[0]) :];
             using C0 = std::remove_cvref_t<P0>;
@@ -267,7 +267,7 @@ class Dyn {
                 fn(*self, a0); return Object{};
             } else {
                 return Object(std::make_shared<R>(fn(*self, a0)),
-                             detail::type_name<R>());
+                             detail::ensure_class_info<R>());
             }
         } else if constexpr (params.size() == 2) {
             using P0 = [: std::meta::type_of(params[0]) :];
@@ -282,7 +282,7 @@ class Dyn {
                 fn(*self, a0, a1); return Object{};
             } else {
                 return Object(std::make_shared<R>(fn(*self, a0, a1)),
-                             detail::type_name<R>());
+                             detail::ensure_class_info<R>());
             }
         } else {
             // ponytail: 3+ args not yet supported in the trampoline.
@@ -577,9 +577,8 @@ public:
                             ctx.original_setter = tp->setter;
                             ctx.original_obj = tp->obj;
                             ctx.member_offset = tp->member_offset;
-                            ctx.type_name =
-                                detail::type_name<std::remove_cvref_t<
-                                    typename FT::value_type>>();
+                            ctx.class_info = detail::ensure_class_info<
+                                std::remove_cvref_t<typename FT::value_type>>();
                             ctx.hooks = &vec;
                             tp->getter = &prop_get_trampoline;
                             tp->setter = &prop_set_trampoline;

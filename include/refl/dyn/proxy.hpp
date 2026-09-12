@@ -530,11 +530,13 @@ class Proxy {
     void populate() {
         if (!obj_.valid()) return;
         overload_storage_.clear();
-        const ClassInfo* info = detail::lookup_class_info(obj_.class_name());
-        if (!info)
+        auto ci = obj_.class_info();
+        if (!ci)
             throw std::runtime_error(
-                "Proxy: object type '" + std::string(obj_.class_name()) +
+                "Proxy: object has no ClassInfo — type '" +
+                std::string(obj_.class_name()) +
                 "' is not registered in the reflection pool");
+        const ClassInfo* info = ci.get();
         static constexpr auto dm = std::define_static_array(
             std::meta::nonstatic_data_members_of(^^Dispatch,
                 std::meta::access_context::unchecked()));
@@ -678,7 +680,7 @@ public:
     // Returns an invalid Class if not bound or the type is unregistered.
     Class get_class() const {
         if (!obj_.valid()) return {};
-        return find_class(obj_.class_name()).value_or(Class{});
+        return Class(obj_.class_info().get());
     }
 
     // -----------------------------------------------------------------------

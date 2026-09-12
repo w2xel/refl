@@ -150,14 +150,15 @@ struct EnumInfo {
 // ---------------------------------------------------------------------------
 // Global class and enum pools — Meyers singletons to avoid SIOF.
 //
-// Values are held in unique_ptr so that Class/Field/Function/... handles
-// (which store const ClassInfo* / const EnumInfo* into the pool) remain
-// valid across rehashes: a runtime ensure_registered<T>() after lookups
-// have started can grow the unordered_map, but the heap-allocated info
-// objects never move.
+// Values are held in shared_ptr so that Object can carry a
+// shared_ptr<const ClassInfo> directly — the Object keeps its ClassInfo
+// alive for its lifetime, and mock-owned ClassInfos are cleaned up when
+// the last referencing Object dies.  The heap-allocated info objects never
+// move (unordered_map rehashing only moves the shared_ptr handles, not
+// the pointees), so ClassInfo* / Function / Field handles remain stable.
 // ---------------------------------------------------------------------------
-inline std::unordered_map<std::string, std::unique_ptr<ClassInfo>>& class_pool() {
-    static std::unordered_map<std::string, std::unique_ptr<ClassInfo>> pool;
+inline std::unordered_map<std::string, std::shared_ptr<ClassInfo>>& class_pool() {
+    static std::unordered_map<std::string, std::shared_ptr<ClassInfo>> pool;
     return pool;
 }
 
@@ -174,7 +175,7 @@ inline std::mutex& pool_mutex() {
 struct Registrar {
     explicit Registrar(const ClassInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        class_pool()[info.name] = std::make_unique<ClassInfo>(std::move(info));
+        class_pool()[info.name] = std::make_shared<ClassInfo>(std::move(info));
     }
 };
 
@@ -336,8 +337,8 @@ class Enum;
 class Enumerator;
 
 namespace detail {
-Object borrow_object(void* ptr, std::string_view class_name);
-}  // namespace detail
+Object borrow_object(void* ptr, std::shared_ptr<const ClassInfo> info);
+}  // namespace detail  // namespace detail
 
 namespace detail {
 
@@ -402,14 +403,36 @@ inline bool is_base_of(std::string_view derived_name, std::string_view base_name
     return is_base_of_unlocked(derived_name, base_name);
 }
 
-// Lookup a registered class by name, returning the raw ClassInfo*.
-// The pool is append-only, so the pointer stays valid after the lock is
-// released.  Used by the dyn/proxy dispatch layer to bind type-erased
-// Objects to their ClassInfo at runtime.
-inline const ClassInfo* lookup_class_info(std::string_view name) {
+// Lookup a registered class by name, returning a shared_ptr to the
+// ClassInfo (null if not found).  The pool is append-only, so the
+// shared_ptr (and the raw pointer it yields) remain valid after the
+// lock is released.  Used by the dyn/proxy dispatch layer and by
+// ensure_class_info<T>() to find pool-registered types.
+inline std::shared_ptr<const ClassInfo> lookup_class_info(std::string_view name) {
     std::lock_guard<std::mutex> lk(pool_mutex());
     auto it = class_pool().find(std::string(name));
-    return it != class_pool().end() ? it->second.get() : nullptr;
+    return it != class_pool().end() ? it->second : nullptr;
+}
+
+// Get a shared_ptr<const ClassInfo> for type T.  If T is registered in
+// the pool, returns the pool's entry (with full metadata: functions,
+// fields, bases, constructors).  If not, creates a minimal ClassInfo
+// (name only) cached per-type via a static local — not added to the
+// pool, so find_class won't find it.  The Object carries the shared_ptr
+// directly; same-type identity (cast_ref, extract_arg) works via name
+// comparison, and hierarchy walks fail (correct — the type isn't
+// registered).  This is the single entry point for Object construction:
+// every Object stores the shared_ptr returned here.
+template <typename T>
+std::shared_ptr<const ClassInfo> ensure_class_info() {
+    auto existing = lookup_class_info(type_name<T>());
+    if (existing) return existing;
+    static std::shared_ptr<const ClassInfo> info = [] {
+        auto ci = std::make_shared<ClassInfo>();
+        ci->name = std::string(type_name<T>());
+        return ci;
+    }();
+    return info;
 }
 
 // Upcast offset with diamond-ambiguity check.  Returns the byte offset
@@ -515,19 +538,19 @@ public:
     Object() = default;
 
     // Owning construction — from a shared_ptr (factory, getter, invoker).
-    Object(std::shared_ptr<void> owner, std::string_view class_name)
+    Object(std::shared_ptr<void> owner, std::shared_ptr<const ClassInfo> info)
         : owner_(std::move(owner))
         , ptr_(owner_.get())
-        , class_name_(class_name) {}
+        , class_info_(std::move(info)) {}
 
     // Owning construction with separate pointer (aliasing — for reference
     // returns where the shared_ptr keeps the original alive but the
     // pointer points at a subobject or the object itself).
     Object(std::shared_ptr<void> owner, void* ptr,
-           std::string_view class_name)
+           std::shared_ptr<const ClassInfo> info)
         : owner_(std::move(owner))
         , ptr_(ptr)
-        , class_name_(class_name) {}
+        , class_info_(std::move(info)) {}
 
     // From shared_ptr<T> — implicit owning construction.  This is the
     // idiomatic way to create an Object from a heap-managed instance;
@@ -542,7 +565,7 @@ public:
     Object(const std::shared_ptr<T>& sp) noexcept
         : owner_(std::static_pointer_cast<void>(sp))
         , ptr_(sp.get())
-        , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
+        , class_info_(detail::ensure_class_info<std::remove_cvref_t<T>>()) {}
 
     // From a concrete lvalue — non-owning borrow.
     // Call-scoped only: safe for passing to invoke/get/set where the
@@ -557,7 +580,7 @@ public:
                  (not detail::is_shared_ptr_v<std::remove_cvref_t<T>>)
     Object(T& obj) noexcept
         : ptr_(static_cast<void*>(std::addressof(obj)))
-        , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
+        , class_info_(detail::ensure_class_info<std::remove_cvref_t<T>>()) {}
 
     // From a concrete rvalue — owning (moves into shared_ptr).
     template <typename T>
@@ -566,7 +589,7 @@ public:
     Object(T&& obj)
         : owner_(std::make_shared<std::remove_cvref_t<T>>(std::move(obj)))
         , ptr_(owner_.get())
-        , class_name_(detail::type_name<std::remove_cvref_t<T>>()) {}
+        , class_info_(detail::ensure_class_info<std::remove_cvref_t<T>>()) {}
 
     // Block temporaries from the template constructor (below) — but allow
     // move construction (needed for expected<Object> returns).
@@ -575,14 +598,22 @@ public:
     Object& operator=(const Object&) = default;
     Object& operator=(Object&&) noexcept = default;
 
-    std::string_view class_name() const { return class_name_; }
+    std::string_view class_name() const {
+        return class_info_ ? std::string_view(class_info_->name)
+                           : std::string_view{};
+    }
+
+    // Direct access to the ClassInfo shared_ptr.  When non-null, keeps
+    // the ClassInfo alive for the Object's lifetime.  Null for default-
+    // constructed (invalid) Objects.
+    std::shared_ptr<const ClassInfo> class_info() const { return class_info_; }
 
     bool is_owned() const { return static_cast<bool>(owner_); }
 
     bool is_class(std::string_view name) const {
         if (!valid()) return false;
-        if (class_name_ == name) return true;
-        return detail::is_base_of(class_name_, name);
+        if (class_name() == name) return true;
+        return detail::is_base_of(class_name(), name);
     }
 
     // Owning cast — returns a shared_ptr<T> that keeps the object alive.
@@ -595,7 +626,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!is_owned()) return std::unexpected(Error::NotOwned);
         const auto tname = detail::type_name<T>();
-        auto off = detail::upcast_offset(class_name_, tname);
+        auto off = detail::upcast_offset(class_name(), tname);
         if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return std::shared_ptr<T>(owner_,
@@ -610,7 +641,7 @@ public:
     std::expected<T*, Error> cast_ref() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto tname = detail::type_name<T>();
-        auto off = detail::upcast_offset(class_name_, tname);
+        auto off = detail::upcast_offset(class_name(), tname);
         if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return static_cast<T*>(static_cast<void*>(adjusted));
@@ -619,17 +650,15 @@ public:
     std::expected<Object, Error> clone() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!is_owned()) return std::unexpected(Error::NotOwned);
-        std::lock_guard<std::mutex> lk(pool_mutex());
-        auto it = class_pool().find(std::string(class_name_));
-        if (it == class_pool().end() || !it->second->clone)
+        if (!class_info_ || !class_info_->clone)
             return std::unexpected(Error::NotCopyable);
-        auto copied = it->second->clone(ptr_);
-        return Object(std::move(copied), class_name_);
+        auto copied = class_info_->clone(ptr_);
+        return Object(std::move(copied), class_info_);
     }
 
     std::string to_string() const {
         if (!valid()) return "Object(invalid)";
-        return "Object(" + std::string(class_name_) + " @ " +
+        return "Object(" + std::string(class_name()) + " @ " +
                std::to_string(reinterpret_cast<std::uintptr_t>(ptr_)) + ")";
     }
 
@@ -650,20 +679,19 @@ public:
     const std::shared_ptr<void>& owner() const { return owner_; }
 
 private:
-    // Non-owning construction — raw pointer + class name.  Private:
+    // Non-owning construction — raw pointer + ClassInfo.  Private:
     // use Object(T&) for borrowing lvalues, or detail::borrow_object()
-    // for the one internal site that can't use the lvalue ctor.
-    Object(void* ptr, std::string_view class_name)
-        : ptr_(ptr), class_name_(class_name) {}
+    // for internal sites that can't use the lvalue ctor.
+    Object(void* ptr, std::shared_ptr<const ClassInfo> info)
+        : ptr_(ptr), class_info_(std::move(info)) {}
 
     std::shared_ptr<void> owner_;
     void* ptr_ = nullptr;
-    // Borrows static storage: always type_name<T>() (consteval).
-    std::string_view class_name_;
+    std::shared_ptr<const ClassInfo> class_info_;
 
     friend class Function;
     friend class Field;
-    friend Object detail::borrow_object(void*, std::string_view);
+    friend Object detail::borrow_object(void*, std::shared_ptr<const ClassInfo>);
 };
 
 // ---------------------------------------------------------------------------
@@ -675,8 +703,8 @@ namespace detail {
 // Factory for non-owning borrow Objects from a raw pointer.  Used by
 // static_invoker for reference returns (where the lvalue ctor can't be
 // used because the reference may be const-qualified).  Call-scoped only.
-Object borrow_object(void* ptr, std::string_view class_name) {
-    return Object(ptr, class_name);
+Object borrow_object(void* ptr, std::shared_ptr<const ClassInfo> info) {
+    return Object(ptr, std::move(info));
 }
 
 // Build an Object from argument I.  Non-const lvalue args borrow the
@@ -764,7 +792,7 @@ Object factory(const Object* args) {
 
     return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
         return Object(std::make_shared<T>(extract(std::integral_constant<std::size_t, I>{})...),
-                      type_name<T>());
+                      detail::ensure_class_info<T>());
     }(std::make_index_sequence<n>{});
 }
 
@@ -790,11 +818,11 @@ Object invoker(const std::shared_ptr<void>& owner, void* obj,
             return Object{};
         } else if constexpr (std::is_reference_v<R>) {
             auto& ref = (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
-            return Object(owner, std::addressof(ref), type_name<RStore>());
+            return Object(owner, std::addressof(ref), detail::ensure_class_info<RStore>());
         } else {
             return Object(std::make_shared<RStore>(
                 (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...)),
-                type_name<RStore>());
+                detail::ensure_class_info<RStore>());
         }
     }(std::make_index_sequence<n>{});
 }
@@ -806,7 +834,7 @@ Object getter(void* obj) {
     using MemberType = [:std::meta::type_of(Member):];
     using StorageType = std::remove_const_t<std::remove_reference_t<MemberType>>;
     return Object(std::make_shared<StorageType>(target->*ptr),
-                 type_name<StorageType>());
+                 detail::ensure_class_info<StorageType>());
 }
 
 template <typename T, std::meta::info Member>
@@ -840,11 +868,11 @@ Object static_getter() {
         // get_ref still returns ReadOnly for these (no addressable storage);
         // get() copies the value out.
         return Object(std::make_shared<StorageType>(
-            [:std::meta::constant_of(Member):]), type_name<StorageType>());
+            [:std::meta::constant_of(Member):]), detail::ensure_class_info<StorageType>());
     } else {
         auto* ptr = &[:Member:];
         return Object(std::make_shared<StorageType>(*ptr),
-                     type_name<StorageType>());
+                     detail::ensure_class_info<StorageType>());
     }
 }
 
@@ -889,11 +917,11 @@ Object static_invoker(const Object* args) {
             return Object{};
         } else if constexpr (std::is_reference_v<R>) {
             auto& ref = fn(extract(std::integral_constant<std::size_t, I>{})...);
-            return borrow_object(std::addressof(ref), type_name<RStore>());
+            return borrow_object(std::addressof(ref), detail::ensure_class_info<RStore>());
         } else {
             return Object(std::make_shared<RStore>(
                 fn(extract(std::integral_constant<std::size_t, I>{})...)),
-                type_name<RStore>());
+                detail::ensure_class_info<RStore>());
         }
     }(std::make_index_sequence<n>{});
 }
@@ -1955,7 +1983,8 @@ inline std::expected<Object, Error>
 Object::invoke_op(std::string_view name, const Object& arg) const {
     if (!valid()) return std::unexpected(Error::NullHandle);
     if (!arg.valid()) return std::unexpected(Error::NullHandle);
-    const ClassInfo* info = detail::lookup_class_info(class_name());
+    if (!class_info_) return std::unexpected(Error::NotFound);
+    const ClassInfo* info = class_info_.get();
     if (!info) return std::unexpected(Error::NotFound);
     std::vector<std::string> param_types = {
         detail::normalize_type(arg.class_name())};
