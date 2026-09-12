@@ -411,10 +411,10 @@ int main() {
         refl::Proxy<IVec2> pv1(sp1);
         refl::Proxy<IVec2> pv2(sp2);
 
-        // operator+ (Proxy + Proxy)
+        // operator+ (Proxy + Proxy) — returns Proxy<IVec2>
         auto sum = pv1 + pv2;
-        CHECK(sum.x == 4, "pv1 + pv2: x should be 4 (1+3)");
-        CHECK(sum.y == 6, "pv1 + pv2: y should be 6 (2+4)");
+        CHECK(sum->x == 4, "pv1 + pv2: x should be 4 (1+3)");
+        CHECK(sum->y == 6, "pv1 + pv2: y should be 6 (2+4)");
 
         // operator== (Proxy == Proxy)
         bool eq = pv1 == pv2;

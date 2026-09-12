@@ -104,40 +104,6 @@ collect_sigs(std::meta::info type, std::string_view name) {
     return result;
 }
 
-// consteval: return the reflection of the return type of the first
-// overload of operator `op` on type (walking public bases).  Returns
-// ^^void if no overload exists — this keeps the splice [:R:] well-formed
-// even when the operator is absent, so -Wtemplate-body can check the
-// body without error.  The caller's requires-clause prevents the method
-// from existing when the operator is absent; the void fallback is never
-// reached at runtime.
-consteval std::meta::info op_return_type(std::meta::info type,
-                                           std::meta::operators op) {
-    for (auto m : std::meta::members_of(type,
-            std::meta::access_context::unchecked())) {
-        if (is_public_method(m) && !std::meta::has_identifier(m)
-            && !std::meta::is_static_member(m)
-            && std::meta::is_operator_function(m)
-            && std::meta::operator_of(m) == op)
-            return std::meta::return_type_of(m);
-    }
-    for (auto b : std::meta::bases_of(type,
-            std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b)) {
-            auto rt = op_return_type(std::meta::type_of(b), op);
-            if (rt != ^^void) return rt;
-        }
-    }
-    return ^^void;
-}
-
-// consteval: does type (and its public bases) have any overload of
-// operator `op`?  Used as a compile-time constraint on Proxy<T>'s
-// operator methods — the method exists iff T declares the operator.
-consteval bool has_binary_op(std::meta::info type, std::meta::operators op) {
-    return op_return_type(type, op) != ^^void;
-}
-
 // consteval: collect the const-ness of all overloads for a named method
 // on the interface type, in Sigs-pack order.  Used by populate() to
 // verify the impl's method const-ness matches the interface's.
@@ -696,69 +662,71 @@ public:
 
     // -----------------------------------------------------------------------
     // Operators — looked up at call time via Object::invoke_op, which
-    // resolves overloads by the argument's runtime type.  Each operator
-    // generates two methods:
+    // resolves overloads by the argument's runtime type.
     //
-    //   1. Same-type: operator+(const Proxy& other) — both operands are
-    //      Proxy<T>.  The runtime lookup matches the impl's operator by
-    //      the other proxy's bound object type, so mismatched impl types
-    //      are caught at call time.  Exists iff T has T op T.
+    // Value-returning operators (+, -, *, /, %) return Proxy<T> wrapping
+    // the result, so you can chain: p1 + p2 + p3.  Comparison operators
+    // (==, !=, <, >, <=, >=) return bool.
     //
-    //   2. Generic: template<U> operator+(U&& val) — any concrete value.
-    //      The lookup matches the impl's operator by val's type.  Exists
-    //      iff T declares the operator at all; the match is runtime —
-    //      if no compatible overload exists, it throws.
+    // Each operator generates two methods:
+    //   1. Same-type: operator+(const Proxy& other) — runtime lookup by
+    //      the other proxy's bound object type.
+    //   2. Generic: template<U> operator+(U&& val) — runtime lookup by
+    //      val's type.
     //
-    // Neither exists if T has no such operator.
+    // Neither exists if T has no such operator.  The constraint uses
+    // decltype — no consteval helpers needed for the return type.
     // -----------------------------------------------------------------------
 public:
-#define PROXY_BINARY_OP(symbol, op_enum, op_name) \
+#define PROXY_BINARY_OP(symbol, op_name) \
     auto operator symbol(const Proxy& other) const \
-        requires (detail::has_binary_op(^^T, op_enum)) \
-              && requires(T a, T b) { a symbol b; } \
+        requires requires(T a, T b) { a symbol b; } \
     { \
-        using R = [:detail::op_return_type(^^T, op_enum):]; \
-        auto result = obj_.invoke_op(op_name, other.obj_); \
+        using R = decltype(std::declval<T>() symbol std::declval<T>()); \
+        Object arg = other.obj_; \
+        auto result = obj_.invoke_op(op_name, arg); \
         if (!result) \
             throw std::runtime_error( \
-                "Proxy: operator" #symbol " — no matching overload for '" + \
-                std::string(other.obj_.class_name()) + "' in '" + \
+                "Proxy: " op_name " — no matching overload for '" + \
+                std::string(arg.class_name()) + "' in '" + \
                 std::string(obj_.class_name()) + "'"); \
         if constexpr (std::is_void_v<R>) return; \
+        else if constexpr (std::is_same_v<R, bool>) \
+            return std::move(*static_cast<bool*>(result->raw())); \
         else \
-            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
-                result->raw())); \
+            return Proxy(std::move(*result)); \
     } \
     template <typename U> \
-        requires (detail::has_binary_op(^^T, op_enum)) \
-              && (!std::is_same_v<std::remove_cvref_t<U>, Proxy>) \
+        requires (!std::is_same_v<std::remove_cvref_t<U>, Proxy>) \
+              && requires(T a, U b) { a symbol b; } \
     auto operator symbol(U&& val) const \
     { \
-        using R = [:detail::op_return_type(^^T, op_enum):]; \
+        using R = decltype(std::declval<T>() symbol std::declval<U>()); \
         Object arg(std::forward<U>(val)); \
         auto result = obj_.invoke_op(op_name, arg); \
         if (!result) \
             throw std::runtime_error( \
-                "Proxy: operator" #symbol " — no matching overload for '" + \
+                "Proxy: " op_name " — no matching overload for '" + \
                 std::string(arg.class_name()) + "' in '" + \
                 std::string(obj_.class_name()) + "'"); \
         if constexpr (std::is_void_v<R>) return; \
+        else if constexpr (std::is_same_v<R, bool>) \
+            return std::move(*static_cast<bool*>(result->raw())); \
         else \
-            return std::move(*static_cast<std::remove_cvref_t<R>*>( \
-                result->raw())); \
+            return Proxy(std::move(*result)); \
     }
 
-    PROXY_BINARY_OP(+, std::meta::operators::op_plus, "operator+")
-    PROXY_BINARY_OP(-, std::meta::operators::op_minus, "operator-")
-    PROXY_BINARY_OP(*, std::meta::operators::op_star, "operator*")
-    PROXY_BINARY_OP(/ , std::meta::operators::op_slash, "operator/")
-    PROXY_BINARY_OP(%, std::meta::operators::op_percent, "operator%")
-    PROXY_BINARY_OP(==, std::meta::operators::op_equals_equals, "operator==")
-    PROXY_BINARY_OP(!=, std::meta::operators::op_exclamation_equals, "operator!=")
-    PROXY_BINARY_OP(< , std::meta::operators::op_less, "operator<")
-    PROXY_BINARY_OP(> , std::meta::operators::op_greater, "operator>")
-    PROXY_BINARY_OP(<=, std::meta::operators::op_less_equals, "operator<=")
-    PROXY_BINARY_OP(>=, std::meta::operators::op_greater_equals, "operator>=")
+    PROXY_BINARY_OP(+, "operator+")
+    PROXY_BINARY_OP(-, "operator-")
+    PROXY_BINARY_OP(*, "operator*")
+    PROXY_BINARY_OP(/ , "operator/")
+    PROXY_BINARY_OP(%, "operator%")
+    PROXY_BINARY_OP(==, "operator==")
+    PROXY_BINARY_OP(!=, "operator!=")
+    PROXY_BINARY_OP(< , "operator<")
+    PROXY_BINARY_OP(> , "operator>")
+    PROXY_BINARY_OP(<=, "operator<=")
+    PROXY_BINARY_OP(>=, "operator>=")
 
 #undef PROXY_BINARY_OP
 
