@@ -227,6 +227,16 @@ struct TypedProperty {
     }
 
     static constexpr bool is_readonly() { return Readonly; }
+
+    // Expected type name of the proxied data member, normalized for
+    // comparison against the impl's ClassInfo field type.  Both sides use
+    // normalize_type so const-qualifier differences (the interface strips
+    // const via remove_cv_t, the impl stores the raw display string) don't
+    // cause false mismatches.
+    static std::string expected_type() {
+        return std::string(detail::normalize_type(
+            detail::type_name<std::remove_cvref_t<T>>()));
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -554,13 +564,21 @@ class Proxy {
                         dispatch_.[:field:].num = vec.size();
                     } else {
                         // Non-static data member → bind from Object's ClassInfo.
+                        using TP = std::remove_cv_t<FieldType>;
                         dispatch_.[:field:].obj = obj_.raw();
                         dispatch_.[:field:].owner = obj_.owner();
                         constexpr auto nm_sv = std::meta::identifier_of(field);
                         auto key = std::string(nm_sv);
+                        auto exp_type = TP::expected_type();
                         bool found = false;
                         for (const auto& fi : info->fields)
                             if (fi.name == key) {
+                                auto impl_type = detail::normalize_type(fi.type);
+                                if (impl_type != exp_type)
+                                    throw std::runtime_error(
+                                        "Proxy: field type mismatch on '" + key +
+                                        "' — interface expects '" + exp_type +
+                                        "', impl has '" + impl_type + "'");
                                 dispatch_.[:field:].member_offset =
                                     static_cast<std::size_t>(fi.offset);
                                 dispatch_.[:field:].getter = fi.getter;
