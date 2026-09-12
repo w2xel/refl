@@ -85,6 +85,23 @@ struct SimpleImpl { int v; SimpleImpl(int v) : v(v) {} int get_value() { return 
 // distinguish which object the proxy reports/dispatches to by class name.
 struct SimpleImplB { int v; SimpleImplB(int v) : v(v) {} int get_value() { return v; } };
 
+// For cross-base ambiguous name-lookup rejection: DiamondLeft and DiamondRight
+// each declare a method of the same name with distinct signatures.  A class
+// inheriting both has two base subobjects with that name — an ambiguous lookup
+// that C++ rejects.  The proxy must reject the bind rather than silently pick
+// one base's invoker.
+struct IAmbigBase { int method(int); };
+struct DiamondLeft  { int method(int x) const { return x + 1; } };
+struct DiamondRight { int method(int x) const { return x + 2; } };
+struct DiamondAmbig : DiamondLeft, DiamondRight {};
+
+// For cross-base unambiguous inherited method: DiamondMid declares the only
+// own method of a given name, hiding the same-named method in its base, so the
+// lookup is unambiguous and must bind to DiamondMid's implementation.
+struct IDiamondOverride { int method(int); };
+struct DiamondBase { int method(int x) const { return x + 100; } };
+struct DiamondMid : DiamondBase { int method(int x) const { return x + 10; } };
+
 // For Proxy operator tests.
 struct IVec2 {
     int x, y;
@@ -200,6 +217,8 @@ struct MoveOnlyProp {
 [[maybe_unused]] static refl::Reg<ConstSetImpl> reg_const_set;
 [[maybe_unused]] static refl::Reg<SimpleImpl> reg_simple_impl;
 [[maybe_unused]] static refl::Reg<SimpleImplB> reg_simple_impl_b;
+[[maybe_unused]] static refl::Reg<DiamondAmbig> reg_diamond_ambig;
+[[maybe_unused]] static refl::Reg<DiamondMid> reg_diamond_mid;
 [[maybe_unused]] static refl::Reg<Vec2Impl> reg_vec2_impl;
 [[maybe_unused]] static refl::Reg<Vec2Other> reg_vec2_other;
 [[maybe_unused]] static refl::Reg<ScalableImpl> reg_scalable_impl;
@@ -555,6 +574,32 @@ int main() {
             "get_class should still report original type SimpleImpl after failed rebind");
         CHECK(p->get_value() == 11,
             "calls should still dispatch to original object (value 11) after failed rebind");
+    }
+
+    // === Proxy: cross-base ambiguous name-lookup rejected at bind ===
+    // DiamondAmbig inherits two bases each declaring method(int).  The lookup
+    // hits two distinct base subobjects — an ambiguity C++ rejects — so the
+    // proxy must refuse to bind rather than silently pick one base's invoker.
+    {
+        auto sp = std::make_shared<DiamondAmbig>();
+        bool threw = false;
+        try {
+            refl::Proxy<IAmbigBase> p(sp);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw, "Proxy<IAmbigBase> on DiamondAmbig should throw — ambiguous base lookup");
+    }
+
+    // === Proxy: name-hiding makes an inherited method unambiguous ===
+    // DiamondMid declares its own method(int), hiding DiamondBase::method(int).
+    // The lookup is unambiguous (one subobject owns the name) and must bind to
+    // DiamondMid's implementation, not the hidden base.
+    {
+        auto sp = std::make_shared<DiamondMid>();
+        refl::Proxy<IDiamondOverride> p(sp);
+        CHECK(p->method(1) == 11,
+            "name-hiding: DiamondMid::method(1) should be 11, not 101 from base");
     }
 
     // === Proxy operators ===
