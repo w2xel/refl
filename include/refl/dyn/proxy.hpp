@@ -324,6 +324,30 @@ consteval void collect_all_methods(std::meta::info type,
     }
 }
 
+// Instance surface shared by synthetic metadata and native slot wiring. Match
+// the dispatch struct's method hiding and first-visible-field policy.
+consteval void collect_instance_members(std::meta::info type,
+        std::vector<std::meta::info>& out) {
+    collect_all_methods(type, out);
+    std::vector<std::meta::info> fields;
+    for (auto m : std::meta::nonstatic_data_members_of(type,
+            std::meta::access_context::unchecked()))
+        fields.push_back(m);
+    collect_inherited_dms(type, fields);
+    std::vector<std::string> names;
+    for (auto m : fields) {
+        if (!is_public_data_member(m) || !std::meta::has_identifier(m)) continue;
+        auto name = std::string(std::meta::identifier_of(m));
+        bool hidden = false;
+        for (const auto& previous : names)
+            if (previous == name) { hidden = true; break; }
+        if (!hidden) {
+            names.push_back(name);
+            out.push_back(m);
+        }
+    }
+}
+
 // consteval: collect the const-ness of all overloads for a named method
 // on the interface type, in Sigs-pack order.  Used by populate() to
 // verify the impl's method const-ness matches the interface's.

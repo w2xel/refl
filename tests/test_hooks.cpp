@@ -58,6 +58,30 @@ int main() {
     CHECK(hook_b == 62, "p hook B should fire with 62 (42+20)");
     CHECK(cross_result == 62, "cross-object should receive 62");
 
+    // Wrappers retain replaced implementations and compose in installation order.
+    {
+        refl::Dyn<Point> wrapped(1, 2);
+        auto context = std::make_shared<int>(10);
+        std::weak_ptr<int> lifetime = context;
+        wrapped.implement<^^Point::sum>([context](refl::Dyn<Point>&) {
+            return *context;
+        });
+        context.reset();
+        wrapped.wrap<^^Point::sum>([](auto& original, refl::Dyn<Point>&) {
+            return original() + 1;
+        });
+        wrapped.wrap<^^Point::sum>([](auto& original, refl::Dyn<Point>&) {
+            return original() * 2;
+        });
+        CHECK(!lifetime.expired(), "wrapper chain should retain its implementation");
+        CHECK(wrapped->sum() == 22, "nested wrappers should compose as B(A(target))");
+        refl::Dyn<Point> moved(std::move(wrapped));
+        CHECK(moved->sum() == 22, "moving Dyn should preserve wrapper contexts");
+        moved.restore<^^Point::sum>();
+        CHECK(moved->sum() == 3, "restore should select the native implementation");
+        CHECK(lifetime.expired(), "restore should release inactive wrapper contexts");
+    }
+
     printf("All hooks tests passed.\n");
     return 0;
 }

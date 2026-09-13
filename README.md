@@ -4,6 +4,22 @@ Goal: Make a Framework based on latest compile-time reflection features that ena
 
 Highly experimental.
 
+## Build and test
+
+In the configured Nix development shell:
+
+```sh
+meson setup builddir
+meson compile -C builddir -j 2
+meson test -C builddir --print-errorlogs
+```
+
+The test run covers all five test executables and all three samples. LTO defaults
+to off because GCC 16.2 crashes linking the reflection-heavy Dyn coverage; warnings
+as errors and the available GCC static analyzer remain enabled. See
+[Getting Started](docs/content/getting-started.md) for existing build directories
+and toolchain setup.
+
 ## Two layers
 
 - **Core** (`include/refl/refl.hpp`) — registration and the type-erased
@@ -72,4 +88,3 @@ Note the dereferences — the return values are `std::expected`.  Function
 and field results are returned as `Object` — use `cast_safe<T>()` (owning)
 or `cast_ref<T>()` (non-owning) to extract.  Void functions return an
 invalid `Object` (`.valid()` is false).
-

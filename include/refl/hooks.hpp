@@ -123,6 +123,8 @@ public:
             pwc.saved_get_ctx = saved.get_ctx;
             pwc.saved_setter = saved.setter;
             pwc.saved_set_ctx = saved.set_ctx;
+            pwc.saved_get_owner = saved.get_owner;
+            pwc.saved_set_owner = saved.set_owner;
             pwc.class_info = detail::ensure_class_info<Bare>();
             pwc.hooks = &vec;
 
@@ -139,7 +141,7 @@ public:
             // Install the wrapper setter, keep the getter as-is.
             this->mockable_->template set_prop_slot<Member>(
                 {saved.getter, saved.get_ctx,
-                 (SetterFn)+wrapper_setter, &pwc});
+                 +wrapper_setter, &pwc, saved.get_owner, {}});
         }
     }
 
@@ -174,6 +176,8 @@ private:
         void* saved_get_ctx;
         SetterFn saved_setter;
         void* saved_set_ctx;
+        std::shared_ptr<void> saved_get_owner;
+        std::shared_ptr<void> saved_set_owner;
         std::shared_ptr<const ClassInfo> class_info;
         std::vector<std::function<void(Object&)>>* hooks;
     };

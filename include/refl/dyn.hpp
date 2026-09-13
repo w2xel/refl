@@ -28,8 +28,8 @@
 #include <refl/dyn/proxy.hpp>
 #include <refl/mockable.hpp>
 
+#include <any>
 #include <functional>
-#include <map>
 
 namespace refl {
 
@@ -78,9 +78,11 @@ private:
         T* raw = obj_.get();
 
         // Walk T's members via reflection, match against ClassInfo.
-        static constexpr auto all_members = std::define_static_array(
-            std::meta::members_of(^^T,
-                std::meta::access_context::unchecked()));
+        static constexpr auto all_members = []() consteval {
+            std::vector<std::meta::info> members;
+            detail::collect_instance_members(^^T, members);
+            return std::define_static_array(members);
+        }();
         template for (constexpr auto m : all_members) {
             if constexpr (detail::is_public_method(m)
                           && std::meta::has_identifier(m)
@@ -104,10 +106,10 @@ private:
                         return pts;
                     }());
                 if (r.fi) {
-                    // Save the real invoker as the method slot.
-                    // The real invoker expects T* as obj.
+                    // Inherited invokers expect their declaring base subobject.
+                    auto* receiver = static_cast<char*>(static_cast<void*>(raw)) + r.offset;
                     mockable_->template set_slot<m>(
-                        {r.fi->invoker, raw});
+                        {r.fi->invoker, receiver, obj_});
                 }
             } else if constexpr (detail::is_public_data_member(m)
                           && std::meta::has_identifier(m)
@@ -117,9 +119,10 @@ private:
                 auto key = std::string(nm);
                 auto r = detail::find_field_in_hierarchy(info, key);
                 if (r.fi) {
+                    auto* receiver = static_cast<char*>(static_cast<void*>(raw)) + r.offset;
                     mockable_->template set_prop_slot<m>(
-                        {r.fi->getter, raw,
-                         r.fi->setter, raw});
+                        {r.fi->getter, receiver,
+                         r.fi->setter, receiver, obj_, obj_});
                 }
             }
         }
@@ -184,7 +187,8 @@ public:
     bool is_dynamic() const { return dynamic_mode_; }
 
     Class get_class() const {
-        return proxy_.get_class();
+        // Class-level statics belong to T, not its synthetic dispatch metadata.
+        return Class(detail::lookup_class_info(detail::type_name<T>()).get());
     }
 
     // --- reset: swap real object, re-wire slots ---
@@ -200,9 +204,10 @@ public:
     // --- make_dynamic: drop real object, mock-only ---
     void make_dynamic() {
         dynamic_mode_ = true;
+        // Clearing the slots drops their native owners and invalidates dispatch
+        // until implement() supplies replacements. Active calls retain a copy.
+        mockable_->clear_slots();
         obj_.reset();
-        // Clear all slots — implement() will set them.
-        // ponytail: no per-slot clear; implement() overwrites.
     }
 
     // --- implement: override a method with a runtime callable ---
@@ -304,6 +309,7 @@ public:
     struct WrapCtx {
         InvokerFn saved_invoker;
         void* saved_ctx;
+        std::shared_ptr<void> saved_owner;
         std::shared_ptr<SelfRef> self_ref;
         std::any wrap_fn;  // std::function<R(Orig, Dyn<T>&, Args...)>
     };
@@ -320,7 +326,8 @@ public:
 
         if constexpr (params.size() == 0) {
             using Orig = std::function<R()>;
-            auto orig = Orig([owner, sv = wc->saved_invoker,
+            auto orig = Orig([owner = wc->saved_owner ? wc->saved_owner : owner,
+                              sv = wc->saved_invoker,
                               sc = wc->saved_ctx]() -> R {
                 Object result = sv(owner, sc, nullptr);
                 if constexpr (std::is_void_v<R>) return;
@@ -344,7 +351,8 @@ public:
             using C0 = std::remove_cvref_t<P0>;
             auto& a0 = *static_cast<C0*>(args[0].raw());
             using Orig = std::function<R(C0)>;
-            auto orig = Orig([owner, sv = wc->saved_invoker,
+            auto orig = Orig([owner = wc->saved_owner ? wc->saved_owner : owner,
+                              sv = wc->saved_invoker,
                               sc = wc->saved_ctx](C0 x) -> R {
                 C0 storage(std::move(x));
                 Object ref(storage);
@@ -373,7 +381,8 @@ public:
             auto& a0 = *static_cast<C0*>(args[0].raw());
             auto& a1 = *static_cast<C1*>(args[1].raw());
             using Orig = std::function<R(C0, C1)>;
-            auto orig = Orig([owner, sv = wc->saved_invoker,
+            auto orig = Orig([owner = wc->saved_owner ? wc->saved_owner : owner,
+                              sv = wc->saved_invoker,
                               sc = wc->saved_ctx](C0 x0, C1 x1) -> R {
                 C0 s0(std::move(x0));
                 C1 s1(std::move(x1));
@@ -412,18 +421,17 @@ public:
         using R = [: std::meta::return_type_of(Method) :];
         constexpr auto params = std::define_static_array(
             std::meta::parameters_of(Method));
-        constexpr auto nm_sv = std::meta::identifier_of(Method);
-        constexpr auto nm = std::define_static_string(nm_sv);
-        auto key = std::string(nm);
 
         // Save the current slot.
         auto saved = mockable_->template slot<Method>();
 
-        // Build the WrapCtx — stored on the Dyn, kept alive by the
-        // shared_ptr in wrap_ctxs_.  The Mockable slot points at it.
-        auto& wc = wrap_ctxs_[key];
+        // Each wrapper owns a distinct context and the previous slot's owner.
+        // Reusing one map entry would make a second wrap point back to itself.
+        auto context = std::make_shared<WrapCtx>();
+        auto& wc = *context;
         wc.saved_invoker = saved.invoker;
         wc.saved_ctx = saved.ctx;
+        wc.saved_owner = saved.owner;
         wc.self_ref = make_self_ref();
 
         // Store the user's lambda, typed by arity.  The first arg is
@@ -456,10 +464,8 @@ public:
 
         // Install the wrap trampoline as the new slot.
         mockable_->template set_slot<Method>(
-            {get_wrap_tramp<Method>(), &wc});
+            {get_wrap_tramp<Method>(), &wc, context});
     }
-
-    std::map<std::string, WrapCtx> wrap_ctxs_;
 
     // --- restore: remove an override, go back to the real invoker ---
     template <std::meta::info Method>
@@ -486,8 +492,9 @@ public:
                 return pts;
             }());
         if (r.fi) {
+            auto* receiver = static_cast<char*>(static_cast<void*>(obj_.get())) + r.offset;
             mockable_->template set_slot<Method>(
-                {r.fi->invoker, obj_.get()});
+                {r.fi->invoker, receiver, obj_});
         }
     }
 

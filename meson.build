@@ -6,7 +6,9 @@ project(
     'cpp_std=c++26',
     'warning_level=3',      # -Wall -Wextra
     'werror=true',
-    'b_lto=true',
+    # GCC 16.2 crashes in lto_read_decls for the reflection-heavy Dyn tests.
+    # Keep LTO opt-in until the configured compiler can link that coverage.
+    'b_lto=false',
     'optimization=2',
   ],
 )

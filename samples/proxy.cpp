@@ -64,8 +64,9 @@ int main() {
     // Look up by name, construct by name.  Proxy<IDrawable> never sees
     // "Triangle" in its own code — it receives an Object and resolves
     // everything at runtime.
-    auto tri_cls = *refl::find_class("Triangle");
-    auto tri_obj = *tri_cls.constructors()[0].call(6, 8);
+    auto tri_cls = refl::find_class("Triangle").value();
+    auto tri_obj = tri_cls.find_constructor({"int", "int"}).value()
+                          .call(6, 8).value();
 
     std::printf("\n=== Proxy<IDrawable> → Triangle(6, 8) via Constructor::call ===\n");
     refl::Proxy<IDrawable> p2(tri_obj);
@@ -91,4 +92,3 @@ int main() {
 
     return 0;
 }
-

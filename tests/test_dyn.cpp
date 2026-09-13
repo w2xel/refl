@@ -16,6 +16,11 @@ struct Base {
     int base_method() const { return base_val * 2; }
 };
 
+struct Prefix { int padding = 777; };
+struct OffsetPoint : Prefix, Base {
+    OffsetPoint() : Base(13) {}
+};
+
 struct Point : Base {
     int x;
     int y;
@@ -206,6 +211,9 @@ struct MoveOnlyProp {
     MoveOnlyProp() : ptr(std::make_unique<int>(0)) {}
 };
 
+// The current runtime resolves base metadata through the registration pool.
+[[maybe_unused]] static refl::Reg<Base> reg_base;
+[[maybe_unused]] static refl::Reg<Prefix> reg_prefix;
 [[maybe_unused]] static refl::Dyn<Point> reg_point;
 [[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
@@ -240,6 +248,28 @@ int main() {
     refl::Dyn<Point> rp(1, 2);
     CHECK(rp.get().x == 1, "Dyn<Point> get().x should be 1");
     CHECK(rp.get().y == 2, "Dyn<Point> get().y should be 2");
+
+    // Inherited methods and fields need the same surface as the typed proxy,
+    // and a receiver adjusted to a non-first base subobject.
+    {
+        refl::Dyn<OffsetPoint> inherited;
+        inherited.reset();
+        CHECK(inherited->base_method() == 26, "inherited method should use the Base receiver");
+        inherited->base_val = 17;
+        CHECK(inherited.get().base_val == 17, "inherited field writes should reach Base");
+        CHECK(inherited.get().padding == 777, "base adjustment must preserve the first base");
+        inherited.implement<^^Base::base_method>([](refl::Dyn<OffsetPoint>&) { return 99; });
+        CHECK(inherited->base_method() == 99, "inherited method should support replacement");
+        inherited.restore<^^Base::base_method>();
+        CHECK(inherited->base_method() == 34, "restored inherited method should retain its offset");
+        inherited.make_dynamic();
+        bool missing_native = false;
+        try { (void)inherited->base_method(); }
+        catch (const std::runtime_error&) { missing_native = true; }
+        CHECK(missing_native, "make_dynamic should remove native slots");
+        inherited.reset();
+        CHECK(inherited->base_method() == 26, "reset should repopulate inherited native slots");
+    }
 
     // --- typed method call via -> (real return type, no any_cast!) ---
     int sum_result = rp->sum();

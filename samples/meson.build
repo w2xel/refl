@@ -1,25 +1,29 @@
 # Samples — runnable usage examples.
-# Built but not tested; they exist to demonstrate the intended API.
+# Run as smoke tests so examples cannot silently stop working.
 
 inc = include_directories('../include')
 
-executable(
+basic_sample = executable(
   'basic_sample',
   'basic.cpp',
   include_directories: inc,
   install: false,
 )
 
-executable(
+dynamic_sample = executable(
   'dynamic_sample',
   'dynamic.cpp',
   include_directories: inc,
   install: false,
 )
 
-executable(
+proxy_sample = executable(
   'proxy_sample',
   'proxy.cpp',
   include_directories: inc,
   install: false,
 )
+
+test('basic_sample', basic_sample, suite: 'samples')
+test('dynamic_sample', dynamic_sample, suite: 'samples')
+test('proxy_sample', proxy_sample, suite: 'samples')

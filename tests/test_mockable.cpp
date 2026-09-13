@@ -125,6 +125,59 @@ int main() {
     CHECK(!obj.cast_safe<IShape>().has_value(),
           "cast_safe<IShape> on mock should fail");
 
+    // Saved slots retain exactly the implementation they captured.
+    {
+        auto retained = refl::Mockable<IShape>::create();
+        auto context = std::make_shared<int>(123);
+        std::weak_ptr<int> lifetime = context;
+        retained->implement<^^IShape::area>([context](int scale) {
+            return *context * scale;
+        });
+        context.reset();
+        auto original = retained->slot<^^IShape::area>();
+        retained->implement<^^IShape::area>([](int) { return 9; });
+        CHECK(!lifetime.expired(), "saved method slot should retain its context");
+        retained->set_slot<^^IShape::area>(original);
+        CHECK(retained->proxy()->area(2) == 246, "saved method should restore its context");
+        original = {};
+        retained->implement<^^IShape::area>([](int) { return 8; });
+        CHECK(lifetime.expired(), "replaced method context should be released");
+    }
+
+    // A getter saved before replacement retains its original backing value.
+    {
+        auto retained = refl::Mockable<IWidget>::create();
+        auto context = std::make_shared<int>(321);
+        std::weak_ptr<int> lifetime = context;
+        retained->implement_property<^^IWidget::height>([context] { return *context; });
+        context.reset();
+        auto original = retained->prop_slot<^^IWidget::height>();
+        retained->implement_property<^^IWidget::height>([] { return 8; });
+        CHECK(!lifetime.expired(), "saved property slot should retain its context");
+        retained->set_prop_slot<^^IWidget::height>(original);
+        CHECK(retained->proxy()->height == 321, "saved getter should restore its context");
+        original = {};
+        retained->implement_property<^^IWidget::height>([] { return 9; });
+        CHECK(lifetime.expired(), "replaced getter context should be released");
+    }
+
+    // Replacing the executing slot must not destroy its callable mid-call.
+    {
+        auto changing = refl::Mockable<IShape>::create();
+        auto context = std::make_shared<int>(1);
+        std::weak_ptr<int> lifetime = context;
+        changing->implement<^^IShape::area>([raw = changing.get(), context](int) {
+            std::weak_ptr<int> during_call = context;
+            raw->implement<^^IShape::area>([](int) { return 22; });
+            return during_call.expired() ? -1 : 11;
+        });
+        context.reset();
+        auto view = changing->proxy();
+        CHECK(view->area(0) == 11, "active call should retain the replaced context");
+        CHECK(lifetime.expired(), "active context should be released after return");
+        CHECK(view->area(0) == 22, "next call should see the replacement");
+    }
+
     printf("All mockable tests passed.\n");
     return 0;
 }

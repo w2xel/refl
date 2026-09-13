@@ -104,6 +104,59 @@ These are observations about that revision and toolchain, not permanent compiler
 limitations or proof that the target design works. Stabilize and rerun the baseline
 before claiming end-to-end feasibility; record configuration changes separately.
 
+### Stabilized build baseline
+
+The baseline stabilization following documentation revision `89c21b8` uses the
+configured GCC 16.2.0 toolchain, Meson 1.10.2, C++26 reflection, optimization level 2,
+warnings as errors, and GCC's static analyzer. LTO is now off by default: its
+`lto_read_decls` compiler crash was reproduced and remains an opt-in compiler
+investigation, not a supported baseline configuration.
+
+The stabilization fixes implementation-thunk duplicate symbols, signature collisions
+between method slots, missing inherited dispatch metadata and receiver adjustment,
+native class-level lookup from `Dyn`, saved callable/property ownership, and nested
+wrapper ownership. The proxy sample selects its constructor by signature and checks
+lookup results. Mockable and Hooks tests are registered, and all samples run as
+smoke tests. These are repairs to the existing API, not adoption of the proposed
+`CallTarget`, `MemberId`, registry, or reference-export contracts.
+
+Reproduce the baseline in a fresh directory:
+
+```sh
+meson setup builddir
+meson compile -C builddir -j 2
+meson test -C builddir --print-errorlogs
+```
+
+An existing directory configured with LTO needs
+`meson configure builddir -Db_lto=false` first. The expected default run has eight
+entries: `selfcheck`, `refl_api`, `dyn_api`, `mockable_api`, `hooks_api`, and the three
+sample smoke tests. The new regressions cover saved-context retention and release,
+self-replacement, nested wrapping and move/restore, and inherited dispatch through
+a non-first base. The inheritance fixture registers base types explicitly because
+the current resolver still depends on the global metadata pool.
+
+Verification on 2026-09-13:
+
+| Check | Result |
+| --- | --- |
+| Full build with the settings above | All eight executables compiled and linked |
+| Default Meson test run | 8 passed, 0 failed, including every sample |
+| Valgrind on `dyn_api`, `mockable_api`, and `hooks_api` | All three passed; zero errors and all heap blocks freed |
+| Strict MkDocs build and `git diff --check` | Passed |
+
+The memory check used:
+
+```sh
+meson test -C builddir --no-rebuild --print-errorlogs \
+  --wrapper 'valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,indirect' \
+  dyn_api mockable_api hooks_api
+```
+
+A passing baseline does not prove the proposed qualifier, reference, detachment,
+or observation contracts; step 0a and the subsequent conformance milestones remain
+necessary.
+
 ## Legacy implementation evidence
 
 The following names and source links describe revision `29ddfd2`, not the target

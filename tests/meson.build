@@ -30,3 +30,19 @@ test_dyn = executable(
   install: false,
 )
 test('dyn_api', test_dyn)
+
+test_mockable = executable(
+  'test_mockable',
+  'test_mockable.cpp',
+  include_directories: inc,
+  install: false,
+)
+test('mockable_api', test_mockable)
+
+test_hooks = executable(
+  'test_hooks',
+  'test_hooks.cpp',
+  include_directories: inc,
+  install: false,
+)
+test('hooks_api', test_hooks)
