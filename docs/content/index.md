@@ -23,6 +23,8 @@ boilerplate registration code.
 
 ## Where to go next
 
+- [Architecture](architecture/index.md) — a proposed target design, repository
+  assessment, layer contracts, and an incremental migration guide for maintainers.
 - [Design](design.md) — the core reflection API.
 - [Dyn](dyn.md) — the typed dispatch / dynamic layer.
 - [Getting Started](getting-started.md) — building, testing, and serving docs.

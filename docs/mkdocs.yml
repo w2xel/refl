@@ -29,7 +29,11 @@ theme:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -41,4 +45,14 @@ nav:
   - Home: index.md
   - Design: design.md
   - Dyn: dyn.md
+  - Architecture:
+      - Overview: architecture/index.md
+      - Repository assessment: architecture/assessment.md
+      - "Layer 1: Contracts and values": architecture/contracts.md
+      - "Layer 2: Reflection generation": architecture/generation.md
+      - "Layer 3: Runtime services": architecture/runtime.md
+      - "Layer 4: Typed binding": architecture/typed-binding.md
+      - "Layer 5: Dynamic composition": architecture/dynamic.md
+      - "Layer 6: Observation": architecture/observation.md
+      - Migration and verification: architecture/migration.md
   - Getting Started: getting-started.md
