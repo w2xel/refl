@@ -1,8 +1,8 @@
-site_name: cpp_runtime_reflection
+site_name: refl
 site_description: C++26 compile-time-reflection-based runtime reflection framework
-repo_url: https://github.com/swuerl/cpp_runtime_reflection
+repo_url: https://github.com/w2xel/refl
 docs_dir: content
-site_url: https://swuerl.github.io/cpp_runtime_reflection/
+site_url: https://w2xel.github.io/refl/
 watch:
   - ../tests
 
