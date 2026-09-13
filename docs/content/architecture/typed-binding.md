@@ -49,8 +49,8 @@ declared result anchor across replacement and observation.
 
 `binding_contracts` checks shared plans, isolated receivers, inherited adjustment,
 mutable arguments, const rejection, move-only inputs/results, qualifier mismatch,
-failed rebinding, moves, and slot replacement. Existing Dyn/Proxy/Hooks
-suites cover overloads, properties, operators, and saved slot behavior.
+failed rebinding, moves, and slot replacement. Dyn, Proxy, and Observed suites cover
+overloads, properties, operators, observation, and saved target behavior.
 
 Next: [dynamic dispatch](dynamic.md).
 

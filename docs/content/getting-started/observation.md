@@ -1,16 +1,17 @@
 # Observation
 
-Use the types from [typed binding](binding.md). `observe` wraps a dispatch handle.
-Keep the subscription token alive to receive events.
+Use the types from [typed binding](binding.md). `observe(dynamic, sink)` returns a
+typed facade. Keep each subscription token alive to receive events.
 
 ```cpp
 --8<-- "test_usage.cpp:observation"
 ```
 
-Events expose read-only receiver, argument, and result views. Delivery runs after
-successful result capture and before typed extraction. Listener exceptions go to
-the required non-throwing error sink.
+Call through `observed->` to emit method, property-read, and property-write events.
+Use `after_view<M>` with `observed.dispatch(OperationKind::view)` for retained
+property views. Events expose read-only receiver, argument, and result views plus
+their operation kind. Delivery runs after successful result capture and before
+typed extraction. Listener exceptions go to the required non-throwing error sink.
 
-The adapter observes calls made through it. Direct calls bypass it.
-A generated typed observation facade and dedicated property events remain pending.
-See [observation semantics](../architecture/observation.md).
+The adapter observes calls made through it. Direct calls bypass it. See
+[observation semantics](../architecture/observation.md).

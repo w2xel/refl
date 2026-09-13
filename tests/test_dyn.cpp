@@ -1,6 +1,5 @@
-// Dyn<T> dispatch test: typed method calls, properties, hooks (connect /
-// on_change / emit), dynamic properties, runtime method implementation
-// (mocking), real-to-dynamic-to-real switching, and cross-object connect.
+// Dyn<T> dispatch test: typed calls, properties, runtime implementations,
+// wrappers, reset, and structural binding.
 //
 // Returns non-zero (fails meson test) on any assertion failure.
 #include <refl/dyn.hpp>
@@ -203,9 +202,7 @@ struct RefGet {
     int val() const { return x; }
 };
 
-// For move-only on_change tests — on_change on a move-only member must
-// not crash when the getter is null.  The setter trampoline uses
-// borrow_object (member_offset + type_name) as the fallback.
+// A move-only property has write and retained-view operations but no copy read.
 struct MoveOnlyProp {
     std::unique_ptr<int> ptr;
     MoveOnlyProp() : ptr(std::make_unique<int>(0)) {}
@@ -294,16 +291,15 @@ int main() {
     static_assert(decltype(rp->id)::is_readonly(), "id must be Readonly=true");
     static_assert(!decltype(rp->x)::is_readonly(), "x must be Readonly=false");
 
-    // --- hooks are user-side: wrap your lambda in implement ---
-    // (connect/on_change removed; use implement with a wrapped lambda)
-    int hook_result = 0;
-    rp.implement<^^Point::sum>([&hook_result](refl::Dyn<Point>::Self& self) {
+    // --- cross-cutting behavior can wrap an implementation ---
+    int callback_result = 0;
+    rp.implement<^^Point::sum>([&callback_result](refl::Dyn<Point>::Self& self) {
         int r = self.get().x + self.get().y;
-        hook_result = r;
+        callback_result = r;
         return r;
     });
     (void)rp->sum();
-    CHECK(hook_result == 119, "hook via wrapped lambda should fire after sum() with result 119 (99+20)");
+    CHECK(callback_result == 119, "implementation callback should see sum result 119 (99+20)");
     rp.restore<^^Point::sum>();
 
     // Dynamic construction does not publish to the default registry.
@@ -311,8 +307,7 @@ int main() {
     CHECK(rp.get_class().name() == "Point", "native metadata stays available without registration");
 
     // === array element access via get() ===
-    // TypedProperty no longer offers operator[] (removed to keep the field
-    // type hook-free).  Access elements via Dyn<T>::get() instead.
+    // TypedProperty does not offer operator[]. Access elements via Dyn<T>::get().
     rp.get().coords[0] = 10;
     rp.get().coords[1] = 20;
     rp.get().coords[2] = 30;
@@ -418,13 +413,13 @@ int main() {
     CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
     CHECK(rp2->sum() == 3, "real sum() should be 3 (1+2)");
 
-    // String-based implement (no ^^ syntax, compile-time checked).
+    // Replace an implementation by member reflection.
     rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self&) { return 777; });
     CHECK(rp2->sum() == 777, "string-based implement sum() should be 777");
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 3, "restored sum() should be 3 again");
 
-    // Verify the self reference can access the real object.
+    // A call-scoped Self can access the real object.
     rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self& self) {
         return self.get().x + self.get().y + 100;
     });
@@ -432,17 +427,17 @@ int main() {
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 3, "restored sum() should be 3 after self-ref test");
 
-    // === hooks are user-side (multi-hook via wrapped lambda) ===
-    int hook_a = 0, hook_b = 0;
-    rp2.implement<^^Point::sum>([&hook_a, &hook_b](refl::Dyn<Point>::Self& self) {
+    // === multiple callbacks through one wrapped implementation ===
+    int callback_a = 0, callback_b = 0;
+    rp2.implement<^^Point::sum>([&callback_a, &callback_b](refl::Dyn<Point>::Self& self) {
         int r = self.get().x + self.get().y;
-        hook_a = r;
-        hook_b = r;
+        callback_a = r;
+        callback_b = r;
         return r;
     });
     (void)rp2->sum();
-    CHECK(hook_a == 3, "hook A should fire with 3");
-    CHECK(hook_b == 3, "hook B should fire with 3");
+    CHECK(callback_a == 3, "callback A should receive 3");
+    CHECK(callback_b == 3, "callback B should receive 3");
     rp2.restore<^^Point::sum>();
 
     // === Proxy: signature-matched overload binding ===

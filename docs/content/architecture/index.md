@@ -13,7 +13,9 @@ flowchart TD
     P --> G
     F[Dyn facade] --> D
     F --> P
-    O[Observation] --> R
+    O[Erased observation] --> R
+    TO[Typed observation] --> O
+    TO --> P
 ```
 
 ## Modules
@@ -30,12 +32,12 @@ flowchart TD
 | `dyn/proxy.hpp` | Shared binding plans and typed calls |
 | `dynamic/dispatch_table.hpp` | Owned targets and generation publication |
 | `dyn.hpp` | Typed dynamic facade |
-| `extensions/observed.hpp` | Completion events and subscription tokens |
-| `hooks.hpp` | Compatibility callbacks over dynamic targets |
+| `extensions/observed.hpp` | Reflection-free completion events and subscriptions |
+| `extensions/observed_dyn.hpp` | Typed method and property observation |
 
-Core, registry, invocation, dispatch, and observation compile without reflection.
-Generation and typed facades use C++26 reflection. Include-boundary tests enforce
-this separation.
+Core, registry, invocation, dispatch, and erased observation compile without
+reflection. Generation and typed facades use C++26 reflection. Include-boundary
+tests enforce this separation.
 
 ## Read next
 
@@ -53,9 +55,9 @@ this separation.
 | Shared native/runtime call frames | `runtime_contracts`, `refl_api` |
 | Shared typed binding plans | `binding_contracts`, `dyn_api` |
 | Owned dynamic generations | `dynamic_state`, `dispatch_table_api`, `call_contract` |
+| Typed method and property observation | `observed_api`, `call_contract` |
 | Executable usage documentation | `usage` |
 
-Remaining work: integrate typed and property observation, retire compatibility
-hooks where covered, then finish header/API cleanup. Dynamic state and observation
-mutation require caller synchronization. Cross-DSO identity and stable serialized
-member IDs are outside the current contract.
+The migration through observation is complete. Final header and API cleanup remains.
+Dynamic state and observation mutation require caller synchronization. Cross-DSO
+identity and stable serialized member IDs are outside the current contract.

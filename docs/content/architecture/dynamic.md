@@ -67,6 +67,6 @@ supports lifetime and reentrancy; it does not make slot mutation thread-safe.
 `call_contract` exercises the table under C++23 without reflection.
 `dynamic_state` covers publication, isolation, saved targets, wrapping, failed
 reset, detachment, closure references, weak context expiry, and replacement during
-observation. Full observation integration remains the [next step](observation.md).
+observation. The [observation layer](observation.md) uses the same live handles.
 
 See [tested usage](../getting-started/dynamic.md).

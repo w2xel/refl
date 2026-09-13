@@ -1,5 +1,5 @@
 // Dynamic replacement tests: methods, properties, and owned target lifetimes.
-// Hooks are user-side: wrap your lambda to add a hook.
+// Cross-cutting call behavior stays outside the dispatch table.
 #include <refl/dyn.hpp>
 
 #include <cstdio>
@@ -46,17 +46,17 @@ int main() {
     m->implement<^^IShape::area>([](int scale) { return scale * 200; });
     CHECK(p->area(5) == 1000, "re-implemented area(5) should be 1000");
 
-    // === Hook via wrapped lambda ===
-    int hook_result = 0;
-    m->implement<^^IShape::area>([&hook_result](int scale) {
+    // === Replacement with captured state ===
+    int callback_result = 0;
+    m->implement<^^IShape::area>([&callback_result](int scale) {
         int r = scale * 200;
-        hook_result = r;
+        callback_result = r;
         return r;
     });
     (void)p->area(5);
-    CHECK(hook_result == 1000, "wrapped lambda should observe result 1000");
+    CHECK(callback_result == 1000, "replacement should capture result 1000");
 
-    // === Raw slot save / restore ===
+    // === Target save / restore ===
     auto saved = m->target<^^IShape::area>();
     m->implement<^^IShape::area>([](int scale) { return scale * 999; });
     CHECK(p->area(1) == 999, "overridden area(1) should be 999");
@@ -82,7 +82,7 @@ int main() {
     pw->width = 99;
     CHECK(pw->width == 99, "width after write should be 99");
 
-    // === Virtual property with hook in the setter ===
+    // === Virtual property with setter state ===
     int width_changed_to = 0;
     int stored_w = 42;
     mw->implement_property<^^IWidget::width>(
@@ -94,7 +94,7 @@ int main() {
     );
     pw->width = 55;
     CHECK(pw->width == 55, "width after virtual set should be 55");
-    CHECK(width_changed_to == 55, "setter hook should observe 55");
+    CHECK(width_changed_to == 55, "setter should capture 55");
 
     // === Read-only virtual property ===
     mw->implement_property<^^IWidget::height>(
@@ -102,7 +102,7 @@ int main() {
     );
     CHECK(pw->height == 88, "read-only property should return 88");
 
-    // === Raw property slot save / restore ===
+    // === Property target save / restore ===
     auto prop_saved = mw->target<^^IWidget::height>(refl::OperationKind::read);
     mw->implement_property<^^IWidget::height>(
         []() { return 77; }

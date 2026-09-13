@@ -1,7 +1,8 @@
 # Observation
 
-`Observed` retains a `DispatchHandle` and an explicit non-throwing error sink.
-It invokes the same checked targets as runtime and typed calls. It does not modify
+`ObservedHandle` adds completion events to one `DispatchHandle` without reflection.
+`Observed<T>` combines observed method, read, write, and view handles with a typed
+proxy. Both require an explicit non-throwing error sink. Observation does not modify
 the source's replacement chain.
 
 ```text
@@ -22,15 +23,15 @@ prepare listener snapshot → resolve and validate → invoke and capture result
 | Unsubscribe during delivery | Inactive listeners are skipped |
 | Recursive invocation | Nested delivery runs synchronously |
 
-The listener snapshot is allocated before target entry. `Subscription` owns the
-registration; destruction or `unsubscribe()` disables it. Tokens refer weakly to
-listener state. Retain a token to keep the subscription active.
+The dispatch handle prepares the listener snapshot before target entry.
+`Subscription` owns the registration; destruction or `unsubscribe()` disables it.
+Tokens refer weakly to listener state. Retain a token to keep the subscription active.
 
-Events expose member identity and read-only receiver, post-call argument, and
-result views. Consumed arguments can be moved from. Views are call-scoped unless
-an available anchor is retained. Retention does not freeze values: later extraction
-can move from result storage. A listener can also invalidate a borrow through
-another mutable handle.
+Events expose member identity, operation kind, and read-only receiver, post-call
+argument, and result views. Consumed arguments can be moved from. Views are
+call-scoped unless an available anchor is retained. Retention does not freeze values:
+later extraction can move from result storage. A listener can also invalidate a
+borrow through another mutable handle.
 
 `try_call_retained<T>` uses the same delivery path and keeps the selected result
 anchor even if a listener replaces its target. Raw reference export is checked
@@ -38,21 +39,17 @@ before target entry.
 
 ## Interception boundary
 
-Only calls through the observed adapter emit its events. Direct native access,
+Only calls through the observed adapter emit events. Direct native access,
 `dynamic->method()`, and other proxies bypass it. A live source handle follows
-replacement and reset while subscriptions remain attached to member IDs.
+replacement and reset while subscriptions remain attached to operation keys.
 Concurrent invocation or subscription changes require external synchronization.
 
-`Hooks<T>` remains a compatibility facade that wraps dynamic targets. Its payloads
-are owned copies; non-copyable method results use `Observed`. It is separate from
-the subscription adapter.
-
-## Remaining integration
-
-Dedicated property events and a generated typed observation facade are pending.
-The current event has no operation-kind field. No automatic old/new property
-snapshots or direct-access interception are implemented.
+`Observed<T>::after<M>` observes methods. `after_read<M>`, `after_write<M>`, and
+`after_view<M>` observe property operations independently. Write events report
+completion; their argument view can be moved from. The layer does not manufacture
+old/new property snapshots or intercept direct storage access.
 
 `call_contract` covers listener order, failures, reentry, and retained results.
-`dynamic_state` covers replacement during delivery. See the
-[tested usage](../getting-started/observation.md).
+`observed_api` covers typed calls, every property operation, reset, direct-call
+bypass, listener errors, and unsubscription. `dynamic_state` covers replacement
+during delivery. See the [tested usage](../getting-started/observation.md).
