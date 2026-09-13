@@ -21,7 +21,7 @@ include/refl/
   refl.hpp       compatibility umbrella for core runtime + registration
   dyn.hpp        compatibility facade for dynamic composition
   mockable.hpp   compatibility facade for slot backend
-  hooks.hpp      compatibility facade for observation
+  hooks.hpp      compatibility facade for observation + Dyn integration
   dyn/proxy.hpp  compatibility include for the typed adapter
 ```
 
@@ -34,17 +34,57 @@ come gradually; start with the smallest split that makes a dependency enforceabl
 | Step | Concrete change | Completion evidence |
 | --- | --- | --- |
 | 0. Establish baseline | Run existing configured tests; add existing mockable/hooks executables to Meson; inventory API/documentation mismatches | Report each component's pass/fail state separately; do not treat unregistered files as tested |
-| 1. Extract contracts | Introduce complete type uses/member IDs, immutable descriptor handles, explicit value access; preserve legacy API translation | Qualifier/case collisions are distinguishable; synthetic handles survive source destruction |
-| 2. Unify calls | Add common argument frames, validation, result/lifetime policies, and owned call targets; route runtime calls through them | Out-parameter, const, move-only, reference, void, and exception contract scenarios pass |
+| 0a. Prove the risky contracts | Build a narrow end-to-end prototype across runtime, proxy, slots, and observation before broad migration | Out-parameter, move-only, and closure-reference scenarios below pass; record initial compile time and dispatch allocations |
+| 1. Extract contracts | Introduce complete type uses/member IDs, immutable descriptor handles, explicit value access, endpoints and call snapshots; preserve legacy API translation | Qualifier/case collisions are distinguishable; synthetic handles survive source destruction; contracts compile without reflection |
+| 2. Unify calls | Add common argument frames, validation, result/lifetime policies, and owned call targets; route runtime calls through them | Out-parameter, const, move-only, reference, void, and exception contract scenarios pass; callable-context anchors survive replacement |
 | 3. Separate generation/publication | Extract native/interface schemas; put pools behind `Registry`; remove global dependency from descriptor relationships | Interface-only description has no linker dependence on method definitions; two isolated registries work |
-| 4. Unify binding | Centralize hierarchy resolution; build immutable structural binding plans; route typed calls through common frames | Runtime/proxy conformance matrix agrees; failed rebind preserves old view; each overload retains its receiver path |
-| 5. Stabilize dynamic state | Use member-keyed owned targets; separate slot backend from proxy; specify replacement/wrap/reset transitions | Saved targets survive replacement; wrapping composes; no native-dependent target survives detachment without an owner |
-| 6. Isolate observation | Add public observer adapter, connection tokens, read-only events, explicit delivery policy | Endpoint destruction, reentrancy, listener failure, and reset behavior pass |
-| 7. Publish the boundaries | Move headers behind compatibility includes; align API docs/samples; add dependency checks and consumer target | Old includes compile; each layer's standalone consumer compiles; architecture diagrams match actual dependencies |
+| 4. Unify binding | Centralize hierarchy resolution; separate structural plans, bound views, and call snapshots; route typed calls through common frames | Runtime/proxy conformance matrix agrees; failed rebind preserves old view; shared plans isolate instances and observe later replacements |
+| 5. Stabilize dynamic state | Use member-keyed owned targets; separate slot backend from proxy; implement live endpoints and declared capture dependencies | Saved targets survive replacement; wrapping composes; detachment handles tracked and unknown dependencies; captured views and live endpoints follow their specified generations |
+| 6. Isolate observation | Add public observed endpoint adapter, connection tokens, read-only events, explicit delivery policy | Native endpoints work without Dyn; source lifetime, reentrancy, listener failure, and subscription survival across reset pass |
+| 7. Publish the boundaries | Finish header moves behind compatibility includes; align API docs/samples; complete consumer target | Old includes compile; accumulated dependency and standalone-consumer checks pass; diagrams match actual dependencies |
 
 If step 0 exposes failures, record them and fix those blocking the vertical
 scenario in separate changes. Do not encode accidental behavior as a permanent
 contract merely to obtain a green baseline.
+
+At every extraction step, add its standalone-header and include-boundary checks
+immediately. Step 7 completes coverage; it is not the first enforcement point.
+
+### Early prototype acceptance
+
+Keep the prototype limited to enough operations to exercise `void update(int&)`,
+a move-only value result, and a reference into a replacement closure. Use the
+existing adapters where possible, with the proposed contracts at the boundary;
+this is a feasibility checkpoint, not a second production invocation engine.
+Promote its fixtures as the corresponding implementation milestones land.
+
+Verify caller mutation through runtime and typed calls, observation without
+copying the move-only result, and a retained closure reference surviving slot
+replacement. Bind two instances with one structural plan and prove isolation.
+Check that subsequent calls see replacements, captured views keep their generation
+after reset, and observed calls follow fresh state while direct calls emit no
+events. Include declared native captures and unknown detachment dependencies.
+
+Record clean consumer compile time and direct/runtime/proxy/slot/observed call
+costs and allocation counts on the same toolchain. Use this evidence to decide
+whether to expand the supported surface; keep result-storage optimizations behind
+the established semantic contract.
+
+### Recorded baseline limitations
+
+A review of revision `7eb6bbe` using the configured GCC 16.2.0 environment found:
+
+- The strict MkDocs build passed.
+- The default C++ test build stopped with an internal compiler error during LTO
+  linking of `test_dyn`; the complete test suite did not run.
+- With `-Db_lto=false`, `selfcheck` and `refl_api` passed, but `test_dyn` failed
+  assembly with a duplicate `Mockable<Point>::impl_trampoline` symbol.
+- `test_mockable.cpp` and `test_hooks.cpp` were not registered in Meson and were
+  not run by these checks.
+
+These are observations about that revision and toolchain, not permanent compiler
+limitations or proof that the target design works. Stabilize and rerun the baseline
+before claiming end-to-end feasibility; record configuration changes separately.
 
 ## Compatibility is an explicit translation
 
@@ -74,6 +114,8 @@ coverage.
 | Const receiver with mutating member | Reject | Reject or unavailable syntax | Same access validation | No success event |
 | Move-only value parameter/result | Explicit consumption | Same category behavior | Generic callable thunk | Observe without copy |
 | Return reference into argument | Correct anchor/borrow | Document typed borrow | Same provenance policy | Retention requires capability |
+| Return reference into replacement closure | Retain invoked context | Typed return remains a borrow | Retained result survives replacement | Preserve result anchor through delivery |
+| Two instances sharing a structural plan | Resolve each endpoint | No instance state in plan | Replacing one leaves the other intact | Events belong to the invoked adapter |
 | Two overloads sharing a name | Select exact declaration | Bind each independently | Replace one only | Subscribe to one only |
 | Ambiguous repeated base | Diagnose | Bind fails | Native wiring uses same resolver | No synthetic success |
 | User exception | Propagate target exception | Same | Same | No success event |
@@ -95,7 +137,8 @@ standard yet.
 
 Add an include-boundary check: `core` cannot include `reflect`, `runtime`, or
 adapters; `runtime` cannot include generation; slots cannot include proxy; no lower
-layer includes hooks. Integration/umbrella headers are the deliberate exceptions.
+layer includes hooks. Observation depends on contracts/runtime and cannot include
+dynamic internals. Integration/umbrella headers are the deliberate exceptions.
 Exercise public operations from small consumer programs rather than granting tests
 special access to internals.
 
@@ -115,8 +158,13 @@ mkdocs serve -f docs/mkdocs.yml
 
 The build checks navigation and Markdown links. It does not execute C++ sketches
 or parse Mermaid diagrams in a browser. Preview the dependency, call-sequence, and
-state diagrams in both theme modes. Material loads the Mermaid runtime in the
-browser, which may require network access under the default theme configuration;
+state diagrams in both theme modes, and run every Mermaid block through the
+matching Mermaid parser when editing diagram sources. Sequence-message text must
+not contain an unescaped semicolon: Mermaid treats it as a statement separator.
+Use plain wording or the documented `#59;` escape (see
+[Mermaid sequence-diagram escaping](https://mermaid.js.org/syntax/sequenceDiagram.html#entity-codes-to-escape-characters)).
+Material loads the Mermaid runtime in the browser, which may require network
+access under the default theme configuration;
 an offline site needs a separate asset-bundling decision. Diagram source remains
 readable in Markdown.
 

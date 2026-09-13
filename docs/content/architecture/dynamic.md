@@ -9,6 +9,11 @@ The backend depends on contracts and generated interface schemas. `Dyn` also use
 runtime binding and the proxy adapter. The backend must remain usable by a runtime
 caller that never instantiates a typed proxy.
 
+The backend implements the common invocation-endpoint contract. `Dyn` provides a
+stable live endpoint whose state reference changes only after a successful reset
+or detachment. Moving the facade transfers that endpoint identity. Typed views
+and observers consume the endpoint without accessing slot containers directly.
+
 ## Slots retain complete targets
 
 ```cpp
@@ -82,18 +87,34 @@ stateDiagram-v2
 | `implement(member, fn)` | Only that exact member changes; signature validated |
 | `restore(member)` | Restore native baseline; report unavailable baseline in dynamic mode |
 | `wrap(member, fn)` | New owned decorator surrounds the current target |
-| `make_dynamic()` | Drop native baselines and native-dependent targets; retain independent replacements |
+| `make_dynamic()` | Drop native baselines and targets with native or unknown dependencies; retain declared independent replacements |
 | `reset(args...)` | Build a new native object and complete slot table; discard replacements/wrappers on success |
 
-For `make_dynamic`, mark a wrapper chain's dependency on native storage explicitly.
-If it cannot be detached safely, make the affected slot unimplemented. Never leave
-a raw target pointing at the released native object. `reset` is transactional with
-respect to dynamic state publication: construction/binding failure leaves the old
-state. This does not undo external side effects in a constructor.
+For `make_dynamic`, track native dependencies on generated targets, replacement
+registrations, and wrapper chains. A decorator inherits its previous target's
+dependencies and declares any additional ones. Replacement registration supplies
+owned contexts or lifetime anchors plus a dependency policy: native-dependent,
+independent, or unknown. Unknown dependencies default to making the affected slot
+unimplemented on detachment; explicitly independent replacements remain callable.
 
-Already retained views and in-progress calls keep their old state alive after a
-transition. Fresh calls through `Dyn` see the new state. Document that distinction
-so reset does not appear to revoke references already given to callers.
+The framework cannot infer dependencies hidden in arbitrary lambda captures.
+Marking a callable independent is a caller assertion, and capturing a borrowed
+pointer leaves its lifetime with the caller. Offer explicit context ownership and
+native-dependency declarations for captures the backend should manage. The
+detachment guarantee covers these tracked dependencies; it cannot make an
+incorrectly declared borrowed capture safe. Dropping targets from current slots
+does not destroy contexts still owned by saved targets or active calls.
+
+`reset` is transactional with respect to dynamic state publication:
+construction/binding failure leaves the old state. This does not undo external
+side effects in a constructor.
+
+Captured state views and in-progress calls keep their old generation alive after
+a transition. A captured view still sees replacements within that generation;
+it does not follow a later reset. Fresh calls through `Dyn` or its stable live
+endpoint resolve the new generation. Observed adapters over that live endpoint
+also follow reset. This distinction concerns state ownership, not protection
+against mutations that invalidate references inside a retained object.
 
 Initially require external synchronization for concurrent mutation and invocation.
 Immutable target snapshots define lifetime and reentrancy, but do not automatically
@@ -110,5 +131,7 @@ Prove overload isolation, save/replace/restore lifetime, nested wrapping order,
 self-replacement during a call, failed reset, and transition to dynamic mode with
 a mixture of native targets and independent replacements. A destruction counter
 should demonstrate that saved targets retain exactly the contexts they need.
+Include declared native captures, unknown dependencies, closure-owned reference
+results, and an old captured view alongside a live endpoint after reset.
 
 Next: [observation](observation.md).

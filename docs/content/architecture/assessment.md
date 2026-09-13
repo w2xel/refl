@@ -35,7 +35,7 @@ These are header dependencies, with a few redundant edges omitted. The public
 | [`proxy.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/dyn/proxy.hpp): `populate` resolves structure and `TypedMethod` builds its own argument storage | Typed calls can diverge from core forwarding and resolution semantics | Produce a binding plan and reuse the call-frame contract |
 | [`mockable.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/mockable.hpp): synthetic `T$mock` metadata, name-keyed slots, raw `ctx`, and `proxy()` convenience | Interface identity, storage identity, overload selection, and adapter dependency are intertwined | Separate interface from storage; key slots by member identity; own callable context |
 | [`dyn.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/dyn.hpp): `wire_real_slots`, `restore`, `wrap`, and mode transitions coordinate several stores and pointers | Lifetime and transition correctness depend on each operation remembering every related store | Publish complete backend states and compose owned call targets |
-| [`hooks.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/hooks.hpp): derived class reaches `mockable_`; callbacks and saved property contexts live in separate maps | Observation is coupled to dynamic storage layout and wrapper lifetime | Public decoration operations and connection tokens |
+| [`hooks.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/hooks.hpp): derived class reaches `mockable_`; callbacks and saved property contexts live in separate maps | Observation is coupled to dynamic storage layout and wrapper lifetime | Observed endpoint adapter outside replacement chains, plus connection tokens |
 | [`tests/meson.build`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/tests/meson.build) registers `selfcheck`, `test_refl`, and `test_dyn`, but not existing `test_mockable.cpp` or `test_hooks.cpp` | A successful default test run does not cover all architectural components | Make each public layer a first-class build/test target |
 
 ## Keep these strengths
@@ -68,8 +68,14 @@ whether each expectation is intended behavior or a historical limitation.
    A typed view must preserve the semantics of the object it exposes.
 4. Separate metadata construction from registry publication. Local registries and
    synthetic backends should not need global mutable state to behave correctly.
-5. Make hooks an optional consumer of the dynamic API, with explicit delivery and
-   disconnection rules.
+5. Make hooks an optional consumer of invocation endpoints and checked runtime
+   calls, with explicit delivery and disconnection rules. Keep Dyn integration
+   separate from the observation adapter.
+
+The [recorded baseline](migration.md#recorded-baseline-limitations) adds execution
+evidence from the subsequent documentation review at `7eb6bbe`. It distinguishes
+passing core tests from build failures and unregistered tests; it does not change
+the revision or static-review scope of the source assessment above.
 
 ## Documentation drift is a boundary signal
 

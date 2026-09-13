@@ -34,15 +34,24 @@ relationship to it. Keep this property through every internal change.
 // Target sketch.
 struct BindingEntry {
     MemberId requirement;
-    BoundOperation operation;      // target + signature + receiver path
+    MemberId implementation_member;
+    OperationKind kind;            // method, property read/write/view
+    Signature signature;
+    ReceiverPath receiver_path;    // descriptor operations, no instance address
 };
 struct BindingPlan {
     InterfaceHandle interface;
-    TypeHandle implementation;
+    SchemaHandle implementation;  // native descriptor or synthetic schema
     std::vector<BindingEntry> entries;
 };
 
+struct BoundView {
+    std::shared_ptr<const BindingPlan> plan;
+    EndpointHandle endpoint;       // per-instance state, separate from the plan
+};
+
 Result<Proxy<Drawable>> try_bind(Object object);
+Result<Proxy<Drawable>> try_bind(EndpointHandle endpoint);
 ```
 
 Binding validates the entire interface before publishing a new view. A failure
@@ -55,6 +64,18 @@ Cache immutable structural plans only after profiling. A cache key must include
 interface identity, descriptor identity/version, and relevant access policy.
 Instance pointers, slot contents, and closure owners do not belong in a shared
 structural plan.
+
+Keep three lifetimes separate. The plan records structural compatibility and
+operation selection. The bound view pairs that plan with an invocation endpoint.
+Each call resolves a fresh `CallSnapshot` containing the selected target, adjusted
+receiver, and owners needed until completion. A slot-backed endpoint must resolve
+the current slot on every call; storing its current closure in the plan would
+silently bypass later replacements. A native endpoint can resolve a fixed thunk.
+
+The endpoint exposes its callable schema separately from actual storage identity,
+so a synthetic backend can bind without claiming to contain an `Interface` object.
+The common endpoint and snapshot contracts are defined in
+[contracts and values](contracts.md#invocation-endpoints-and-call-snapshots).
 
 | Requirement | Initial binding rule |
 | --- | --- |
@@ -77,10 +98,13 @@ Retaining metadata is not itself a promise that every adapter supports it.
 sequenceDiagram
     participant U as Caller
     participant P as Typed view
+    participant E as Invocation endpoint
     participant F as Common call frame
     participant T as Bound target
     U->>P: update(int& output)
-    P->>F: Borrow output; retain its category
+    P->>F: Borrow output and retain its category
+    P->>E: Resolve current operation
+    E-->>P: Retained target and receiver snapshot
     F->>F: Validate runtime-dependent constraints
     F->>T: Invoke with adjusted receiver
     T->>U: Write to original output
@@ -94,6 +118,8 @@ argument builder so `T&`, `const T&`, and `T&&` behave consistently with runtime
 invocation. A typed reference return is still a C++ borrow; its validity must
 follow the underlying object's lifetime and mutation rules. Offer a retained-view
 operation when a caller needs lifetime extension.
+That operation retains the declared receiver, argument, or callable-context owner;
+it does not protect an element reference from invalidating mutations.
 
 A const proxy grants read-only access to its receiver. It does not make all
 objects reachable through pointer-valued members deeply const. Document that
@@ -116,5 +142,7 @@ Run the structural sample with both unrelated native implementations and a slot
 implementation. Verify mixed-return overloads, ref-qualified rejection/support,
 const requirements, failed rebinding, move behavior, and inherited receiver paths.
 Use the same out-parameter and move-only scenarios as runtime invocation.
+Bind two instances with one structural plan and prove their targets stay isolated.
+Replace a slot after binding and verify that the next call sees the replacement.
 
 Next: [dynamic composition](dynamic.md).

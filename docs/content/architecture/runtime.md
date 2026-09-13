@@ -4,6 +4,14 @@ Runtime services make descriptors discoverable and callable. They depend on the
 contract layer; native reflection generation is a producer, not a prerequisite
 for lookup. Proposed home: `refl/runtime/{registry,lookup,invoke}.hpp`.
 
+Checked invocation accepts the contract layer's endpoint and resolves a fresh
+call snapshot before entering user code. Native endpoints resolve descriptor
+operations and receiver paths; synthetic endpoints expose their callable schema
+and resolve backend operations without pretending to store that interface type.
+Both use the same validator. A structural binding plan can reuse operation
+selection, but it cannot cache a mutable slot's current target. Keep the snapshot
+alive through completion, including synchronous observation and result extraction.
+
 ## Registry as an application-owned catalog
 
 ```cpp
