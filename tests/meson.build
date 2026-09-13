@@ -48,7 +48,7 @@ test_hooks = executable(
 test('hooks_api', test_hooks)
 
 # Each extracted contract compiles by itself, without reflection extensions.
-foreach header : ['error', 'descriptor']
+foreach header : ['error', 'descriptor', 'type', 'value', 'call']
   assert(cpp.compiles(
     '#include <refl/core/' + header + '.hpp>\nint main() {}',
     include_directories: inc,
@@ -76,3 +76,21 @@ metadata_lifetime = executable(
   install: false,
 )
 test('metadata_lifetime', metadata_lifetime)
+
+call_contract = executable(
+  'test_call_contract', 'test_call_contract.cpp',
+  include_directories: inc,
+  cpp_args: ['-fno-reflection'],
+  override_options: ['cpp_std=c++23'],
+  install: false,
+)
+test('call_contract', call_contract)
+
+benchmark_calls = executable(
+  'benchmark_calls', 'benchmark_calls.cpp',
+  include_directories: inc,
+  cpp_args: ['-fno-reflection'],
+  override_options: ['cpp_std=c++23'],
+  install: false,
+)
+test('call_benchmark_smoke', benchmark_calls)

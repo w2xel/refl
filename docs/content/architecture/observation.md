@@ -1,6 +1,12 @@
 # Layer 6: Call observation
 
-`Observed<Source>` is an optional adapter over a source's dispatch handle and
+`Observed` now accepts a `DispatchHandle` and an explicit non-throwing error sink.
+Its method events use the shared invocation path. Subscription tokens, read-only
+views, listener snapshots, and retained-reference delivery are implemented and
+tested in the [prototype](current-state.md#call-contract-prototype-0a).
+Property events and generated typed facade integration remain pending.
+
+The remaining target design follows. `Observed<Source>` is an optional adapter over a source's dispatch handle and
 property operations, constructed by `observe(source, observer_error_sink)`.
 It depends on the common dispatch-handle contract and runtime checked invocation.
 `Dynamic` integration supplies its live dispatch handle; native dispatch can also

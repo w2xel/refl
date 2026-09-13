@@ -15,8 +15,9 @@ step 1 extracts metadata declarations and errors into independently compiled cor
 headers (commit `eb474e2`). The second completed slice gives public metadata handles const
 shared ownership, preserves raw-pointer construction through snapshots, and retains
 inherited lookup results. Eleven tests cover the suite, boundaries, and metadata
-lifetimes. Step 0a remains pending, as do the complete identity, value, and dispatch
-contracts in step 1. The [current-state page](current-state.md) records compatibility
+lifetimes. The step 0a call prototype now passes. Its production call primitives are reused
+by the next steps; its state provider remains a test fixture. Full identity/access
+validation and legacy API integration remain pending. The [current-state page](current-state.md) records compatibility
 changes and remaining global hierarchy dependencies.
 
 ## Proposed destination
