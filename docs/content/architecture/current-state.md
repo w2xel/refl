@@ -6,15 +6,15 @@ remaining chapters label their target contracts separately from this state.
 ## Core metadata boundary
 
 `refl/core/descriptor.hpp` contains the existing `ClassInfo`, `EnumInfo`, member
-records, and erased operation pointer aliases. It includes only standard-library
-headers and forward-declares `Object`. `refl/core/error.hpp` defines the existing
+records, native operation factories, and legacy operation pointer aliases. It includes
+standard-library and core headers and forward-declares `Object`. `refl/core/error.hpp` defines the existing
 `Error` enumeration and structured `Diagnostic`/`Result` types. Both compile as C++23 without
-reflection enabled. The public names and record layouts are unchanged.
+reflection enabled. Legacy record names remain; records now include type and member identity.
 
 `refl/refl.hpp` includes both headers as a compatibility umbrella. It still owns
-`Object`, generation, global pools, hierarchy lookup, and invocation. Describing
-metadata requires no registration or compiler reflection; generating native
-metadata and invoking operations still require the umbrella and C++26 reflection.
+`Object`, legacy generation, global pools, and hierarchy lookup. Native generation
+is in `reflect/native.hpp`; checked dispatch is in `runtime/invoke.hpp`. Only
+generation requires C++26 reflection.
 The records remain mutable construction data, and operation pointers do not own
 callable contexts or receivers. Publication copies records into const allocations.
 
@@ -73,10 +73,11 @@ and the three sample smoke tests. `metadata_lifetime` verifies each handle kind,
 raw-pointer snapshots, invalid indices, catalog replacement, inherited lookup,
 and native invocation after replacement. The Mockable suite verifies metadata
 survival after backend/proxy destruction and release after the final member.
-The full suite has fourteen entries, including core-contract conformance and the call prototype.
+The full suite has fifteen entries, including runtime/core conformance and the call prototype.
 
 Verification on 2026-09-13 uses GCC 16.2, C++26 reflection for existing APIs,
-optimization level 2, warnings as errors, static analysis, and LTO disabled.
+optimization level 2, warnings as errors, and LTO disabled. Static analysis is
+opt-in; see [build measurements](../getting-started.md#build-and-test).
 The complete suite and strict MkDocs build pass. Valgrind checks cover the new
 lifetime test and the Dyn, Mockable, and Hooks suites.
 
@@ -84,7 +85,7 @@ lifetime test and the Dyn, Mockable, and Hooks suites.
 
 The shared call path is in `core/{type,value,call}.hpp` and `runtime/invoke.hpp`.
 `extensions/observed.hpp` observes that path. All compile without reflection.
-`OwnedValue` holds new call results; legacy `Object` conversion is pending.
+`OwnedValue` holds call results; the legacy boundary converts these to `Object`.
 The generation/reset provider in `tests/prototype/source.hpp` is a test fixture.
 
 | Scenario | Evidence in `test_call_contract.cpp` |
@@ -125,10 +126,31 @@ still uses its legacy path; its conformance and cost checks land with typed bind
 | Typed extraction | Wrong result type fails before target execution |
 
 `tests/test_core_contracts.cpp` is the executable reference. `error.hpp` now contains
-structured diagnostics. `OwnedValue` remains the new owning call storage until
-legacy `Object` is translated at the runtime boundary.
+structured diagnostics. `OwnedValue` owns call storage and is translated to legacy `Object` at the runtime boundary.
+
+## Runtime call integration (2)
+
+Native constructors, methods, static methods, and supported field reads/writes use
+`CallTarget` and `CallFrame`. Generated legacy method trampolines use that same
+path. `Function::try_invoke(ObjectView, args...)` returns `Result<CallResult>`.
+`Function::invoke` keeps its `expected<Object, Error>` interface.
+
+| Call | Result |
+| --- | --- |
+| `update.invoke(object, out)` | Updates the caller's `out` |
+| `update.try_invoke(borrow_const(value), out)` | Read-only diagnostic; no target effect |
+| `consume.invoke(object, pointer)` | Rejects a move-only lvalue |
+| `consume.invoke(object, std::move(pointer))` | Consumes the pointer |
+| Target throws `std::bad_cast` | Original exception propagates |
+
+The strict checked API does not infer reference provenance. The legacy `invoke`
+translation keeps its receiver-anchor policy for compatibility. Const reference
+results remain read-only through checked casts. Legacy raw pointers remain an
+unchecked backend boundary. Typed forwarding still needs the binding migration.
+Native generation is in `reflect/native.hpp`; publication and global hierarchy
+lookup are separated in the next step. `runtime_contracts` verifies this boundary.
 
 ## Migration status
 
-The prototype and core contracts are implemented. Legacy call integration,
-independent registries, and shared typed binding remain the next three steps. Production dynamic state and property observation remain later work.
+The prototype, core contracts, and native runtime call integration are implemented.
+Independent registries and shared typed binding remain the next two steps. Production dynamic state and property observation remain later work.

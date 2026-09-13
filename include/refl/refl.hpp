@@ -21,6 +21,9 @@
 #include <refl/core/descriptor.hpp>
 #include <refl/core/error.hpp>
 
+#include <refl/reflect/native.hpp>
+#include <refl/runtime/invoke.hpp>
+
 #include <meta>
 #include <algorithm>
 #include <array>
@@ -178,8 +181,7 @@ consteval bool is_consteval_fn(std::meta::info Fn) {
 // suffixes " const" on the function type (e.g. "int() const").  Same
 // display-string-parsing approach as is_consteval_fn above.
 consteval bool is_const_method(std::meta::info m) {
-    return std::meta::display_string_of(std::meta::type_of(m))
-               .ends_with(" const");
+    return std::meta::is_const(m);
 }
 
 // Shared member filters — used by both make_info (refl core) and Dyn<T>'s
@@ -187,10 +189,7 @@ consteval bool is_const_method(std::meta::info m) {
 // (it needs named struct fields); make_info also accepts operators
 // (has_identifier || is_operator_function).
 consteval bool is_public_method(std::meta::info m) {
-    return std::meta::is_function(m)
-        && std::meta::is_public(m)
-        && !std::meta::is_deleted(m)
-        && !is_consteval_fn(m);
+    return reflect_detail::public_method(m);
 }
 
 consteval bool is_public_data_member(std::meta::info m) {
@@ -321,6 +320,8 @@ std::shared_ptr<const ClassInfo> ensure_class_info() {
     static std::shared_ptr<const ClassInfo> info = [] {
         auto ci = std::make_shared<ClassInfo>();
         ci->name = std::string(type_name<T>());
+        ci->identity = type_id<T>();
+        ci->make_view = &reflect_detail::native_view<T>;
         return ci;
     }();
     return info;
@@ -499,6 +500,12 @@ public:
     // constructed (invalid) Objects.
     std::shared_ptr<const ClassInfo> class_info() const { return class_info_; }
 
+    ObjectView view() const {
+        if (!valid() || !class_info_ || !class_info_->make_view) return {};
+        return detail::ViewAccess::attach(class_info_->make_view(ptr_, owner_, read_only_), class_info_);
+    }
+    bool read_only() const { return read_only_; }
+    Object as_const() const { auto copy = *this; copy.read_only_ = true; return copy; }
     bool is_owned() const { return static_cast<bool>(owner_); }
 
     bool is_class(std::string_view name) const {
@@ -516,7 +523,8 @@ public:
     std::expected<std::shared_ptr<T>, Error> cast_safe() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!is_owned()) return std::unexpected(Error::NotOwned);
-        const auto tname = detail::type_name<T>();
+        if (read_only_ && !std::is_const_v<T>) return std::unexpected(Error::ReadOnly);
+        const auto tname = detail::type_name<std::remove_const_t<T>>();
         auto off = detail::upcast_offset(class_name(), tname);
         if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
@@ -531,7 +539,8 @@ public:
     template <typename T>
     std::expected<T*, Error> cast_ref() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
-        const auto tname = detail::type_name<T>();
+        if (read_only_ && !std::is_const_v<T>) return std::unexpected(Error::ReadOnly);
+        const auto tname = detail::type_name<std::remove_const_t<T>>();
         auto off = detail::upcast_offset(class_name(), tname);
         if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
@@ -579,6 +588,7 @@ private:
     std::shared_ptr<void> owner_;
     void* ptr_ = nullptr;
     std::shared_ptr<const ClassInfo> class_info_;
+    bool read_only_ = false;
 
     friend class Function;
     friend class Field;
@@ -596,6 +606,83 @@ namespace detail {
 // used because the reference may be const-qualified).  Call-scoped only.
 Object borrow_object(void* ptr, std::shared_ptr<const ClassInfo> info) {
     return Object(ptr, std::move(info));
+}
+
+inline Error legacy_error(Diagnostic diagnostic) {
+    switch (diagnostic.code) {
+        case DiagnosticCode::not_found: return Error::NotFound;
+        case DiagnosticCode::null_handle: return Error::NullHandle;
+        case DiagnosticCode::arity_mismatch: return Error::ArityMismatch;
+        case DiagnosticCode::read_only: return Error::ReadOnly;
+        case DiagnosticCode::missing_anchor: return Error::NotOwned;
+        case DiagnosticCode::ambiguous: return Error::Ambiguous;
+        default: return Error::TypeError;
+    }
+}
+inline Object legacy_result(CallResult result, std::shared_ptr<const ClassInfo> info) {
+    if (std::holds_alternative<VoidResult>(result)) return {};
+    auto view = result_view(result);
+    if (auto registered = lookup_class_info(info->name)) info = std::move(registered);
+    auto* pointer = const_cast<void*>(view.address());
+    Object object = view.anchor()
+        ? Object(std::shared_ptr<void>(view.anchor(), pointer), pointer, std::move(info))
+        : borrow_object(pointer, std::move(info));
+    return view.read_only() ? object.as_const() : object;
+}
+inline const NativeOperation* operation(const ClassInfo& info, MemberId member, OperationKind kind) {
+    for (const auto& candidate : info.operations)
+        if (candidate.descriptor.member == member && candidate.descriptor.operation == kind) return &candidate;
+    return nullptr;
+}
+template<class A> ArgumentView native_argument(A&& value) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<A>, Object>)
+        return {value.view(), std::is_lvalue_reference_v<A> ? ValueCategory::lvalue : ValueCategory::consumable};
+    else if constexpr (std::is_same_v<std::remove_cvref_t<A>, ArgumentView>) return value;
+    else if constexpr (std::is_same_v<std::remove_cvref_t<A>, ObjectView>) return {value, ValueCategory::lvalue};
+    else {
+        auto arg = argument(std::forward<A>(value));
+        arg.object = ViewAccess::attach(arg.object, ensure_class_info<std::remove_cvref_t<A>>());
+        return arg;
+    }
+}
+inline Result<ObjectView> project_legacy_view(ObjectView view, const ClassInfo& declaring) {
+    if (view.type().type == declaring.identity) return view;
+    if (!view.native_descriptor() || !declaring.make_view)
+        return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch});
+    auto offset = upcast_offset(view.native_descriptor()->name, declaring.name);
+    if (!offset) return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch});
+    return declaring.make_view(static_cast<char*>(const_cast<void*>(view.address())) + *offset,
+                               view.anchor(), view.read_only());
+}
+inline void project_legacy_arguments(std::span<ArgumentView> arguments, const Signature& signature) {
+    if (arguments.size() != signature.parameters.size()) return;
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        if (arguments[i].object.type().type == signature.parameters[i].type) continue;
+        std::shared_ptr<const ClassInfo> expected;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex());
+            for (const auto& [name, info] : class_pool())
+                if (info->identity == signature.parameters[i].type) { expected = info; break; }
+        }
+        if (expected) {
+            auto converted = project_legacy_view(arguments[i].object, *expected);
+            if (converted) arguments[i].object = *converted;
+        }
+    }
+}
+inline Result<CallResult> invoke_native(const NativeOperation& operation, const ClassInfo& declaring,
+                                        ObjectView receiver, std::span<ArgumentView> args,
+                                        TargetOptions options = {}) {
+    if (receiver.valid()) {
+        auto adjusted = project_legacy_view(receiver, declaring);
+        if (!adjusted) return std::unexpected(adjusted.error());
+        receiver = *adjusted;
+    }
+    auto target = operation.bind(receiver, std::move(options));
+    if (!target) return std::unexpected(target.error());
+    project_legacy_arguments(args, target->signature());
+    CallFrame frame{receiver, args};
+    return invoke_target(*target, frame, operation.descriptor.member, ExportKind::erased);
 }
 
 // Build an Object from argument I.  Non-const lvalue args borrow the
@@ -621,19 +708,13 @@ std::expected<const Object*, Error>
 prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
              std::array<Object, sizeof...(Args)>& refs,
              std::size_t param_count, Args&&... args) {
+    (void)storage; // Kept in the legacy signature during migration.
     if (sizeof...(Args) != param_count)
         return std::unexpected(Error::ArityMismatch);
-    if constexpr (sizeof...(Args) == 0) {
-        return nullptr;
-    } else {
-        storage.emplace(std::forward<Args>(args)...);
-        auto fwd = std::forward_as_tuple(args...);
-        [&]<std::size_t... I>(std::index_sequence<I...>) {
-            using Tuple = std::tuple<std::decay_t<Args>...>;
-            using ArgTuple = std::tuple<Args...>;
-            ((refs[I] = make_arg_ref<I, Tuple, std::tuple_element_t<I, ArgTuple>>(
-                           *storage, std::get<I>(fwd))), ...);
-        }(std::make_index_sequence<sizeof...(Args)>{});
+    if constexpr (sizeof...(Args) == 0) return nullptr;
+    else {
+        std::size_t index = 0;
+        ((refs[index++] = Object(std::forward<Args>(args))), ...);
         return refs.data();
     }
 }
@@ -688,34 +769,21 @@ Object factory(const Object* args) {
 }
 
 template <typename T, std::meta::info Fn>
-Object invoker(const std::shared_ptr<void>& owner, void* obj,
-               const Object* args) {
-    auto* target = static_cast<T*>(obj);
-    auto mfn = &[:Fn:];
-    static constexpr auto params = std::define_static_array(
-        std::meta::parameters_of(Fn));
-    constexpr std::size_t n = params.size();
-    using R = [:std::meta::return_type_of(Fn):];
-    using RStore = std::remove_cvref_t<R>;
-
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) -> decltype(auto) {
-        using P = [:std::meta::type_of(params[J]):];
-        return extract_arg<P>(args, J);
-    };
-
-    return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
-        if constexpr (std::is_void_v<R>) {
-            (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
-            return Object{};
-        } else if constexpr (std::is_reference_v<R>) {
-            auto& ref = (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...);
-            return Object(owner, std::addressof(ref), detail::ensure_class_info<RStore>());
-        } else {
-            return Object(std::make_shared<RStore>(
-                (target->*mfn)(extract(std::integral_constant<std::size_t, I>{})...)),
-                detail::ensure_class_info<RStore>());
-        }
-    }(std::make_index_sequence<n>{});
+Object invoker(const std::shared_ptr<void>& owner, void* obj, const Object* args) {
+    static const auto operation = reflect_detail::method<T, Fn>();
+    constexpr auto count = std::meta::parameters_of(Fn).size();
+    std::array<ArgumentView, count> arguments;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto parameter = operation.descriptor.signature.parameters[i];
+        const bool consume = parameter.reference == ReferenceKind::rvalue || !parameter.copyable;
+        arguments[i] = {args[i].view(), consume ? ValueCategory::consumable : ValueCategory::lvalue};
+    }
+    auto info = ensure_class_info<T>();
+    auto receiver = ViewAccess::attach(reflect_detail::native_view<T>(obj, owner, false), info);
+    auto result = invoke_native(operation, *info, receiver, arguments,
+                                {.result_lifetime = ResultLifetime::receiver});
+    if (!result) throw ReflectionError(result.error());
+    return legacy_result(std::move(*result), operation.result_descriptor());
 }
 
 template <typename T, std::meta::info Member>
@@ -790,31 +858,18 @@ std::shared_ptr<void> clone(void* obj) {
 
 template <std::meta::info Fn>
 Object static_invoker(const Object* args) {
-    auto fn = &[:Fn:];
-    static constexpr auto params = std::define_static_array(
-        std::meta::parameters_of(Fn));
-    constexpr std::size_t n = params.size();
-    using R = [:std::meta::return_type_of(Fn):];
-    using RStore = std::remove_cvref_t<R>;
-
-    auto extract = [&]<std::size_t J>(std::integral_constant<std::size_t, J>) -> decltype(auto) {
-        using P = [:std::meta::type_of(params[J]):];
-        return extract_arg<P>(args, J);
-    };
-
-    return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
-        if constexpr (std::is_void_v<R>) {
-            fn(extract(std::integral_constant<std::size_t, I>{})...);
-            return Object{};
-        } else if constexpr (std::is_reference_v<R>) {
-            auto& ref = fn(extract(std::integral_constant<std::size_t, I>{})...);
-            return borrow_object(std::addressof(ref), detail::ensure_class_info<RStore>());
-        } else {
-            return Object(std::make_shared<RStore>(
-                fn(extract(std::integral_constant<std::size_t, I>{})...)),
-                detail::ensure_class_info<RStore>());
-        }
-    }(std::make_index_sequence<n>{});
+    using T = [:std::meta::parent_of(Fn):];
+    static const auto operation = reflect_detail::method<T, Fn>();
+    constexpr auto count = std::meta::parameters_of(Fn).size();
+    std::array<ArgumentView, count> arguments;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto parameter = operation.descriptor.signature.parameters[i];
+        const bool consume = parameter.reference == ReferenceKind::rvalue || !parameter.copyable;
+        arguments[i] = {args[i].view(), consume ? ValueCategory::consumable : ValueCategory::lvalue};
+    }
+    auto result = invoke_native(operation, *ensure_class_info<T>(), {}, arguments);
+    if (!result) throw ReflectionError(result.error());
+    return legacy_result(std::move(*result), operation.result_descriptor());
 }
 
 template <typename Fn, typename... CallArgs>
@@ -842,6 +897,7 @@ template <typename T>
 ClassInfo RegistrarHolder<T>::make_info() {
     ClassInfo info;
     info.name = std::string(std::meta::display_string_of(^^T));
+    reflect_detail::populate_operations<T>(info);
 
     // Base classes — store name + byte offset within T.
     // Only public bases are stored, so the base-hierarchy helpers (used by
@@ -877,6 +933,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             using MemberBare = std::remove_cvref_t<MemberType>;
 
             fi.is_const = std::is_const_v<MemberType>;
+            fi.member = member_id<m>();
 
             // Getter: only for copy-constructible members (getter copies
             // into a shared_ptr).  Move-only members are get_ref-only.
@@ -915,6 +972,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             using MemberBare = std::remove_cvref_t<MemberType>;
 
             fi.is_const = std::is_const_v<MemberType>;
+            fi.member = member_id<m>();
 
             // Capture the address for get_ref.  const static members may
             // lack an out-of-line definition (static const int with an
@@ -964,12 +1022,14 @@ ClassInfo RegistrarHolder<T>::make_info() {
             if constexpr (n == 0) {
                 ConstructorInfo ci;
                 ci.factory = &detail::factory<T, m>;
+                ci.member = member_id<m>();
                 info.constructors.push_back(std::move(ci));
             } else if constexpr (n == 1) {
                 using P0 = [:std::meta::type_of(params[0]):];
                 if constexpr (!std::is_same_v<std::remove_cvref_t<P0>, T>) {
                     ConstructorInfo ci;
                     ci.factory = &detail::factory<T, m>;
+                ci.member = member_id<m>();
                     template for (constexpr auto p : params) {
                         ci.param_types.emplace_back(
                             detail::normalize_type(
@@ -980,6 +1040,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             } else if constexpr (n >= 2) {
                 ConstructorInfo ci;
                 ci.factory = &detail::factory<T, m>;
+                ci.member = member_id<m>();
                 template for (constexpr auto p : params) {
                     ci.param_types.emplace_back(
                             detail::normalize_type(
@@ -1008,9 +1069,14 @@ ClassInfo RegistrarHolder<T>::make_info() {
                 // Static member function — no obj pointer.
                 StaticFunctionInfo fi;
                 fi.name = fname;
+                fi.member = member_id<m>();
+                using CompleteSignature = [:std::meta::type_of(m):];
+                fi.signature = signature_of<CompleteSignature>();
                 fi.return_type = std::string(
                     std::meta::display_string_of(std::meta::return_type_of(m)));
-                fi.invoker = &detail::static_invoker<m>;
+                if constexpr (supported_signature(signature_of<CompleteSignature>()))
+                    fi.invoker = &detail::static_invoker<m>;
+                else fi.invoker = nullptr;
                 template for (constexpr auto p : fparams) {
                     fi.param_types.emplace_back(
                         detail::normalize_type(
@@ -1020,10 +1086,15 @@ ClassInfo RegistrarHolder<T>::make_info() {
             } else {
                 FunctionInfo fi;
                 fi.name = fname;
+                fi.member = member_id<m>();
+                using CompleteSignature = [:std::meta::type_of(m):];
+                fi.signature = signature_of<CompleteSignature>();
                 fi.is_const = detail::is_const_method(m);
                 fi.return_type = std::string(
                     std::meta::display_string_of(std::meta::return_type_of(m)));
-                fi.invoker = &detail::invoker<T, m>;
+                if constexpr (supported_signature(signature_of<CompleteSignature>()))
+                    fi.invoker = &detail::invoker<T, m>;
+                else fi.invoker = nullptr;
                 template for (constexpr auto p : fparams) {
                     fi.param_types.emplace_back(
                         detail::normalize_type(
@@ -1088,6 +1159,12 @@ public:
     std::expected<Object, Error> call(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& ci = owner_->constructors[idx_];
+        if (auto native = detail::operation(*owner_, ci.member, OperationKind::construct)) {
+            std::array<ArgumentView, sizeof...(Args)> arguments{detail::native_argument(std::forward<Args>(args))...};
+            auto result = detail::invoke_native(*native, *owner_, {}, arguments);
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return detail::legacy_result(std::move(*result), native->result_descriptor());
+        }
         std::optional<std::tuple<std::decay_t<Args>...>> storage;
         std::array<Object, sizeof...(Args)> refs;
         auto args_ptr = detail::prepare_args(storage, refs,
@@ -1135,6 +1212,13 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         const auto& fi = owner_->functions[idx_];
+        if (auto native = detail::operation(*owner_, fi.member, OperationKind::method)) {
+            std::array<ArgumentView, sizeof...(Args)> arguments{detail::native_argument(std::forward<Args>(args))...};
+            auto result = detail::invoke_native(*native, *owner_, obj.view(), arguments,
+                {.result_lifetime = ResultLifetime::receiver});
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return detail::legacy_result(std::move(*result), native->result_descriptor());
+        }
         std::optional<std::tuple<std::decay_t<Args>...>> storage;
         std::array<Object, sizeof...(Args)> refs;
         auto args_ptr = detail::prepare_args(storage, refs,
@@ -1145,6 +1229,16 @@ public:
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(fi.invoker, obj.owner(), adj, *args_ptr);
     }
+
+    template<class... A> Result<CallResult> try_invoke(ObjectView receiver, A&&... values) const {
+        if (!valid()) return std::unexpected(Diagnostic{DiagnosticCode::null_handle});
+        auto native = detail::operation(*owner_, owner_->functions[idx_].member, OperationKind::method);
+        if (!native) return std::unexpected(Diagnostic{DiagnosticCode::unsupported});
+        std::array<ArgumentView, sizeof...(A)> arguments{detail::native_argument(std::forward<A>(values))...};
+        return detail::invoke_native(*native, *owner_, receiver, arguments);
+    }
+    const Signature& signature() const { return owner_->functions[idx_].signature; }
+    MemberId member() const { return owner_->functions[idx_].member; }
 
     bool valid() const { return owner_ && idx_ < owner_->functions.size(); }
     explicit operator bool() const { return valid(); }
@@ -1178,6 +1272,11 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         if (!has_getter()) return std::unexpected(Error::NotCopyable);
+        if (auto native = detail::operation(*owner_, owner_->fields[idx_].member, OperationKind::read)) {
+            auto result = detail::invoke_native(*native, *owner_, obj.view(), {});
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return detail::legacy_result(std::move(*result), native->result_descriptor());
+        }
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(owner_->fields[idx_].getter, adj);
@@ -1194,7 +1293,7 @@ public:
     std::expected<void*, Error> get_ref(Object obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
-        if (is_const()) return std::unexpected(Error::ReadOnly);
+        if (is_const() || obj.read_only()) return std::unexpected(Error::ReadOnly);
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<char*>(adj) + owner_->fields[idx_].offset;
@@ -1210,6 +1309,7 @@ public:
     std::expected<T*, Error> get_ref(Object obj) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
+        if (obj.read_only() && !std::is_const_v<T>) return std::unexpected(Error::ReadOnly);
         if (detail::type_name<T>() != owner_->fields[idx_].type)
             return std::unexpected(Error::TypeError);
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
@@ -1227,7 +1327,13 @@ public:
     std::expected<void, Error> set(Object obj, V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
-        if (!has_setter()) return std::unexpected(Error::ReadOnly);
+        if (!has_setter() || obj.read_only()) return std::unexpected(Error::ReadOnly);
+        if (auto native = detail::operation(*owner_, owner_->fields[idx_].member, OperationKind::write)) {
+            std::array arguments{detail::native_argument(std::forward<V>(val))};
+            auto result = detail::invoke_native(*native, *owner_, obj.view(), arguments);
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return {};
+        }
         void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         std::decay_t<V> storage(std::forward<V>(val));
@@ -1267,6 +1373,11 @@ public:
     std::expected<Object, Error> get() const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!has_getter()) return std::unexpected(Error::NotCopyable);
+        if (auto native = detail::operation(*owner_, owner_->static_fields[idx_].member, OperationKind::read)) {
+            auto result = detail::invoke_native(*native, *owner_, {}, {});
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return detail::legacy_result(std::move(*result), native->result_descriptor());
+        }
         return detail::checked_call(owner_->static_fields[idx_].getter);
     }
 
@@ -1305,6 +1416,12 @@ public:
     std::expected<void, Error> set(V&& val) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!has_setter()) return std::unexpected(Error::ReadOnly);
+        if (auto native = detail::operation(*owner_, owner_->static_fields[idx_].member, OperationKind::write)) {
+            std::array arguments{detail::native_argument(std::forward<V>(val))};
+            auto result = detail::invoke_native(*native, *owner_, {}, arguments);
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return {};
+        }
         std::decay_t<V> storage(std::forward<V>(val));
         Object val_ref(storage);
         return detail::checked_call(owner_->static_fields[idx_].setter,
@@ -1347,6 +1464,12 @@ public:
     std::expected<Object, Error> invoke(Args&&... args) const {
         if (!valid()) return std::unexpected(Error::NullHandle);
         const auto& sf = owner_->static_functions[idx_];
+        if (auto native = detail::operation(*owner_, sf.member, OperationKind::method)) {
+            std::array<ArgumentView, sizeof...(Args)> arguments{detail::native_argument(std::forward<Args>(args))...};
+            auto result = detail::invoke_native(*native, *owner_, {}, arguments);
+            if (!result) return std::unexpected(detail::legacy_error(result.error()));
+            return detail::legacy_result(std::move(*result), native->result_descriptor());
+        }
         std::optional<std::tuple<std::decay_t<Args>...>> storage;
         std::array<Object, sizeof...(Args)> refs;
         auto args_ptr = detail::prepare_args(storage, refs,

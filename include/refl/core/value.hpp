@@ -8,6 +8,8 @@
 #include <variant>
 
 namespace refl {
+struct ClassInfo;
+namespace detail { struct ViewAccess; }
 using LifetimeAnchor = std::shared_ptr<const void>;
 enum class ValueCategory { lvalue, consumable };
 
@@ -16,6 +18,8 @@ class ObjectView {
     TypeUse type_ = {};
     LifetimeAnchor anchor_;
     TypeHandle descriptor_;
+    std::shared_ptr<const ClassInfo> native_;
+    friend struct detail::ViewAccess;
 public:
     ObjectView() = default;
     template<class T> static ObjectView from(T& value, LifetimeAnchor anchor = {}) {
@@ -30,6 +34,7 @@ public:
     bool valid() const { return address_ != nullptr; }
     TypeUse type() const { return type_; }
     const TypeHandle& descriptor() const { return descriptor_; }
+    const std::shared_ptr<const ClassInfo>& native_descriptor() const { return native_; }
     const void* address() const { return address_; }
     const LifetimeAnchor& anchor() const { return anchor_; }
     bool read_only() const { return is_const(type_.qualifiers); }
@@ -47,6 +52,15 @@ public:
         return static_cast<T*>(const_cast<void*>(address_));
     }
 };
+namespace detail {
+// Trusted bridge for generated metadata and the legacy erased API.
+struct ViewAccess {
+    static ObjectView attach(ObjectView view, std::shared_ptr<const ClassInfo> descriptor) {
+        view.native_ = std::move(descriptor);
+        return view;
+    }
+};
+}
 template<class T> ObjectView borrow(T& value) { return ObjectView::from(value); }
 template<class T> ObjectView borrow_const(const T& value) { return ObjectView::from(value); }
 struct ArgumentView {
@@ -63,6 +77,12 @@ class OwnedValue {
     ObjectView view_;
 public:
     OwnedValue() = default;
+    template<class T, class... A> static OwnedValue construct(A&&... args) {
+        auto owner = std::make_shared<T>(std::forward<A>(args)...);
+        OwnedValue result;
+        result.view_ = ObjectView::from(*owner, owner);
+        return result;
+    }
     template<class T> static OwnedValue from(T&& value) {
         auto owner = std::make_shared<std::remove_cvref_t<T>>(std::forward<T>(value));
         OwnedValue result;

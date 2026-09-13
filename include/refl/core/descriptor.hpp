@@ -1,6 +1,7 @@
 // Metadata records and erased operation declarations; no registration policy.
 #pragma once
 
+#include <refl/core/call.hpp>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -42,6 +43,8 @@ using CloneFn         = std::shared_ptr<void> (*)(void* obj);
 struct ConstructorInfo {
     std::vector<std::string> param_types;
     FactoryFn factory;
+    MemberId member = {};
+    Signature signature = {};
 };
 
 struct FunctionInfo {
@@ -50,6 +53,8 @@ struct FunctionInfo {
     std::string return_type;
     InvokerFn invoker;
     bool is_const = false;
+    MemberId member = {};
+    Signature signature = {};
 };
 
 struct StaticFunctionInfo {
@@ -57,6 +62,8 @@ struct StaticFunctionInfo {
     std::vector<std::string> param_types;
     std::string return_type;
     StaticInvokerFn invoker;
+    MemberId member = {};
+    Signature signature = {};
 };
 
 struct FieldInfo {
@@ -66,6 +73,8 @@ struct FieldInfo {
     GetterFn getter;        // nullptr if move-only (not copy-constructible)
     SetterFn setter;        // nullptr for const / not move-assignable
     bool is_const;          // true for const-qualified members
+    MemberId member = {};
+    Signature signature = {};
 };
 
 struct StaticFieldInfo {
@@ -75,8 +84,17 @@ struct StaticFieldInfo {
     StaticGetterFn getter;
     StaticSetterFn setter;  // nullptr for const / not move-assignable
     bool is_const;          // true for const-qualified members
+    MemberId member = {};
+    Signature signature = {};
 };
 
+struct ClassInfo;
+struct NativeOperation {
+    OperationDescriptor descriptor;
+    std::function<Result<CallTarget>(ObjectView, TargetOptions)> bind;
+    std::function<std::shared_ptr<const ClassInfo>()> result_descriptor;
+};
+using NativeViewFn = ObjectView (*)(void*, LifetimeAnchor, bool);
 struct BaseInfo {
     std::string name;
     std::ptrdiff_t offset;  // byte offset of this base within the derived class
@@ -90,6 +108,10 @@ struct ClassInfo {
     std::vector<ConstructorInfo> constructors;
     std::vector<FunctionInfo> functions;
     std::vector<StaticFunctionInfo> static_functions;
+    TypeId identity = {};
+    NativeViewFn make_view = nullptr;
+    std::vector<NativeOperation> operations = {};
+    std::vector<std::string> unsupported_members = {};
     CloneFn clone = nullptr;  // nullptr if T is not copy-constructible
 };
 

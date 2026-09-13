@@ -61,11 +61,11 @@ template<class S> struct signature_traits;
 template<class R, class... A> struct signature_traits<R(A...)> {
     using result = R;
     using arguments = std::tuple<A...>;
-    static Signature signature() { return {{type_use<A>()...}, type_use<R>(), {}, false}; }
+    static constexpr Signature signature() { return {{type_use<A>()...}, type_use<R>(), {}, false}; }
 };
 #define REFL_SIGNATURE_QUALIFIERS(Q, CV, REF, NOEX) \
     template<class R, class... A> struct signature_traits<R(A...) Q> : signature_traits<R(A...)> { \
-        static Signature signature() { return {{type_use<A>()...}, type_use<R>(), {CV, REF}, NOEX}; } \
+        static constexpr Signature signature() { return {{type_use<A>()...}, type_use<R>(), {CV, REF}, NOEX}; } \
     };
 REFL_SIGNATURE_QUALIFIERS(noexcept, Cv::none, ReferenceKind::none, true)
 REFL_SIGNATURE_QUALIFIERS(&, Cv::none, ReferenceKind::lvalue, false)
@@ -128,5 +128,5 @@ inline bool compatible_signature(const Signature& required, const Signature& act
         (!is_const(required.receiver.qualifiers) || is_const(actual.receiver.qualifiers)) &&
         (!required.is_noexcept || actual.is_noexcept);
 }
-template<class S> Signature signature_of() { return detail::signature_traits<S>::signature(); }
+template<class S> constexpr Signature signature_of() { return detail::signature_traits<S>::signature(); }
 }

@@ -9,6 +9,13 @@ handle. Global pools and name-based base relationships remain in `refl/refl.hpp`
 local registries and an independent invocation service are not implemented. The
 [implemented architecture](current-state.md) documents these boundaries and tests.
 
+## Implemented checked invocation
+
+`runtime/invoke.hpp` consumes core contracts without registry or reflection headers.
+Native operations and legacy method trampolines use its validator and result
+capture. The [runtime examples](current-state.md#runtime-call-integration-2) show
+argument consumption, const access, and compatibility behavior.
+
 ## Remaining runtime destination
 
 The target runtime makes descriptors discoverable and callable. It depends on core

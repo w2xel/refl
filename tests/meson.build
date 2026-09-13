@@ -103,3 +103,7 @@ core_contracts = executable(
   install: false,
 )
 test('core_contracts', core_contracts)
+
+runtime_contracts = executable('test_runtime_contracts', 'test_runtime_contracts.cpp',
+  include_directories: inc, install: false)
+test('runtime_contracts', runtime_contracts)

@@ -17,7 +17,8 @@ shared ownership, preserves raw-pointer construction through snapshots, and reta
 inherited lookup results. Eleven tests cover the suite, boundaries, and metadata
 lifetimes. The step 0a call prototype now passes. Its production call primitives are reused
 by the next steps; its state provider remains a test fixture. Core identity/access
-validation is complete. Legacy API integration is the next step. The [current-state page](current-state.md) records compatibility
+validation is complete. Native runtime calls now use common frames and owned targets. Independent
+registries and shared typed binding are the next steps. The [current-state page](current-state.md) records compatibility
 changes and remaining global hierarchy dependencies.
 
 ## Proposed destination

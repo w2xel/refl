@@ -23,7 +23,7 @@ struct CallFrame {
     ObjectView receiver = {};
     std::span<const ArgumentView> arguments;
 };
-inline bool supported_signature(const Signature& signature) {
+constexpr bool supported_signature(const Signature& signature) {
     if (is_volatile(signature.receiver.qualifiers) || signature.receiver.reference != ReferenceKind::none)
         return false;
     if (is_volatile(signature.result.qualifiers) || signature.result.reference == ReferenceKind::rvalue)
@@ -73,6 +73,18 @@ public:
     const TargetOptions& options() const { return record_->options; }
     // The runtime validator is the only public invocation entry point.
     friend Result<CallResult> invoke_target(const CallTarget&, CallFrame&, MemberId, ExportKind);
+    template<class T, class... A> static Result<CallTarget> constructor() {
+        CallTarget target;
+        TargetOptions options;
+        options.operation = OperationKind::construct;
+        target.record_ = std::make_shared<const Record>(signature_of<T(A...)>(), options,
+            [](CallFrame& frame) -> CallResult {
+                return [&]<std::size_t... I>(std::index_sequence<I...>) -> CallResult {
+                    return OwnedValue::construct<T>(detail::call_argument<A>(frame.arguments[I])...);
+                }(std::index_sequence_for<A...>{});
+            });
+        return target;
+    }
     template<class S, class F> static Result<CallTarget> make(F&& callable, TargetOptions options = {}) {
         using Traits = detail::signature_traits<S>;
         using R = typename Traits::result;
