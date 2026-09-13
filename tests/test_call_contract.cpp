@@ -25,6 +25,13 @@ struct ThrowingMove {
     ThrowingMove(const ThrowingMove&) = delete;
     ThrowingMove(ThrowingMove&&) { if (++moves == fail_on) throw 7; }
 };
+refl::DispatchHandle single_source(refl::MemberId member, refl::CallTarget target) {
+    auto schema = std::make_shared<const refl::InterfaceSchema>(refl::InterfaceSchema{
+        {member, "single", target.signature(), target.options().operation}});
+    return {schema, [target](auto) -> refl::Result<refl::ResolvedCall> {
+        return refl::ResolvedCall{target, {}, {}};
+    }};
+}
 int main() {
     auto schema = std::make_shared<const refl::InterfaceSchema>(refl::InterfaceSchema{
         {update, "update", refl::signature_of<void(int&)>()},
@@ -118,13 +125,13 @@ int main() {
     refl::try_call<void>(live, update, n).value(); check(n == 6);
     // Move-only input requires an explicit rvalue.
     auto consume = refl::make_target<int(std::unique_ptr<int>)>([](auto p) { return *p; }).value();
-    refl::DispatchHandle consume_source(schema, [consume](auto) -> refl::Result<refl::ResolvedCall> { return refl::ResolvedCall{consume, {}, {}}; });
+    auto consume_source = single_source(value, consume);
     auto input = std::make_unique<int>(55);
     check(!refl::try_call<int>(consume_source, value, input) && input);
     check(refl::try_call<int>(consume_source, value, std::move(input)).value() == 55 && !input);
     // Capture failure follows target effects; extraction failure follows delivery.
     auto throwing = refl::make_target<ThrowingMove()>([&] { ++calls; return ThrowingMove{}; }).value();
-    refl::DispatchHandle throwing_source(schema, [throwing](auto) -> refl::Result<refl::ResolvedCall> { return refl::ResolvedCall{throwing, {}, {}}; });
+    auto throwing_source = single_source(value, throwing);
     auto observed_throw = refl::observe(throwing_source, [](std::exception_ptr) noexcept {});
     auto on_throw = observed_throw.after(value, [&](const auto&) { ++events; });
     auto old_events = events;
@@ -137,9 +144,7 @@ int main() {
     check(events == old_events + 1);
     // Argument materialization can fail before user code or event delivery.
     auto prepare = refl::make_target<void(ThrowingCopy)>([&](auto) { ++calls; }).value();
-    refl::DispatchHandle prepare_source(schema, [prepare](auto) -> refl::Result<refl::ResolvedCall> {
-        return refl::ResolvedCall{prepare, {}, {}};
-    });
+    auto prepare_source = single_source(update, prepare);
     auto observed_prepare = refl::observe(prepare_source, [](std::exception_ptr) noexcept {});
     auto on_prepare = observed_prepare.after(update, [&](const auto&) { ++events; });
     ThrowingCopy copy;

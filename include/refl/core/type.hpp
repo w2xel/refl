@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -66,16 +67,66 @@ template<class R, class... A> struct signature_traits<R(A...)> {
     template<class R, class... A> struct signature_traits<R(A...) Q> : signature_traits<R(A...)> { \
         static Signature signature() { return {{type_use<A>()...}, type_use<R>(), {CV, REF}, NOEX}; } \
     };
-REFL_SIGNATURE_QUALIFIERS(const, Cv::constant, ReferenceKind::none, false)
-REFL_SIGNATURE_QUALIFIERS(volatile, Cv::volatile_, ReferenceKind::none, false)
-REFL_SIGNATURE_QUALIFIERS(const volatile, Cv::constant_volatile, ReferenceKind::none, false)
-REFL_SIGNATURE_QUALIFIERS(&, Cv::none, ReferenceKind::lvalue, false)
-REFL_SIGNATURE_QUALIFIERS(const &, Cv::constant, ReferenceKind::lvalue, false)
-REFL_SIGNATURE_QUALIFIERS(&&, Cv::none, ReferenceKind::rvalue, false)
-REFL_SIGNATURE_QUALIFIERS(const &&, Cv::constant, ReferenceKind::rvalue, false)
 REFL_SIGNATURE_QUALIFIERS(noexcept, Cv::none, ReferenceKind::none, true)
+REFL_SIGNATURE_QUALIFIERS(&, Cv::none, ReferenceKind::lvalue, false)
+REFL_SIGNATURE_QUALIFIERS(& noexcept, Cv::none, ReferenceKind::lvalue, true)
+REFL_SIGNATURE_QUALIFIERS(&&, Cv::none, ReferenceKind::rvalue, false)
+REFL_SIGNATURE_QUALIFIERS(&& noexcept, Cv::none, ReferenceKind::rvalue, true)
+REFL_SIGNATURE_QUALIFIERS(const, Cv::constant, ReferenceKind::none, false)
 REFL_SIGNATURE_QUALIFIERS(const noexcept, Cv::constant, ReferenceKind::none, true)
+REFL_SIGNATURE_QUALIFIERS(const &, Cv::constant, ReferenceKind::lvalue, false)
+REFL_SIGNATURE_QUALIFIERS(const & noexcept, Cv::constant, ReferenceKind::lvalue, true)
+REFL_SIGNATURE_QUALIFIERS(const &&, Cv::constant, ReferenceKind::rvalue, false)
+REFL_SIGNATURE_QUALIFIERS(const && noexcept, Cv::constant, ReferenceKind::rvalue, true)
+REFL_SIGNATURE_QUALIFIERS(volatile, Cv::volatile_, ReferenceKind::none, false)
+REFL_SIGNATURE_QUALIFIERS(volatile noexcept, Cv::volatile_, ReferenceKind::none, true)
+REFL_SIGNATURE_QUALIFIERS(volatile &, Cv::volatile_, ReferenceKind::lvalue, false)
+REFL_SIGNATURE_QUALIFIERS(volatile & noexcept, Cv::volatile_, ReferenceKind::lvalue, true)
+REFL_SIGNATURE_QUALIFIERS(volatile &&, Cv::volatile_, ReferenceKind::rvalue, false)
+REFL_SIGNATURE_QUALIFIERS(volatile && noexcept, Cv::volatile_, ReferenceKind::rvalue, true)
+REFL_SIGNATURE_QUALIFIERS(const volatile, Cv::constant_volatile, ReferenceKind::none, false)
+REFL_SIGNATURE_QUALIFIERS(const volatile noexcept, Cv::constant_volatile, ReferenceKind::none, true)
+REFL_SIGNATURE_QUALIFIERS(const volatile &, Cv::constant_volatile, ReferenceKind::lvalue, false)
+REFL_SIGNATURE_QUALIFIERS(const volatile & noexcept, Cv::constant_volatile, ReferenceKind::lvalue, true)
+REFL_SIGNATURE_QUALIFIERS(const volatile &&, Cv::constant_volatile, ReferenceKind::rvalue, false)
+REFL_SIGNATURE_QUALIFIERS(const volatile && noexcept, Cv::constant_volatile, ReferenceKind::rvalue, true)
 #undef REFL_SIGNATURE_QUALIFIERS
+}
+enum class TypeKind { object, pointer, array, function, void_ };
+struct TypeDescriptor;
+using TypeHandle = std::shared_ptr<const TypeDescriptor>;
+struct TypeDescriptor {
+    TypeId id;
+    TypeKind kind = TypeKind::object;
+    TypeUse element = {};
+    TypeHandle element_descriptor = {};
+    std::size_t extent = 0;
+};
+template<class T> TypeHandle describe_type() {
+    using U = std::remove_cvref_t<T>;
+    static const TypeHandle descriptor = [] {
+        TypeDescriptor type{type_id<U>()};
+        if constexpr (std::is_pointer_v<U>) {
+            type.kind = TypeKind::pointer;
+            type.element = type_use<std::remove_pointer_t<U>>();
+            type.element_descriptor = describe_type<std::remove_pointer_t<U>>();
+        } else if constexpr (std::is_array_v<U>) {
+            type.kind = TypeKind::array;
+            type.element = type_use<std::remove_extent_t<U>>();
+            type.element_descriptor = describe_type<std::remove_extent_t<U>>();
+            type.extent = std::extent_v<U>;
+        } else if constexpr (std::is_function_v<U>) type.kind = TypeKind::function;
+        else if constexpr (std::is_void_v<U>) type.kind = TypeKind::void_;
+        return std::make_shared<const TypeDescriptor>(std::move(type));
+    }();
+    return descriptor;
+}
+inline bool compatible_signature(const Signature& required, const Signature& actual) {
+    return required.parameters == actual.parameters && required.result == actual.result &&
+        required.receiver.reference == actual.receiver.reference &&
+        is_volatile(required.receiver.qualifiers) == is_volatile(actual.receiver.qualifiers) &&
+        (!is_const(required.receiver.qualifiers) || is_const(actual.receiver.qualifiers)) &&
+        (!required.is_noexcept || actual.is_noexcept);
 }
 template<class S> Signature signature_of() { return detail::signature_traits<S>::signature(); }
 }

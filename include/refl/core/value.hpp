@@ -8,23 +8,6 @@
 #include <variant>
 
 namespace refl {
-enum class DiagnosticCode {
-    not_found, null_handle, type_mismatch, arity_mismatch, read_only,
-    requires_consumption, unsupported, reference_export, missing_anchor, conflict, ambiguous
-};
-struct Diagnostic {
-    DiagnosticCode code;
-    MemberId member = {};
-    TypeUse expected = {};
-    TypeUse actual = {};
-    std::size_t argument_index = static_cast<std::size_t>(-1);
-};
-template<class T> using Result = std::expected<T, Diagnostic>;
-class ReflectionError : public std::runtime_error {
-public:
-    Diagnostic diagnostic;
-    explicit ReflectionError(Diagnostic d) : std::runtime_error("reflection contract failure"), diagnostic(d) {}
-};
 using LifetimeAnchor = std::shared_ptr<const void>;
 enum class ValueCategory { lvalue, consumable };
 
@@ -32,6 +15,7 @@ class ObjectView {
     const void* address_ = nullptr;
     TypeUse type_ = {};
     LifetimeAnchor anchor_;
+    TypeHandle descriptor_;
 public:
     ObjectView() = default;
     template<class T> static ObjectView from(T& value, LifetimeAnchor anchor = {}) {
@@ -39,11 +23,13 @@ public:
         ObjectView view;
         view.address_ = std::addressof(value);
         view.type_ = type_use<T>();
+        view.descriptor_ = describe_type<T>();
         view.anchor_ = std::move(anchor);
         return view;
     }
     bool valid() const { return address_ != nullptr; }
     TypeUse type() const { return type_; }
+    const TypeHandle& descriptor() const { return descriptor_; }
     const void* address() const { return address_; }
     const LifetimeAnchor& anchor() const { return anchor_; }
     bool read_only() const { return is_const(type_.qualifiers); }

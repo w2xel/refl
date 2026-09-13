@@ -9,6 +9,11 @@ inline Result<CallResult> invoke_target(const CallTarget& target, CallFrame& fra
         return std::unexpected(Diagnostic{code, member, expected, actual, index});
     };
     if (!target.valid()) return error(DiagnosticCode::null_handle);
+    if (target.options().receiver.valid()) {
+        const bool read_only = frame.receiver.read_only();
+        frame.receiver = target.options().receiver;
+        if (read_only) frame.receiver = frame.receiver.as_const();
+    }
     const auto& signature = target.signature();
     if (!supported_signature(signature)) return error(DiagnosticCode::unsupported);
     if (signature.parameters.size() != frame.arguments.size()) return error(DiagnosticCode::arity_mismatch);
@@ -34,6 +39,10 @@ inline Result<CallResult> invoke_target(const CallTarget& target, CallFrame& fra
     if (signature.result.reference != ReferenceKind::none) {
         if (mode == ExportKind::raw_reference && options.reference_export != ReferenceExport::caller_borrow)
             return error(DiagnosticCode::reference_export);
+        if (mode == ExportKind::raw_reference && options.result_lifetime == ResultLifetime::argument &&
+            (options.argument_index >= frame.arguments.size() ||
+             frame.arguments[options.argument_index].category == ValueCategory::consumable))
+            return error(DiagnosticCode::reference_export);
         if (options.result_lifetime == ResultLifetime::unknown) {
             for (const auto& arg : frame.arguments)
                 if (arg.category == ValueCategory::consumable) return error(DiagnosticCode::reference_export);
@@ -58,10 +67,23 @@ inline Result<CallResult> invoke(const DispatchHandle& source, MemberId member,
     CallFrame frame{call->receiver, arguments};
     return invoke_target(call->target, frame, member, mode);
 }
+template<class Source>
+Result<void> check_result_type(const Source& source, MemberId member, TypeUse expected) {
+    if (!source.schema()) return std::unexpected(Diagnostic{DiagnosticCode::null_handle, member});
+    for (const auto& operation : *source.schema()) {
+        if (operation.member != member) continue;
+        if (operation.signature.result != expected)
+            return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch, member, expected, operation.signature.result});
+        return {};
+    }
+    return std::unexpected(Diagnostic{DiagnosticCode::not_found, member});
+}
 template<class R> using TypedResult = std::conditional_t<std::is_lvalue_reference_v<R>,
     std::reference_wrapper<std::remove_reference_t<R>>, R>;
 template<class R, class Source, class... A>
 Result<TypedResult<R>> try_call(const Source& source, MemberId member, A&&... values) {
+    auto compatible = check_result_type(source, member, type_use<R>());
+    if (!compatible) return std::unexpected(compatible.error());
     std::array<ArgumentView, sizeof...(A)> arguments{argument(std::forward<A>(values))...};
     auto result = invoke(source, member, arguments,
                          std::is_reference_v<R> ? ExportKind::raw_reference : ExportKind::erased);
@@ -82,6 +104,8 @@ Result<TypedResult<R>> try_call(const Source& source, MemberId member, A&&... va
 }
 template<class T, class Source, class... A>
 Result<RetainedRef<T>> try_call_retained(const Source& source, MemberId member, A&&... values) {
+    auto compatible = check_result_type(source, member, type_use<T&>());
+    if (!compatible) return std::unexpected(compatible.error());
     std::array<ArgumentView, sizeof...(A)> arguments{argument(std::forward<A>(values))...};
     auto result = invoke(source, member, arguments, ExportKind::retained_reference);
     if (!result) return std::unexpected(result.error());

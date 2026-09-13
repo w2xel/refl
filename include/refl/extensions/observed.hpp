@@ -56,6 +56,7 @@ public:
     Observed(DispatchHandle source, Sink sink)
         : state_(std::make_shared<State>(std::move(source), std::move(sink),
                                         std::vector<std::shared_ptr<detail::Listener>>{})) {}
+    const std::shared_ptr<const InterfaceSchema>& schema() const { return state_->source.schema(); }
     Subscription after(MemberId member, std::function<void(const CallCompletedEvent&)> callback) {
         std::erase_if(state_->listeners, [](const auto& listener) { return !listener->active; });
         auto listener = std::make_shared<detail::Listener>(member, true, std::move(callback));

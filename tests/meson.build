@@ -94,3 +94,12 @@ benchmark_calls = executable(
   install: false,
 )
 test('call_benchmark_smoke', benchmark_calls)
+
+core_contracts = executable(
+  'test_core_contracts', ['test_core_contracts.cpp', 'type_identity_peer.cpp'],
+  include_directories: inc,
+  cpp_args: ['-fno-reflection'],
+  override_options: ['cpp_std=c++23'],
+  install: false,
+)
+test('core_contracts', core_contracts)

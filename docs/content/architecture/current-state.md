@@ -8,7 +8,7 @@ remaining chapters label their target contracts separately from this state.
 `refl/core/descriptor.hpp` contains the existing `ClassInfo`, `EnumInfo`, member
 records, and erased operation pointer aliases. It includes only standard-library
 headers and forward-declares `Object`. `refl/core/error.hpp` defines the existing
-`Error` enumeration and includes no other headers. Both compile as C++23 without
+`Error` enumeration and structured `Diagnostic`/`Result` types. Both compile as C++23 without
 reflection enabled. The public names and record layouts are unchanged.
 
 `refl/refl.hpp` includes both headers as a compatibility umbrella. It still owns
@@ -73,7 +73,7 @@ and the three sample smoke tests. `metadata_lifetime` verifies each handle kind,
 raw-pointer snapshots, invalid indices, catalog replacement, inherited lookup,
 and native invocation after replacement. The Mockable suite verifies metadata
 survival after backend/proxy destruction and release after the final member.
-The full suite has thirteen entries, including the call prototype and benchmark smoke test.
+The full suite has fourteen entries, including core-contract conformance and the call prototype.
 
 Verification on 2026-09-13 uses GCC 16.2, C++26 reflection for existing APIs,
 optimization level 2, warnings as errors, static analysis, and LTO disabled.
@@ -113,8 +113,22 @@ A clean benchmark consumer compile took 6.56 s with the same Meson compiler flag
 Run `build/tests/benchmark_calls` to repeat call measurements. The generated proxy
 still uses its legacy path; its conformance and cost checks land with typed binding.
 
+## Core contracts (1)
+
+| Contract | Implemented check |
+| --- | --- |
+| `TypeId` | Same type across translation units; case-distinct types stay distinct |
+| `TypeUse`, `TypeDescriptor` | CV/ref, pointer pointee, array element and extent are retained |
+| `Signature`, `MemberId` | Full qualifiers and declaration identity; unsupported calls fail explicitly |
+| `ObjectView` | Typed access preserves constness; retained views keep their owner |
+| `DispatchHandle` | Resolved targets match the advertised schema |
+| Typed extraction | Wrong result type fails before target execution |
+
+`tests/test_core_contracts.cpp` is the executable reference. `error.hpp` now contains
+structured diagnostics. `OwnedValue` remains the new owning call storage until
+legacy `Object` is translated at the runtime boundary.
+
 ## Migration status
 
-The prototype checkpoint is implemented. Full identity/access validation, legacy
-call integration, independent registries, and shared typed binding remain the next
-four steps. Production dynamic state and property observation remain later work.
+The prototype and core contracts are implemented. Legacy call integration,
+independent registries, and shared typed binding remain the next three steps. Production dynamic state and property observation remain later work.

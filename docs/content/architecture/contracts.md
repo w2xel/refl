@@ -3,12 +3,19 @@
 ## Implemented boundary
 
 `refl/core/descriptor.hpp` defines the existing metadata records and erased
-operation declarations; `refl/core/error.hpp` defines `Error`. Both depend only on
+operation declarations; `refl/core/error.hpp` defines `Error`. The core headers depend only on
 the standard library and compile without reflection. The umbrella includes them
 for compatibility. Public class, enum, and member handles retain const descriptor
 storage; raw-pointer constructors copy snapshots. See
 [implemented architecture](current-state.md) for construction, ownership limits,
 and verification.
+
+`type.hpp` defines exact type/member identity, pointer and array descriptors, and
+complete signatures. `value.hpp` defines const-preserving `ObjectView`, owning
+`OwnedValue`, argument categories, and `RetainedRef`. `call.hpp` defines opaque
+owned targets, dispatch handles, and resolved calls. Typed result checks and
+schema validation run before the target. Unsupported qualifiers produce a
+structured diagnostic. These contracts are covered by `core_contracts`.
 
 ## Remaining target contracts
 

@@ -79,6 +79,14 @@ public:
         using Args = typename Traits::arguments;
         auto signature = signature_of<S>();
         if (!supported_signature(signature)) return std::unexpected(Diagnostic{DiagnosticCode::unsupported});
+        constexpr bool supported_types = []<std::size_t... I>(std::index_sequence<I...>) {
+            return !std::is_volatile_v<std::remove_reference_t<R>> && !std::is_rvalue_reference_v<R> &&
+                (!std::is_volatile_v<std::remove_reference_t<std::tuple_element_t<I, Args>>> && ...) &&
+                std::is_invocable_r_v<R, std::decay_t<F>&, std::tuple_element_t<I, Args>...>;
+        }(std::make_index_sequence<std::tuple_size_v<Args>>{});
+        if constexpr (!supported_types) {
+            return std::unexpected(Diagnostic{DiagnosticCode::unsupported});
+        } else {
         auto context = std::make_shared<std::decay_t<F>>(std::forward<F>(callable));
         CallTarget target;
         auto invoke = [context, options](CallFrame& frame) -> CallResult {
@@ -99,6 +107,7 @@ public:
         };
         target.record_ = std::make_shared<const Record>(std::move(signature), std::move(options), std::move(invoke));
         return target;
+        }
     }
 };
 template<class S, class F> Result<CallTarget> make_target(F&& callable, TargetOptions options = {}) {
@@ -128,7 +137,17 @@ public:
     const std::shared_ptr<const InterfaceSchema>& schema() const { return schema_; }
     Result<ResolvedCall> resolve(MemberId member) const {
         if (!valid()) return std::unexpected(Diagnostic{DiagnosticCode::null_handle, member});
-        return resolve_(member);
+        const OperationDescriptor* operation = nullptr;
+        for (const auto& candidate : *schema_)
+            if (candidate.member == member) { operation = &candidate; break; }
+        if (!operation) return std::unexpected(Diagnostic{DiagnosticCode::not_found, member});
+        auto result = resolve_(member);
+        if (!result) return result;
+        if (!result->target.valid()) return std::unexpected(Diagnostic{DiagnosticCode::null_handle, member});
+        if (!compatible_signature(operation->signature, result->target.signature()) ||
+            operation->operation != result->target.options().operation)
+            return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch, member});
+        return result;
     }
 };
 }
