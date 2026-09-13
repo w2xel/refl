@@ -27,3 +27,16 @@ section in a fenced C++ block with `--8<-- "test_usage.cpp:name"`.
 Keep each page's setup and execution order clear. Do not add standalone samples
 or duplicate the code in Markdown.
 
+## GitHub Actions and Pages
+
+CI runs the tests and strict site build on pull requests and branch pushes.
+It uses `flake.lock` and one compiler process. Only a successful run on the default
+branch can deploy the site. Test jobs have read-only repository permissions;
+the separate deployment job has Pages and OIDC permissions.
+
+In repository **Settings → Pages → Build and deployment**, set **Source** to
+**GitHub Actions**. The `github-pages` environment can add deployment protection.
+The workflow also supports manual runs; deployment remains limited to the default branch.
+
+Update action pins through Dependabot pull requests. Review changes to the Nix lock
+file with the same build and test commands.

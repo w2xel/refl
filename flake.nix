@@ -21,7 +21,6 @@
             # Build system
             pkgs.meson
             pkgs.ninja
-            pkgs.pkg-config
 
             # GCC 16 toolchain (also pulled in by the stdenv, but listed so the
             # compiler is explicitly on PATH and its gcov/gprof sit alongside).
@@ -32,9 +31,6 @@
             # valgrind: runtime memory / UB detection.
             pkgs.cppcheck
             pkgs.valgrind
-
-            # Compile-commands generation for editors / cppcheck.
-            pkgs.bear
 
             # Documentation — MkDocs Material (markdown-based, modern output).
             pkgs.python3Packages.mkdocs

@@ -69,5 +69,6 @@ All examples use these headers:
 | `include/refl/` | Library headers |
 | `tests/` | Contract tests and usage snippets |
 | `docs/` | MkDocs configuration and Markdown |
+| `.github/workflows/ci.yml` | Test, site build, and Pages deployment |
 
-See [contributing](../contributing.md) for local checks and the documentation workflow.
+See [contributing](../contributing.md) for the documentation and CI workflow.

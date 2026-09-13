@@ -21,6 +21,7 @@ Static analysis and LTO are off by default. See [setup](docs/content/getting-sta
 - [Usage](docs/content/getting-started/index.md): runtime reflection, typed binding,
   dynamic dispatch, retained references, and observation. Code comes from asserted tests.
 - [Architecture](docs/content/architecture/index.md): implemented contracts and remaining work.
-- [Contributing](docs/content/contributing.md): local checks and documentation.
+- [Contributing](docs/content/contributing.md): local checks, documentation, and GitHub Pages setup.
 
-Serve the docs with `mkdocs serve -f docs/mkdocs.yml`.
+Serve the docs with `mkdocs serve -f docs/mkdocs.yml`. CI tests each change, builds the
+site, and deploys successful default-branch runs to GitHub Pages.
