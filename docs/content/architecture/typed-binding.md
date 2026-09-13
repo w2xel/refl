@@ -1,27 +1,28 @@
 # Layer 4: Typed binding
 
 `Proxy<Interface>` should mean “a typed view of an object satisfying this interface.”
-It should work equally well with a native object and a slot backend. It does not
+It should work equally well with a native object and a dispatch table. It does not
 own replacement policy, observe calls, or manufacture a concrete `Interface`.
 
-Proposed home: `refl/adapters/proxy.hpp`. Keep `refl/dyn/proxy.hpp` as a forwarding
-include during migration. Dependencies are runtime services and generated interface
-schemas; neither `Dyn` nor `Hooks` belongs below this layer.
+Proposed home: `refl/adapters/proxy.hpp`. Dependencies are runtime registry and
+invocation plus generated interface schemas; neither `Dynamic` nor `Observed`
+belongs below this layer. Compatibility includes are listed in the migration guide.
 
-## Preserve the useful current API
+## Structural binding without inheritance
 
-**Current API**, as demonstrated by `samples/proxy.cpp`:
+Target sketch of the structural scenario:
 
 ```cpp
-struct IDrawable { int render(int scale) const; };
+struct Drawable { int render(int scale) const; };
 struct Square {
     int side;
     int render(int scale) const { return side * side * scale; }
 };
 
-refl::ensure_registered<Square>();
-auto square = std::make_shared<Square>(4);
-refl::Proxy<IDrawable> view(square);
+refl::Registry registry;
+refl::register_type<Square>(registry);
+auto square = refl::own(Square{4});
+auto view = refl::try_bind<Drawable>(square).value();
 int pixels = view->render(2);
 ```
 
@@ -45,13 +46,14 @@ struct BindingPlan {
     std::vector<BindingEntry> entries;
 };
 
-struct BoundView {
+struct BindingState {
     std::shared_ptr<const BindingPlan> plan;
-    EndpointHandle endpoint;       // per-instance state, separate from the plan
+    DispatchHandle dispatch;       // per-instance state, separate from the plan
 };
 
 Result<Proxy<Drawable>> try_bind(Object object);
-Result<Proxy<Drawable>> try_bind(EndpointHandle endpoint);
+Result<Proxy<Drawable>> try_bind(ObjectView object);
+Result<Proxy<Drawable>> try_bind(DispatchHandle dispatch);
 ```
 
 Binding validates the entire interface before publishing a new view. A failure
@@ -66,16 +68,16 @@ Instance pointers, slot contents, and closure owners do not belong in a shared
 structural plan.
 
 Keep three lifetimes separate. The plan records structural compatibility and
-operation selection. The bound view pairs that plan with an invocation endpoint.
-Each call resolves a fresh `CallSnapshot` containing the selected target, adjusted
-receiver, and owners needed until completion. A slot-backed endpoint must resolve
+operation selection. `BindingState` pairs that plan with a `DispatchHandle`.
+Each call resolves a fresh `ResolvedCall` containing the selected target, adjusted
+receiver, and owners needed until completion. A handle to a dispatch table resolves
 the current slot on every call; storing its current closure in the plan would
-silently bypass later replacements. A native endpoint can resolve a fixed thunk.
+silently bypass later replacements. A native dispatch handle can resolve a fixed thunk.
 
-The endpoint exposes its callable schema separately from actual storage identity,
-so a synthetic backend can bind without claiming to contain an `Interface` object.
-The common endpoint and snapshot contracts are defined in
-[contracts and values](contracts.md#invocation-endpoints-and-call-snapshots).
+The dispatch handle exposes its callable schema separately from actual storage
+identity, so a dispatch table can bind without claiming to contain an `Interface`
+object. The common dispatch handle and resolved call contracts are defined in
+[core contracts](contracts.md#dispatch-handles-and-resolved-calls).
 
 | Requirement | Initial binding rule |
 | --- | --- |
@@ -98,13 +100,13 @@ Retaining metadata is not itself a promise that every adapter supports it.
 sequenceDiagram
     participant U as Caller
     participant P as Typed view
-    participant E as Invocation endpoint
+    participant E as Dispatch handle
     participant F as Common call frame
     participant T as Bound target
     U->>P: update(int& output)
     P->>F: Borrow output and retain its category
     P->>E: Resolve current operation
-    E-->>P: Retained target and receiver snapshot
+    E-->>P: Resolved call retaining target and receiver
     F->>F: Validate runtime-dependent constraints
     F->>T: Invoke with adjusted receiver
     T->>U: Write to original output
@@ -131,12 +133,13 @@ Keep operators on the same resolver and call contract as named methods. Explicit
 specify whether a class-valued operator returns a concrete value or a typed view
 of an interface; do not infer that every class result uses the receiver's interface.
 
-## Migration seam and proof
+## Implementation boundary and proof
 
-Extract `populate` into a plan builder, then replace `TypedMethod` argument/result
-handling with the shared frame. Expose `try_bind` while retaining a throwing
-constructor for compatibility. Remove the slot backend's dependency on this
-adapter by moving `Mockable::proxy()` sugar to an integration header or free factory.
+Build a `BindingPlan` separately from `BindingState`, and route typed argument and
+result handling through the shared frame. Expose `try_bind` with an explicit
+diagnostic result. Keep proxy factories for `DispatchTable<Interface>` in integration
+code so the dispatch table does not depend on this adapter. The migration guide
+maps the current implementation onto these responsibilities.
 
 Run the structural sample with both unrelated native implementations and a slot
 implementation. Verify mixed-return overloads, ref-qualified rejection/support,
@@ -145,4 +148,4 @@ Use the same out-parameter and move-only scenarios as runtime invocation.
 Bind two instances with one structural plan and prove their targets stay isolated.
 Replace a slot after binding and verify that the next call sees the replacement.
 
-Next: [dynamic composition](dynamic.md).
+Next: [dynamic dispatch](dynamic.md).

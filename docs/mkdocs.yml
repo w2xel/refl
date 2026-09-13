@@ -48,11 +48,11 @@ nav:
   - Architecture:
       - Overview: architecture/index.md
       - Repository assessment: architecture/assessment.md
-      - "Layer 1: Contracts and values": architecture/contracts.md
-      - "Layer 2: Reflection generation": architecture/generation.md
-      - "Layer 3: Runtime services": architecture/runtime.md
+      - "Layer 1: Core contracts": architecture/contracts.md
+      - "Layer 2: Reflection and descriptor generation": architecture/generation.md
+      - "Layer 3: Runtime registry and invocation": architecture/runtime.md
       - "Layer 4: Typed binding": architecture/typed-binding.md
-      - "Layer 5: Dynamic composition": architecture/dynamic.md
-      - "Layer 6: Observation": architecture/observation.md
+      - "Layer 5: Dynamic dispatch": architecture/dynamic.md
+      - "Layer 6: Call observation": architecture/observation.md
       - Migration and verification: architecture/migration.md
   - Getting Started: getting-started.md

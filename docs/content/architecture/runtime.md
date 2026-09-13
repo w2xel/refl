@@ -1,16 +1,16 @@
-# Layer 3: Runtime services
+# Layer 3: Runtime registry and invocation
 
-Runtime services make descriptors discoverable and callable. They depend on the
-contract layer; native reflection generation is a producer, not a prerequisite
-for lookup. Proposed home: `refl/runtime/{registry,lookup,invoke}.hpp`.
+The runtime makes descriptors discoverable and callable. It depends on core
+contracts; native descriptor generation is a producer, not a prerequisite for
+lookup. Proposed home: `refl/runtime/{registry,lookup,invoke}.hpp`.
 
-Checked invocation accepts the contract layer's endpoint and resolves a fresh
-call snapshot before entering user code. Native endpoints resolve descriptor
-operations and receiver paths; synthetic endpoints expose their callable schema
-and resolve backend operations without pretending to store that interface type.
+Checked invocation accepts a `DispatchHandle` and produces a `ResolvedCall` before
+entering user code. Native dispatch resolves descriptor operations and receiver
+paths; dispatch tables expose their callable schema and resolve operations without
+pretending to store that interface type.
 Both use the same validator. A structural binding plan can reuse operation
-selection, but it cannot cache a mutable slot's current target. Keep the snapshot
-alive through completion, including synchronous observation and result extraction.
+selection, but it cannot cache a mutable slot's current target. Keep the resolved
+call alive through completion, including synchronous observation and result extraction.
 
 ## Registry as an application-owned catalog
 
@@ -26,17 +26,18 @@ auto member = editor.find_class("Square").value()
 // member retains its descriptor independently of editor's map storage.
 ```
 
-Keep `find_class` and `Reg<T>` as facades over `default_registry()` during
-migration. New embedding code can opt into explicit registries immediately.
+Use an application-owned `Registry` for isolated catalogs, or `default_registry()`
+for process-wide discovery. The migration guide describes compatibility facades.
 
 Registration publishes an immutable descriptor. Adding the same identity and
 equivalent descriptor is idempotent; a conflicting descriptor or an alias claimed
 by another type returns a conflict diagnostic. Do not silently replace metadata
 under existing handles. Initially omit removal and replacement operations.
 
-Every class, enum, constructor, field, and function handle retains the descriptor
-storage it references. A member handle can be a shared descriptor handle plus an
-index. Base edges retain or resolve through a shared immutable descriptor graph;
+`ClassHandle`, `EnumHandle`, `ConstructorHandle`, `FieldHandle`, `PropertyHandle`,
+and `FunctionHandle` retain the descriptors they reference. A member handle can
+be a shared descriptor handle plus an index. Base edges retain or resolve through
+a shared immutable descriptor graph;
 they must not look up relationships in whichever global registry happens to exist.
 Avoid ownership cycles by giving the graph an arena owner or keeping recursive
 type references as IDs resolved by that owner.
@@ -58,7 +59,7 @@ flowchart LR
     C --> I[Invoke target]
 ```
 
-One resolver serves `Class::find_*`, typed binding, operators, and native-slot
+One resolver serves `ClassHandle::find_*`, typed binding, operators, and native-slot
 wiring. Return structured resolution results, including declaring type and the
 receiver adjustment path. An overload's path belongs to that overload, not to a
 shared method-name group: two selected declarations need not live in the same
@@ -80,7 +81,15 @@ selection. Distinguish “is a base somewhere” from “has an unambiguous conv
 Constructors remain local to their described class unless explicit inherited
 constructor support is implemented.
 
-## Field access is a capability
+## Fields, properties, and operations
+
+A `FieldDescriptor` describes native storage. A `PropertyDescriptor` describes
+read/write/view capabilities and may have no addressable storage. `FieldHandle`
+and `PropertyHandle` expose those distinct member kinds. A field can back a
+property, but exposing a getter and setter alone does not make it a field.
+
+`MemberId` identifies the declaration. `OperationKind` identifies the requested
+operation on it: one property can have separate read, write, and view operations.
 
 Expose copy read, write, and view access separately. A const native field can
 provide a read-only view; a move-only field can provide a view without a copy
@@ -107,7 +116,7 @@ Validation failure means user code was not entered. A user exception means it ma
 have run and mutated state. Returning `Result` does not make the operation
 transactional. Preserve that distinction in diagnostics and documentation.
 
-## Migration seam and proof
+## Implementation boundary and proof
 
 First wrap the existing pools in `Registry` without changing legacy entry points.
 Then give handles ownership, move hierarchy resolution behind one interface, and

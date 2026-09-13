@@ -1,42 +1,37 @@
 # Repository assessment
 
-The strongest existing separation is `Proxy<T>` versus `Mockable<T>`: structural
-binding is useful independently of replacement. Preserve that distinction and
-make it visible in the public architecture. The largest pressure point is the
+The strongest existing separation is structural binding versus replaceable
+dispatch: binding is useful independently of replacement. Preserve that distinction
+and make it visible in the public architecture. The largest pressure point is the
 shared semantic contract underneath them, currently distributed across headers.
 
 This is a static architecture review of revision `29ddfd2`, including headers,
 samples, tests, Meson configuration, and existing documentation. It does not claim
 that the C++ suite was executed or that every implementation defect was identified.
-Source links below pin the reviewed revision so future refactoring does not erase
-the evidence behind the recommendations.
+Source links in the migration guide pin the reviewed revision so future refactoring
+does not erase the evidence behind the recommendations. This assessment describes
+responsibilities using the target vocabulary; it does not claim that the target
+symbols already exist in the implementation.
 
 ## What exists
 
-```mermaid
-flowchart TB
-    H["hooks.hpp · Hooks inherits Dyn"] --> D["dyn.hpp · real object + slots + proxy"]
-    D --> M["mockable.hpp · synthetic ClassInfo + slots"]
-    D --> P["dyn/proxy.hpp · generated typed dispatch"]
-    M --> P
-    P --> R["refl.hpp · generation + pools + Object + lookup + invocation"]
-    M --> R
-    D --> R
-```
+Structural binding and replaceable dispatch are already separate components,
+but their dependencies and call semantics still overlap. The reviewed code has
+these architectural pressure points:
 
-These are header dependencies, with a few redundant edges omitted. The public
-“two layers” description hides both reusable components and an optional extension.
-
-| Evidence in this revision | Architectural consequence | Direction |
+| Existing responsibility | Architectural consequence | Target direction |
 | --- | --- | --- |
-| [`refl.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/refl.hpp): `RegistrarHolder::make_info`, global pools, `Object`, hierarchy helpers, and public handles share one header | Compiler reflection, process policy, and runtime semantics cannot be consumed independently | Extract contracts first, then generation and runtime services |
-| Same header: `normalize_type` lowercases and removes qualifiers, while `extract_arg` compares display names and performs upcasts | Lookup identity and invocation compatibility answer different questions through string conventions | Give identity, complete signatures, and compatibility separate representations |
-| Same header: `Object` owns `ClassInfo`; `Class`, `Function`, and `Field` hold raw metadata pointers | Handle validity depends on where metadata came from; synthetic metadata is not necessarily process-lived | Handles retain immutable descriptor storage |
-| [`proxy.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/dyn/proxy.hpp): `populate` resolves structure and `TypedMethod` builds its own argument storage | Typed calls can diverge from core forwarding and resolution semantics | Produce a binding plan and reuse the call-frame contract |
-| [`mockable.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/mockable.hpp): synthetic `T$mock` metadata, name-keyed slots, raw `ctx`, and `proxy()` convenience | Interface identity, storage identity, overload selection, and adapter dependency are intertwined | Separate interface from storage; key slots by member identity; own callable context |
-| [`dyn.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/dyn.hpp): `wire_real_slots`, `restore`, `wrap`, and mode transitions coordinate several stores and pointers | Lifetime and transition correctness depend on each operation remembering every related store | Publish complete backend states and compose owned call targets |
-| [`hooks.hpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/include/refl/hooks.hpp): derived class reaches `mockable_`; callbacks and saved property contexts live in separate maps | Observation is coupled to dynamic storage layout and wrapper lifetime | Observed endpoint adapter outside replacement chains, plus connection tokens |
-| [`tests/meson.build`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/tests/meson.build) registers `selfcheck`, `test_refl`, and `test_dyn`, but not existing `test_mockable.cpp` or `test_hooks.cpp` | A successful default test run does not cover all architectural components | Make each public layer a first-class build/test target |
+| Generation, global registration, values, and invocation share one header | Runtime consumption requires compiler reflection and process policy | Separate core contracts, generation, and runtime registry and invocation |
+| Lookup strips qualification and invocation compares display names | Identity and compatibility can disagree | Use type identity, complete signatures, and explicit compatibility |
+| Some public handles borrow metadata without retaining it | Synthetic metadata can expire before a handle | Retain immutable descriptors in metadata handles |
+| Typed forwarding builds its own argument storage | Typed and runtime calls can behave differently | Reuse binding plans and the common call frame |
+| Replaceable dispatch combines synthetic identity, name keys, and raw contexts | Storage identity, overload selection, and lifetime are entangled | Use `DispatchTable<Interface>`, member IDs, and owned targets |
+| State transitions coordinate several independent stores | Replacement and reset depend on scattered lifetime bookkeeping | Publish complete dynamic state and retain resolved calls |
+| Observation reaches into dispatch storage | Subscriptions depend on replacement layout | Use `Observed<Source>` over a `DispatchHandle` |
+| Some component tests are not registered in the build | A passing default run does not cover the full architecture | Register and verify every public component |
+
+The [legacy implementation evidence](migration.md#legacy-implementation-evidence)
+contains the original dependency diagram, symbols, and revision-pinned source links.
 
 ## Keep these strengths
 
@@ -50,7 +45,7 @@ internal, immutable representation.
 
 [`samples/proxy.cpp`](https://github.com/swuerl/cpp_runtime_reflection/blob/29ddfd2/samples/proxy.cpp)
 demonstrates the central product feature: unrelated `Square` and `Triangle` types
-bound to the same declaration-only `IDrawable` interface. Promote this to an
+bound to the same declaration-only renderer interface. Promote this to an
 architectural acceptance scenario.
 
 The core tests already exercise inheritance, ambiguity, ownership, and reference
@@ -68,8 +63,8 @@ whether each expectation is intended behavior or a historical limitation.
    A typed view must preserve the semantics of the object it exposes.
 4. Separate metadata construction from registry publication. Local registries and
    synthetic backends should not need global mutable state to behave correctly.
-5. Make hooks an optional consumer of invocation endpoints and checked runtime
-   calls, with explicit delivery and disconnection rules. Keep Dyn integration
+5. Make observation an optional consumer of dispatch handles and checked runtime
+   calls, with explicit delivery and unsubscription rules. Keep `Dynamic` integration
    separate from the observation adapter.
 
 The [recorded baseline](migration.md#recorded-baseline-limitations) adds execution
@@ -79,15 +74,15 @@ the revision or static-review scope of the source assessment above.
 
 ## Documentation drift is a boundary signal
 
-The existing Dyn page places `connect` and `on_change` on `Dyn`, while the source
-places them on `Hooks`; it calls `Dyn` non-movable while the source declares move
-operations. It also describes dispatch features that the current proxy no longer
-exposes, such as property subscripting and static dispatch fields. The core design
-page contains conflicting accounts of inheritance hiding and metadata ownership.
+The existing API documentation disagrees with the source about which component
+owns observation, whether dynamic facades are movable, and which dispatch features
+remain available. The core design page also gives conflicting accounts of
+inheritance hiding and metadata ownership. Exact historical spellings and examples
+are recorded under [legacy documentation drift](migration.md#legacy-documentation-drift).
 
 These discrepancies are evidence that the conceptual model has not kept pace
 with component changes. This section provides a proposed architecture, not a
 replacement API reference. During migration, align each existing API page and
 sample with its owning layer and verify examples before presenting them as current.
 
-Continue with [contracts and values](contracts.md).
+Continue with [core contracts](contracts.md).

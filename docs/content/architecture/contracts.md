@@ -1,4 +1,4 @@
-# Layer 1: Contracts and values
+# Layer 1: Core contracts
 
 This layer defines the language spoken by generation, runtime lookup, proxies, and
 slots. It depends only on the standard library. Its non-template runtime surface
@@ -8,6 +8,14 @@ Proposed home: `refl/core/{type,descriptor,value,call,error}.hpp`. These are log
 boundaries; combine small headers where that improves readability.
 
 ## Identity is not presentation
+
+Use `*Descriptor` for immutable native metadata, such as `TypeDescriptor`,
+`ClassDescriptor`, `FunctionDescriptor`, and `FieldDescriptor`. Use `*Handle` for
+retained access to that metadata: `TypeHandle`, `ClassHandle`, `FunctionHandle`,
+and `FieldHandle`. An `InterfaceSchema` describes structural requirements;
+`InterfaceHandle` retains that schema. `SchemaHandle` retains the callable surface
+of either a native descriptor or an interface schema without claiming native
+storage identity. These names distinguish metadata from the objects it describes.
 
 ```cpp
 // Target sketch: abbreviated records, not a complete declaration set.
@@ -63,11 +71,12 @@ struct ArgumentView {
 };
 ```
 
-An owning `Object` contains storage plus a view. A borrow contains a view with no
-storage owner. Passing either to a call does not change its category or constness.
-Named entry points such as `borrow(x)`, `borrow_const(x)`, and `own(value)` make
-storage decisions visible; preserve implicit current constructors only as a
-compatibility facade with documented behavior.
+`Object` owns concrete storage and exposes an `ObjectView`. An `ObjectView` is
+possibly retained: its optional anchor can keep storage alive, while an unanchored
+view is a borrow. `own(value)` creates an `Object`; `borrow(x)` and
+`borrow_const(x)` create unanchored views. Passing an object or view to a call does
+not change its category or constness. Compatibility behavior is specified in the
+[migration guide](migration.md#compatibility-is-an-explicit-translation).
 
 | Result | Storage/lifetime contract |
 | --- | --- |
@@ -148,11 +157,11 @@ a validation error into `ReflectionError`; a `try_call` exposes the same diagnos
 Do not promise a completely non-throwing API unless a separate policy also defines
 allocation failure and target-exception handling.
 
-## Invocation endpoints and call snapshots
+## Dispatch handles and resolved calls
 
 ```cpp
 // Target sketch: a retained selection for one call.
-struct CallSnapshot {
+struct ResolvedCall {
     CallTarget target;
     ObjectView receiver;           // adjusted native view or backend storage view
     Signature signature;
@@ -160,25 +169,25 @@ struct CallSnapshot {
 };
 ```
 
-An `EndpointHandle` retains a provider with a callable schema and an operation
-that resolves a member plus operation kind into a `CallSnapshot`. Resolution
+A `DispatchHandle` retains a provider with a callable schema and an operation
+that resolves a member plus operation kind into a `ResolvedCall`. Resolution
 selects state; it does not invoke user code. The runtime's checked invocation
-service validates and invokes the snapshot using the common frame. Endpoint
-contracts need neither compiler reflection nor knowledge of `Dyn` or observers.
+service validates and invokes the resolved call using the common frame. Dispatch
+contracts need neither compiler reflection nor knowledge of `Dynamic` or observers.
 This is a small erased protocol, not a requirement for a virtual class hierarchy.
 
-A native endpoint resolves operations on a retained object. A slot endpoint
-resolves the current target on a retained backend state. A live dynamic endpoint
-follows published state changes, whereas a captured state endpoint keeps its
-selected generation. The endpoint's schema describes callable requirements;
-its receiver view describes actual storage. Structural conformance never changes
-the receiver's native cast identity.
-An endpoint preserves its advertised schema across its lifetime. Publishing a new
-dynamic state must validate that schema before existing bound views can use it.
+A native dispatch handle resolves operations on a retained object. A dispatch table
+resolves the current target on a retained state. A live `DispatchHandle` follows
+published state changes, whereas a captured binding keeps its selected generation.
+The handle's schema describes callable requirements; its receiver view describes
+actual storage. Structural conformance never changes the receiver's native cast
+identity.
+A dispatch handle preserves its advertised schema across its lifetime. Publishing
+a new dynamic state must validate that schema before existing proxies can use it.
 
-Keep each snapshot alive through invocation, result extraction, and synchronous
+Keep each `ResolvedCall` alive through invocation, result extraction, and synchronous
 observation. A result escaping that interval needs its own declared anchor.
-Snapshot ownership establishes lifetime and reentrancy behavior; it does not
+The resolved call's owners establish lifetime and reentrancy behavior; they do not
 provide synchronization for concurrent state mutation.
 
 ## Acceptance boundary
@@ -190,4 +199,4 @@ values require consumption, and a void success differs from an invalid receiver.
 Retain a member handle after releasing its originating registry or synthetic
 backend and verify that metadata access remains valid.
 
-Next: [reflection generation](generation.md).
+Next: [reflection and descriptor generation](generation.md).

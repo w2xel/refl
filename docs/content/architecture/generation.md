@@ -1,4 +1,4 @@
-# Layer 2: Reflection generation
+# Layer 2: Reflection and descriptor generation
 
 Generation translates C++ declarations into the common descriptors and callable
 targets. It depends on contracts, the concrete type, and compiler reflection. It
@@ -17,7 +17,7 @@ flowchart LR
     N --> A[Explicit registration facade]
     A --> R[Application registry]
     I --> P[Typed binding generator]
-    I --> M[Slot backend generator]
+    I --> M[Dispatch table generator]
 ```
 
 ```cpp
@@ -28,7 +28,7 @@ auto requirements = describe_interface<Drawable>();
 Registry registry;
 registry.add(descriptor).value();
 
-// Compatibility sugar delegates to the explicit path.
+// Process-wide discovery is an explicit registry choice.
 register_type<Square>(default_registry());
 ```
 
@@ -90,17 +90,17 @@ populate and seal records. Self-referential member types must not cause recursiv
 publication. Do not force complete metadata for every reachable library type just
 because it appears as a parameter; identity and type-use information can suffice.
 
-## Migration seam and proof
+## Implementation boundary and proof
 
-Extract shared public-member predicates and signature builders from `refl.hpp`
-before relocating full generation. Then replace the separate metadata walks in
-`Mockable` and proxy generation with common schema queries. Keep native thunk
-generation separate from interface-only queries.
+Share public-member predicates and signature builders between native descriptor,
+interface schema, dispatch table, and proxy generation. Keep native thunk
+generation separate from interface-only queries. The migration guide records the
+existing implementation entry points to extract.
 
 Compile fixtures should cover declaration-only interfaces, abstract classes,
 qualified overloads, self-referential types, and unsupported-feature diagnostics.
 Verify that describing a type leaves `default_registry()` untouched. Cross-check
-that native and slot descriptions use the same member identities for the same
+that native and dispatch table descriptions use the same member identities for the same
 interface requirements.
 
-Next: [runtime services](runtime.md).
+Next: [runtime registry and invocation](runtime.md).

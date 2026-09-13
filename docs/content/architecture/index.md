@@ -12,10 +12,10 @@ reference, and callable means. Convenience APIs should compose those definitions
 !!! info "A target design, not the current API"
 
     This section reviews repository revision `29ddfd2` and proposes a direction.
-    All C++ sketches and proposed paths in this section describe the target unless
-    explicitly marked **Current API**. They are design examples, not compilable
-    examples promised by this revision. The [assessment](assessment.md) separates
-    observations from recommendations; the [migration](migration.md) orders the work.
+    C++ sketches and proposed paths describe the target, not compilable examples
+    promised by this revision. The [assessment](assessment.md) separates observations
+    from recommendations. The [migration guide](migration.md) orders the work and
+    is the sole reference for superseded names and compatibility.
 
 ## One use case, three entry points
 
@@ -40,7 +40,7 @@ dynamic.implement(member<Drawable, "render", int(int) const>,
                   [](int scale) { return 100 * scale; });
 
 auto observed = observe(dynamic, observer_error_sink);
-auto connection = observed.after(render_member, record_result);
+auto subscription = observed.after(render_member, record_result);
 int recorded_pixels = observed->render(2);
 ```
 
@@ -49,6 +49,24 @@ instance chooses the implementation of each member. Observation sees calls throu
 the returned observed adapter; calls through `dynamic` itself bypass that adapter.
 None of these choices changes the concrete C++ type of `Square`.
 
+## Public vocabulary
+
+| Name | Meaning |
+| --- | --- |
+| `Proxy<Interface>` | Typed forwarding through a structural binding |
+| `DispatchTable<Interface>` | Owned slots supplying replaceable operations |
+| `Dynamic<Interface>` | Dispatch table, optional native object, and typed proxy |
+| `Observed<Source>` | Adapter created by `observe(...)` that reports successful calls through itself |
+| `Subscription` | Scoped registration; destruction or `unsubscribe()` removes it |
+| `DispatchHandle` | Retained access to member dispatch |
+| `BindingPlan` / `BindingState` | Reusable structural mapping / per-instance binding |
+| `ResolvedCall` | Selected target, receiver, and owners retained for one call |
+| `CallCompletedEvent` | Read-only, call-scoped successful-completion event |
+
+`Dynamic::dispatch()` follows published state changes. `capture_binding()` returns
+a proxy tied to the current generation. `detach_native()` removes the native
+baseline and affected targets; `reset()` publishes a new native generation.
+
 ## Dependency direction
 
 Arrows mean **depends on**, not execution order. Numbers identify chapters; this is
@@ -56,14 +74,14 @@ a dependency graph, not a requirement to pass through every layer on every call.
 
 ```mermaid
 flowchart TB
-    H["6 · Observation"] --> R["3 · Runtime services"]
-    H --> C["1 · Contracts and values"]
+    H["6 · Call observation"] --> R["3 · Runtime registry and invocation"]
+    H --> C["1 · Core contracts"]
     O["Observation integration facade"] --> H
-    O --> D["5 · Dynamic composition"]
+    O --> D["5 · Dynamic dispatch"]
     D --> P["4 · Typed binding"]
-    D --> S["5 · Slot backend"]
+    D --> S["5 · Dispatch table"]
     P --> R
-    P --> G["2 · Reflection generation"]
+    P --> G["2 · Reflection and descriptor generation"]
     S --> C
     S --> G
     R --> C
@@ -72,23 +90,23 @@ flowchart TB
     A --> R
 ```
 
-Generation produces descriptors and native call targets. Runtime services consume
-them. Typed binding uses generated interface descriptions and runtime resolution.
-The slot backend produces another kind of call target. `Dyn` composes binding with
-slots and exposes a stable live endpoint. Observation consumes the common endpoint
-contract and runtime checked invocation; integration sugar connects it to `Dyn`.
-The runtime never includes `Dyn` or hooks.
+Generation produces descriptors and native call targets. The runtime consumes
+them. Typed binding uses generated interface schemas and runtime resolution.
+`DispatchTable` supplies replaceable call targets. `Dynamic` composes binding with
+the table and exposes live dispatch. `Observed` consumes the common dispatch-handle
+contract and runtime checked invocation; integration code connects it to `Dynamic`.
+The runtime never includes `Dynamic` or `Observed`.
 
 ## Layer ownership
 
 | Chapter | Owns | Does not own |
 | --- | --- | --- |
-| [Contracts and values](contracts.md) | Identity, signatures, storage views, endpoints, call snapshots/protocol, diagnostics | Global registration, observers |
-| [Reflection generation](generation.md) | C++ discovery, supported-member policy, native thunks, interface schemas | Registry mutation, instance state |
-| [Runtime services](runtime.md) | Registry, lookup, inheritance resolution, checked invocation | Typed field synthesis, replacements |
-| [Typed binding](typed-binding.md) | Structural plans, bound views, typed call syntax | Object construction policy, mutable slots |
-| [Dynamic composition](dynamic.md) | Slot lifetime, live endpoint state, replacement, wrapping, real/dynamic transitions | Reflection lookup algorithms, signals |
-| [Observation](observation.md) | Observed endpoint adapter, subscriptions, delivery order, disconnection | Replacement chains, a second invocation protocol |
+| [Core contracts](contracts.md) | Identity, signatures, storage views, dispatch handles, resolved calls/protocol, diagnostics | Global registration, observers |
+| [Reflection and descriptor generation](generation.md) | C++ discovery, supported-member policy, native thunks, interface schemas | Registry mutation, instance state |
+| [Runtime registry and invocation](runtime.md) | Registry, lookup, inheritance resolution, checked invocation | Typed field synthesis, replacements |
+| [Typed binding](typed-binding.md) | Structural plans, binding states, typed call syntax | Object construction policy, mutable slots |
+| [Dynamic dispatch](dynamic.md) | Slot lifetime, live dispatch state, replacement, wrapping, native/hybrid/detached transitions | Reflection lookup algorithms, signals |
+| [Call observation](observation.md) | `Observed`, subscriptions, delivery order, unsubscription | Replacement chains, a second invocation protocol |
 
 ## Scope and tradeoffs
 
@@ -120,10 +138,10 @@ checkpoint and records the limits of the current build baseline.
 
 ## How to use this section
 
-Read the assessment, then contracts and runtime services to establish the central
-invariants. Use generation and typed binding to implement the bridge. Add dynamic
-composition and observation once the common call path is coherent. The migration
-chapter turns these boundaries into independently reviewable changes.
+Read the assessment, then core contracts and runtime registry and invocation to
+establish the central invariants. Use generation and typed binding to implement
+the bridge. Add dynamic dispatch and call observation once the common call path
+is coherent. The migration chapter turns these boundaries into reviewable changes.
 
 Diagrams use Mermaid through the existing Material theme's
 [native diagram integration](https://squidfunk.github.io/mkdocs-material/reference/diagrams/).
