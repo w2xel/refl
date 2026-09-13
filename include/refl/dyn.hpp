@@ -516,9 +516,7 @@ public:
         }
     }
 
-    static const Registrar& registrar() {
-        return RegistrarHolder<T>::registrar;
-    }
+
 };
 
 }  // namespace refl

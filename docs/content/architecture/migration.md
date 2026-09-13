@@ -9,17 +9,10 @@ are not proof that a layer has been extracted.
 
 ## Current progress
 
-The [implemented architecture](current-state.md) records completed extractions.
-Step 0 is complete with eight baseline tests passing. The first bounded slice of
-step 1 extracts metadata declarations and errors into independently compiled core
-headers (commit `eb474e2`). The second completed slice gives public metadata handles const
-shared ownership, preserves raw-pointer construction through snapshots, and retains
-inherited lookup results. Eleven tests cover the suite, boundaries, and metadata
-lifetimes. The step 0a call prototype now passes. Its production call primitives are reused
-by the next steps; its state provider remains a test fixture. Core identity/access
-validation is complete. Native runtime calls now use common frames and owned targets. Independent
-registries and shared typed binding are the next steps. The [current-state page](current-state.md) records compatibility
-changes and remaining global hierarchy dependencies.
+Core contracts, native runtime calls, and independent registries are implemented.
+Descriptors retain their base graphs. Interface descriptions need no method definitions.
+Shared typed binding is next. Production dynamic state and full observation
+integration remain later work. See [implemented architecture](current-state.md).
 
 ## Proposed destination
 

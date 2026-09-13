@@ -1,5 +1,11 @@
 # Layer 3: Runtime registry and invocation
 
+Implemented: `Registry` owns isolated catalogs; descriptors retain their base graphs.
+Publication rejects name conflicts. Runtime inheritance lookup does not read a catalog.
+`describe_class<T>()` generates full metadata without publication; `describe_interface<T>()`
+records method declarations without linking implementations. See [current state](current-state.md).
+
+
 ## Implemented metadata ownership
 
 Public class, enum, and member handles retain const shared metadata. Registration

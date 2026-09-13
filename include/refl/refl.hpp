@@ -23,6 +23,7 @@
 
 #include <refl/reflect/native.hpp>
 #include <refl/runtime/invoke.hpp>
+#include <refl/runtime/registry.hpp>
 
 #include <meta>
 #include <algorithm>
@@ -43,42 +44,6 @@
 #include <vector>
 
 namespace refl {
-
-// ---------------------------------------------------------------------------
-// Global class and enum pools — Meyers singletons to avoid SIOF.
-//
-// Pools publish const snapshots. Objects and metadata handles share ownership
-// of their descriptors, including after a catalog entry is replaced. Metadata
-// ownership does not retain concrete receivers or callable contexts.
-// ---------------------------------------------------------------------------
-inline std::unordered_map<std::string, std::shared_ptr<const ClassInfo>>& class_pool() {
-    static std::unordered_map<std::string, std::shared_ptr<const ClassInfo>> pool;
-    return pool;
-}
-
-inline std::unordered_map<std::string, std::shared_ptr<const EnumInfo>>& enum_pool() {
-    static std::unordered_map<std::string, std::shared_ptr<const EnumInfo>> pool;
-    return pool;
-}
-
-inline std::mutex& pool_mutex() {
-    static std::mutex m;
-    return m;
-}
-
-struct Registrar {
-    explicit Registrar(const ClassInfo& info) {
-        std::lock_guard<std::mutex> lk(pool_mutex());
-        class_pool()[info.name] = std::make_shared<const ClassInfo>(info);
-    }
-};
-
-struct EnumRegistrar {
-    explicit EnumRegistrar(const EnumInfo& info) {
-        std::lock_guard<std::mutex> lk(pool_mutex());
-        enum_pool()[info.name] = std::make_shared<const EnumInfo>(info);
-    }
-};
 
 // Forward declaration — defined later, used by the base-hierarchy helpers.
 class Class;
@@ -232,76 +197,20 @@ Object borrow_object(void* ptr, std::shared_ptr<const ClassInfo> info);
 
 namespace detail {
 
-// Unlocked helper — caller must hold pool_mutex.
-// Returns the byte offset of `base_name` within `derived_name` (accumulated
-// through the base hierarchy), or nullopt if not found.  Offset 0 means
-// either exact match or first base.
-inline std::optional<std::ptrdiff_t>
-base_offset_unlocked(std::string_view derived_name, std::string_view base_name) {
-    if (derived_name == base_name) return 0;
-    auto it = class_pool().find(std::string(derived_name));
-    if (it == class_pool().end()) return std::nullopt;
-    for (const auto& b : it->second->bases) {
-        if (b.name == base_name) return b.offset;
-        auto deeper = base_offset_unlocked(b.name, base_name);
-        if (deeper) return b.offset + *deeper;
-    }
-    return std::nullopt;
-}
-
-// Collect every distinct byte offset from `derived_name` to `base_name`,
-// one per path through the base hierarchy.  Used for ambiguity detection:
-// more than one distinct offset means the base subobject is reached via
-// two paths (a diamond), so an unqualified lookup is ambiguous (C++ would
-// reject it).  Offsets are deduped so empty-base-optimisation merges that
-// land on the same address count as one subobject.
-//
-// ponytail: walks all paths, O(2^n) in pathological diamond lattices; fine
-// for realistic hierarchies.  Virtual inheritance is unsupported (offset_of
-// is not constant for virtual bases), matching the rest of the framework.
 inline std::set<std::ptrdiff_t>
-base_path_offsets_unlocked(std::string_view derived_name, std::string_view base_name) {
+base_path_offsets(const ClassInfo* derived, std::string_view base) {
     std::set<std::ptrdiff_t> offsets;
-    if (derived_name == base_name) { offsets.insert(0); return offsets; }
-    auto it = class_pool().find(std::string(derived_name));
-    if (it == class_pool().end()) return offsets;
-    for (const auto& b : it->second->bases) {
-        if (b.name == base_name) offsets.insert(b.offset);
-        for (auto o : base_path_offsets_unlocked(b.name, base_name))
-            offsets.insert(b.offset + o);
+    if (!derived) return offsets;
+    if (derived->name == base) { offsets.insert(0); return offsets; }
+    for (const auto& b : derived->bases) {
+        if (b.name == base) offsets.insert(b.offset);
+        for (auto offset : base_path_offsets(b.descriptor.get(), base))
+            offsets.insert(b.offset + offset);
     }
     return offsets;
 }
-
-// Check whether `base_name` is a base class of `derived_name` by walking
-// the registered bases hierarchy.  Used by Object::is_class and cast_safe
-// for runtime upcast checks.
-inline bool is_base_of_unlocked(std::string_view derived_name, std::string_view base_name) {
-    return base_offset_unlocked(derived_name, base_name).has_value();
-}
-
-// Check whether `base_name` is a base class of `derived_name`.
-// Also returns the accumulated byte offset if it is.
-inline std::optional<std::ptrdiff_t>
-is_base_of_with_offset(std::string_view derived_name, std::string_view base_name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    return base_offset_unlocked(derived_name, base_name);
-}
-
-inline bool is_base_of(std::string_view derived_name, std::string_view base_name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    return is_base_of_unlocked(derived_name, base_name);
-}
-
-// Lookup a registered class by name, returning a shared_ptr to the
-// ClassInfo (null if not found).  The pool is append-only, so the
-// shared_ptr (and the raw pointer it yields) remain valid after the
-// lock is released.  Used by the dyn/proxy dispatch layer and by
-// ensure_class_info<T>() to find pool-registered types.
 inline std::shared_ptr<const ClassInfo> lookup_class_info(std::string_view name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    auto it = class_pool().find(std::string(name));
-    return it != class_pool().end() ? it->second : nullptr;
+    return default_registry().find_class(name);
 }
 
 // Get a shared_ptr<const ClassInfo> for type T.  If T is registered in
@@ -327,77 +236,36 @@ std::shared_ptr<const ClassInfo> ensure_class_info() {
     return info;
 }
 
-// Upcast offset with diamond-ambiguity check.  Returns the byte offset
-// if the base is uniquely reachable; Error::Ambiguous if reachable via
-// 2+ distinct offsets (a diamond — C++ rejects an unqualified upcast
-// to the shared base); Error::TypeError if not a base at all.
-// Used by Object::cast_safe / cast_ref — the cast must not silently pick
-// one of two base subobjects.
 inline std::expected<std::ptrdiff_t, Error>
-upcast_offset_unlocked(std::string_view derived_name, std::string_view base_name) {
-    auto offsets = base_path_offsets_unlocked(derived_name, base_name);
+upcast_offset(const ClassInfo* derived, std::string_view base) {
+    auto offsets = base_path_offsets(derived, base);
     if (offsets.empty()) return std::unexpected(Error::TypeError);
     if (offsets.size() > 1) return std::unexpected(Error::Ambiguous);
     return *offsets.begin();
 }
-
-inline std::expected<std::ptrdiff_t, Error>
-upcast_offset(std::string_view derived_name, std::string_view base_name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    return upcast_offset_unlocked(derived_name, base_name);
-}
-
-// Adjust a pointer from a most-derived object to a base subobject.
-// Returns nullptr if the base is not found (guards against pool races
-// after is_class passed).  Caller need not hold pool_mutex — this helper
-// takes it for the offset lookup.
-//
-// ponytail: the call sites do is_class() then adjust_to_base() in two
-// separate lock acquisitions.  This is a TOCTOU window in theory, but the
-// pool is append-only at static-init time — no unregister exists — so a
-// class cannot disappear between the check and the adjustment.
-inline void* adjust_to_base(void* obj, std::string_view derived_name,
-                            std::string_view base_name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    auto off = base_offset_unlocked(derived_name, base_name);
-    if (!off) return nullptr;
-    return static_cast<char*>(obj) + *off;
+inline void* adjust_to_base(void* obj, const ClassInfo* derived, std::string_view base) {
+    auto offset = upcast_offset(derived, base);
+    return offset ? static_cast<char*>(obj) + *offset : nullptr;
 }
 
 }  // namespace detail
 
-// ---------------------------------------------------------------------------
-// Registration — the single responsibility of the core.
-//
-// Call ensure_registered<T>() (or instantiate refl::Reg<T> as a static
-// variable) to trigger static-initialisation of RegistrarHolder<T>::registrar,
-// which populates the global pool with T's metadata.  Once registered, T is
-// found via find_class("T") and constructed/called through type-erased
-// handles — no wrapper object needed at call sites.
-// ---------------------------------------------------------------------------
-
-template <typename T>
-class RegistrarHolder {
-    static ClassInfo make_info();
-public:
-    static inline const Registrar registrar{make_info()};
-};
-
-// Enum registration — triggered when T is an enum type.
-template <typename T>
-class EnumRegistrarHolder {
-    static EnumInfo make_enum_info();
-public:
-    static inline const EnumRegistrar registrar{make_enum_info()};
-};
-
-template <typename T>
-inline void ensure_registered() {
-    if constexpr (std::is_enum_v<T>) {
-        (void)EnumRegistrarHolder<T>::registrar;
-    } else {
-        (void)RegistrarHolder<T>::registrar;
-    }
+template<class T> ClassInfo generate_class();
+template<class T> EnumInfo generate_enum();
+template<class T> std::shared_ptr<const ClassInfo> describe_class() {
+    static const auto info = std::make_shared<const ClassInfo>(generate_class<T>());
+    return info;
+}
+template<class T> std::shared_ptr<const EnumInfo> describe_enum() {
+    static const auto info = std::make_shared<const EnumInfo>(generate_enum<T>());
+    return info;
+}
+template<class T> void ensure_registered() {
+    auto result = [] {
+        if constexpr (std::is_enum_v<T>) return default_registry().publish(describe_enum<T>());
+        else return default_registry().publish(describe_class<T>());
+    }();
+    if (!result) throw ReflectionError(result.error());
 }
 
 // Registration-only tag.  Instantiate as a static variable to register T
@@ -511,7 +379,7 @@ public:
     bool is_class(std::string_view name) const {
         if (!valid()) return false;
         if (class_name() == name) return true;
-        return detail::is_base_of(class_name(), name);
+        return !detail::base_path_offsets(class_info_.get(), name).empty();
     }
 
     // Owning cast — returns a shared_ptr<T> that keeps the object alive.
@@ -525,7 +393,7 @@ public:
         if (!is_owned()) return std::unexpected(Error::NotOwned);
         if (read_only_ && !std::is_const_v<T>) return std::unexpected(Error::ReadOnly);
         const auto tname = detail::type_name<std::remove_const_t<T>>();
-        auto off = detail::upcast_offset(class_name(), tname);
+        auto off = detail::upcast_offset(class_info_.get(), tname);
         if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return std::shared_ptr<T>(owner_,
@@ -541,7 +409,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (read_only_ && !std::is_const_v<T>) return std::unexpected(Error::ReadOnly);
         const auto tname = detail::type_name<std::remove_const_t<T>>();
-        auto off = detail::upcast_offset(class_name(), tname);
+        auto off = detail::upcast_offset(class_info_.get(), tname);
         if (!off) return std::unexpected(off.error());
         auto* adjusted = static_cast<char*>(ptr_) + *off;
         return static_cast<T*>(static_cast<void*>(adjusted));
@@ -649,7 +517,7 @@ inline Result<ObjectView> project_legacy_view(ObjectView view, const ClassInfo& 
     if (view.type().type == declaring.identity) return view;
     if (!view.native_descriptor() || !declaring.make_view)
         return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch});
-    auto offset = upcast_offset(view.native_descriptor()->name, declaring.name);
+    auto offset = upcast_offset(view.native_descriptor().get(), declaring.name);
     if (!offset) return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch});
     return declaring.make_view(static_cast<char*>(const_cast<void*>(view.address())) + *offset,
                                view.anchor(), view.read_only());
@@ -658,12 +526,14 @@ inline void project_legacy_arguments(std::span<ArgumentView> arguments, const Si
     if (arguments.size() != signature.parameters.size()) return;
     for (std::size_t i = 0; i < arguments.size(); ++i) {
         if (arguments[i].object.type().type == signature.parameters[i].type) continue;
-        std::shared_ptr<const ClassInfo> expected;
-        {
-            std::lock_guard<std::mutex> lock(pool_mutex());
-            for (const auto& [name, info] : class_pool())
-                if (info->identity == signature.parameters[i].type) { expected = info; break; }
-        }
+        auto find = [&](auto& self, const std::shared_ptr<const ClassInfo>& descriptor) -> std::shared_ptr<const ClassInfo> {
+            if (!descriptor) return {};
+            if (descriptor->identity == signature.parameters[i].type) return descriptor;
+            for (const auto& base : descriptor->bases)
+                if (auto match = self(self, base.descriptor)) return match;
+            return {};
+        };
+        auto expected = find(find, arguments[i].object.native_descriptor());
         if (expected) {
             auto converted = project_legacy_view(arguments[i].object, *expected);
             if (converted) arguments[i].object = *converted;
@@ -685,30 +555,10 @@ inline Result<CallResult> invoke_native(const NativeOperation& operation, const 
     return invoke_target(*target, frame, operation.descriptor.member, ExportKind::erased);
 }
 
-// Build an Object from argument I.  Non-const lvalue args borrow the
-// caller's variable directly (so functions with T& out-params write through
-// to the caller); rvalue and const-lvalue args borrow the tuple copy (rvalues
-// need stable storage; const lvalues can't be borrowed mutably by design).
-//
-// lvalue-ness is determined from the Args pack (not from std::get on the
-// forward_as_tuple result): std::get on tuple<T&&> returns T& due to reference
-// collapsing, which would misclassify rvalues as lvalues.
-template <std::size_t I, typename Tuple, typename ArgType, typename ArgRef>
-Object make_arg_ref(Tuple& storage, ArgRef&& arg) {
-    if constexpr (std::is_lvalue_reference_v<ArgType> &&
-                 !std::is_const_v<std::remove_reference_t<ArgType>>) {
-        return Object(arg);                  // non-owning borrow of caller's lvalue
-    } else {
-        return Object(std::get<I>(storage)); // borrow the tuple element
-    }
-}
-
 template <typename... Args>
 std::expected<const Object*, Error>
-prepare_args(std::optional<std::tuple<std::decay_t<Args>...>>& storage,
-             std::array<Object, sizeof...(Args)>& refs,
+prepare_args(std::array<Object, sizeof...(Args)>& refs,
              std::size_t param_count, Args&&... args) {
-    (void)storage; // Kept in the legacy signature during migration.
     if (sizeof...(Args) != param_count)
         return std::unexpected(Error::ArityMismatch);
     if constexpr (sizeof...(Args) == 0) return nullptr;
@@ -737,7 +587,7 @@ decltype(auto) extract_arg(const Object* args, std::size_t J) {
     constexpr auto param_type = type_name<PBare>();
     void* src = args[J].raw();
     if (args[J].class_name() != param_type) {
-        auto off = is_base_of_with_offset(args[J].class_name(), param_type);
+        auto off = upcast_offset(args[J].class_info().get(), param_type);
         if (!off) throw std::bad_cast{};
         src = static_cast<char*>(src) + *off;
     }
@@ -805,7 +655,7 @@ void setter(void* obj, const Object* val) {
     constexpr auto member_type = type_name<MemberBare>();
     void* src = val->raw();
     if (val->class_name() != member_type) {
-        auto off = is_base_of_with_offset(val->class_name(), member_type);
+        auto off = upcast_offset(val->class_info().get(), member_type);
         if (!off) throw std::bad_cast{};
         src = static_cast<char*>(src) + *off;
     }
@@ -843,7 +693,7 @@ void static_setter(const Object* val) {
     constexpr auto member_type = type_name<MemberBare>();
     void* src = val->raw();
     if (val->class_name() != member_type) {
-        auto off = is_base_of_with_offset(val->class_name(), member_type);
+        auto off = upcast_offset(val->class_info().get(), member_type);
         if (!off) throw std::bad_cast{};
         src = static_cast<char*>(src) + *off;
     }
@@ -894,7 +744,7 @@ auto checked_call(Fn&& fn, CallArgs&&... args)
 // ---------------------------------------------------------------------------
 
 template <typename T>
-ClassInfo RegistrarHolder<T>::make_info() {
+ClassInfo generate_class() {
     ClassInfo info;
     info.name = std::string(std::meta::display_string_of(^^T));
     reflect_detail::populate_operations<T>(info);
@@ -910,6 +760,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
             info.bases.push_back({
                 std::string(std::meta::display_string_of(std::meta::type_of(b))),
                 std::meta::offset_of(b).bytes,
+                describe_class<typename reflect_detail::reflected_type<std::meta::type_of(b)>::type>(),
             });
         }
     }
@@ -1115,7 +966,7 @@ ClassInfo RegistrarHolder<T>::make_info() {
 // ---------------------------------------------------------------------------
 
 template <typename T>
-EnumInfo EnumRegistrarHolder<T>::make_enum_info() {
+EnumInfo generate_enum() {
     EnumInfo info;
     info.name = std::string(std::meta::display_string_of(^^T));
 
@@ -1143,10 +994,6 @@ public:
     Constructor(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
 
-    // Compatibility: raw metadata is copied, never borrowed.
-    Constructor(const ClassInfo* owner, std::size_t idx)
-        : Constructor(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
-
     const std::vector<std::string>& param_types() const {
         return owner_->constructors[idx_].param_types;
     }
@@ -1163,11 +1010,10 @@ public:
             std::array<ArgumentView, sizeof...(Args)> arguments{detail::native_argument(std::forward<Args>(args))...};
             auto result = detail::invoke_native(*native, *owner_, {}, arguments);
             if (!result) return std::unexpected(detail::legacy_error(result.error()));
-            return detail::legacy_result(std::move(*result), native->result_descriptor());
+            return detail::legacy_result(std::move(*result), owner_);
         }
-        std::optional<std::tuple<std::decay_t<Args>...>> storage;
         std::array<Object, sizeof...(Args)> refs;
-        auto args_ptr = detail::prepare_args(storage, refs,
+        auto args_ptr = detail::prepare_args(refs,
                                              ci.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
@@ -1187,10 +1033,6 @@ public:
     Function() = default;
     Function(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
-
-    // Compatibility: raw metadata is copied, never borrowed.
-    Function(const ClassInfo* owner, std::size_t idx)
-        : Function(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1219,13 +1061,12 @@ public:
             if (!result) return std::unexpected(detail::legacy_error(result.error()));
             return detail::legacy_result(std::move(*result), native->result_descriptor());
         }
-        std::optional<std::tuple<std::decay_t<Args>...>> storage;
         std::array<Object, sizeof...(Args)> refs;
-        auto args_ptr = detail::prepare_args(storage, refs,
+        auto args_ptr = detail::prepare_args(refs,
                                              fi.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
-        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_info().get(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(fi.invoker, obj.owner(), adj, *args_ptr);
     }
@@ -1255,10 +1096,6 @@ public:
     Field(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
 
-    // Compatibility: raw metadata is copied, never borrowed.
-    Field(const ClassInfo* owner, std::size_t idx)
-        : Field(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
-
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
     bool is_const() const { return owner_->fields[idx_].is_const; }
@@ -1277,7 +1114,7 @@ public:
             if (!result) return std::unexpected(detail::legacy_error(result.error()));
             return detail::legacy_result(std::move(*result), native->result_descriptor());
         }
-        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_info().get(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return detail::checked_call(owner_->fields[idx_].getter, adj);
     }
@@ -1294,7 +1131,7 @@ public:
         if (!valid()) return std::unexpected(Error::NullHandle);
         if (!obj.valid()) return std::unexpected(Error::NullHandle);
         if (is_const() || obj.read_only()) return std::unexpected(Error::ReadOnly);
-        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_info().get(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<char*>(adj) + owner_->fields[idx_].offset;
     }
@@ -1312,7 +1149,7 @@ public:
         if (obj.read_only() && !std::is_const_v<T>) return std::unexpected(Error::ReadOnly);
         if (detail::type_name<T>() != owner_->fields[idx_].type)
             return std::unexpected(Error::TypeError);
-        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_info().get(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         return static_cast<T*>(static_cast<void*>(
             static_cast<char*>(adj) + owner_->fields[idx_].offset));
@@ -1334,7 +1171,7 @@ public:
             if (!result) return std::unexpected(detail::legacy_error(result.error()));
             return {};
         }
-        void* adj = detail::adjust_to_base(obj.raw(), obj.class_name(), owner_->name);
+        void* adj = detail::adjust_to_base(obj.raw(), obj.class_info().get(), owner_->name);
         if (!adj) return std::unexpected(Error::TypeError);
         std::decay_t<V> storage(std::forward<V>(val));
         Object val_ref(storage);
@@ -1356,10 +1193,6 @@ public:
     StaticField() = default;
     StaticField(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
-
-    // Compatibility: raw metadata is copied, never borrowed.
-    StaticField(const ClassInfo* owner, std::size_t idx)
-        : StaticField(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
@@ -1443,10 +1276,6 @@ public:
     StaticFunction(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
 
-    // Compatibility: raw metadata is copied, never borrowed.
-    StaticFunction(const ClassInfo* owner, std::size_t idx)
-        : StaticFunction(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
-
     const std::string& name() const { return owner_->static_functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
         return owner_->static_functions[idx_].param_types;
@@ -1470,9 +1299,8 @@ public:
             if (!result) return std::unexpected(detail::legacy_error(result.error()));
             return detail::legacy_result(std::move(*result), native->result_descriptor());
         }
-        std::optional<std::tuple<std::decay_t<Args>...>> storage;
         std::array<Object, sizeof...(Args)> refs;
-        auto args_ptr = detail::prepare_args(storage, refs,
+        auto args_ptr = detail::prepare_args(refs,
                                              sf.param_types.size(),
                                              std::forward<Args>(args)...);
         if (!args_ptr) return std::unexpected(args_ptr.error());
@@ -1494,10 +1322,6 @@ public:
     Enumerator(std::shared_ptr<const EnumInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
 
-    // Compatibility: raw metadata is copied, never borrowed.
-    Enumerator(const EnumInfo* owner, std::size_t idx)
-        : Enumerator(owner ? std::make_shared<const EnumInfo>(*owner) : nullptr, idx) {}
-
     const std::string& name() const { return owner_->enumerators[idx_].name; }
     long long value() const { return owner_->enumerators[idx_].value; }
 
@@ -1513,10 +1337,6 @@ class Enum {
 public:
     Enum() = default;
     explicit Enum(std::shared_ptr<const EnumInfo> info) : info_(std::move(info)) {}
-
-    // Compatibility: raw metadata is copied, never borrowed.
-    explicit Enum(const EnumInfo* info)
-        : Enum(info ? std::make_shared<const EnumInfo>(*info) : nullptr) {}
 
     const std::string& name() const {
         static const std::string empty;
@@ -1547,10 +1367,6 @@ public:
     Base(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
         : owner_(std::move(owner)), idx_(idx) {}
 
-    // Compatibility: raw metadata is copied, never borrowed.
-    Base(const ClassInfo* owner, std::size_t idx)
-        : Base(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
-
     const std::string& name() const { return owner_->bases[idx_].name; }
     std::ptrdiff_t offset() const { return owner_->bases[idx_].offset; }
 
@@ -1571,10 +1387,6 @@ class Class {
 public:
     Class() = default;
     explicit Class(std::shared_ptr<const ClassInfo> info) : info_(std::move(info)) {}
-
-    // Compatibility: raw metadata is copied, never borrowed.
-    explicit Class(const ClassInfo* info)
-        : Class(info ? std::make_shared<const ClassInfo>(*info) : nullptr) {}
 
     const std::string& name() const {
         static const std::string empty;
@@ -1708,13 +1520,12 @@ private:
     // Drop handles whose declaring class is reachable from `derived` via
     // more than one base-subobject path (a diamond).  An unqualified C++
     // lookup of such a member is ambiguous, so the framework does not
-    // return it.  Caller must hold pool_mutex.
     template <typename Handle>
     static void exclude_ambiguous(std::vector<Handle>& v,
-                                 std::string_view derived) {
+                                 const ClassInfo* derived) {
         v.erase(std::remove_if(v.begin(), v.end(),
             [derived](const Handle& h) {
-                return detail::base_path_offsets_unlocked(
+                return detail::base_path_offsets(
                     derived, h.owner_->name).size() > 1;
             }), v.end());
     }
@@ -1727,41 +1538,17 @@ private:
 // ---------------------------------------------------------------------------
 
 inline std::expected<Class, Error> find_class(std::string_view name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    auto it = class_pool().find(std::string(name));
-    if (it == class_pool().end())
-        return std::unexpected(Error::NotFound);
-    return Class(it->second);
+    auto info = default_registry().find_class(name);
+    if (!info) return std::unexpected(Error::NotFound);
+    return Class(std::move(info));
 }
-
-// Enumerate all registered class names.
-inline std::vector<std::string> list_all_classes() {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    std::vector<std::string> names;
-    names.reserve(class_pool().size());
-    for (const auto& [name, info] : class_pool())
-        names.push_back(name);
-    return names;
-}
-
-// Find an enum by runtime string name.
+inline std::vector<std::string> list_all_classes() { return default_registry().class_names(); }
 inline std::expected<Enum, Error> find_enum(std::string_view name) {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    auto it = enum_pool().find(std::string(name));
-    if (it == enum_pool().end())
-        return std::unexpected(Error::NotFound);
-    return Enum(it->second);
+    auto info = default_registry().find_enum(name);
+    if (!info) return std::unexpected(Error::NotFound);
+    return Enum(std::move(info));
 }
-
-// Enumerate all registered enum names.
-inline std::vector<std::string> list_all_enums() {
-    std::lock_guard<std::mutex> lk(pool_mutex());
-    std::vector<std::string> names;
-    names.reserve(enum_pool().size());
-    for (const auto& [name, info] : enum_pool())
-        names.push_back(name);
-    return names;
-}
+inline std::vector<std::string> list_all_enums() { return default_registry().enum_names(); }
 
 // ---------------------------------------------------------------------------
 // Base-hierarchy lookup helpers.
@@ -1778,7 +1565,7 @@ inline std::vector<std::string> list_all_enums() {
 //     C++ (which rejects the unqualified access as ambiguous).
 //
 // Ambiguity is decided by the number of distinct byte-offset paths from the
-// derived class to the declaring class (base_path_offsets_unlocked); >1 is
+// derived class to the declaring class (base_path_offsets); >1 is
 // a diamond.  Two different sibling bases each declaring the name also yield
 // 2+ subobjects and are reported as ambiguous for singular lookups, but
 // each declaration (uniquely reachable) is still listed by the plural views.
@@ -1811,15 +1598,13 @@ std::set<std::string> own_names(const std::vector<Member>& members) {
 // in C's base hierarchy, respecting name hiding: a base that declares `name`
 // hides the same name in its own bases (we don't descend into them);
 // sibling bases are all searched (their declarations may be ambiguous).
-// Caller must hold pool_mutex.
 template <typename Info>
 void collect_base_named(const ClassInfo* C, std::string_view name,
     const std::vector<Info> ClassInfo::* vec,
     std::vector<MemberLocation>& out) {
     for (const auto& b : C->bases) {
-        auto it = class_pool().find(b.name);
-        if (it == class_pool().end()) continue;
-        const auto& bc = it->second;
+        const auto& bc = b.descriptor;
+        if (!bc) continue;
         auto idxs = own_indices((*bc).*vec, name);
         if (!idxs.empty()) {
             for (auto i : idxs) out.emplace_back(bc, i);
@@ -1841,7 +1626,6 @@ inline void dedup_decl(
 // Number of distinct base subobjects that offer `name` in C's hierarchy.
 // Multiple overloads in the same base share one subobject, so they count
 // once.  >1 means an unqualified lookup is ambiguous (diamond or siblings).
-// Caller must hold pool_mutex.
 inline std::size_t subobject_count(
     const ClassInfo* C,
     const std::vector<MemberLocation>& decls) {
@@ -1850,7 +1634,7 @@ inline std::size_t subobject_count(
         classes.insert(ci->name);
     std::size_t total = 0;
     for (const auto& cn : classes)
-        total += base_path_offsets_unlocked(C->name, cn).size();
+        total += base_path_offsets(C, cn).size();
     return total;
 }
 
@@ -1869,7 +1653,6 @@ std::expected<Handle, Error> find_named(const std::shared_ptr<const ClassInfo>& 
 
     std::vector<MemberLocation> decls;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         collect_base_named(C.get(), name, vec, decls);
         dedup_decl(decls);
         if (subobject_count(C.get(), decls) >= 2) return std::unexpected(Error::Ambiguous);
@@ -1903,7 +1686,6 @@ std::expected<Handle, Error> find_named_sig(const std::shared_ptr<const ClassInf
 
     std::vector<MemberLocation> decls;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         collect_base_named(C.get(), name, vec, decls);
         dedup_decl(decls);
         if (subobject_count(C.get(), decls) >= 2) return std::unexpected(Error::Ambiguous);
@@ -1929,11 +1711,10 @@ std::vector<Handle> find_all_named(const std::shared_ptr<const ClassInfo>& C,
 
     std::vector<MemberLocation> decls;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         collect_base_named(C.get(), name, vec, decls);
         dedup_decl(decls);
         std::erase_if(decls, [&](const auto& p) {
-            return base_path_offsets_unlocked(C->name, p.first->name).size() > 1;
+            return base_path_offsets(C.get(), p.first->name).size() > 1;
         });
     }
     for (const auto& [ci, idx] : decls)
@@ -1943,7 +1724,6 @@ std::vector<Handle> find_all_named(const std::shared_ptr<const ClassInfo>& C,
 
 // Collect every member across the hierarchy (all names), respecting name
 // hiding (a class's own names hide same-name members in its bases).
-// Caller must hold pool_mutex.
 template <typename Handle, typename Info>
 void collect_all_unlocked(const std::shared_ptr<const ClassInfo>& C,
     const std::vector<Info> ClassInfo::* vec,
@@ -1952,10 +1732,9 @@ void collect_all_unlocked(const std::shared_ptr<const ClassInfo>& C,
     for (std::size_t i = 0; i < ((*C).*vec).size(); ++i)
         results.emplace_back(C, i);
     for (const auto& b : C->bases) {
-        auto it = class_pool().find(b.name);
-        if (it == class_pool().end()) continue;
+        if (!b.descriptor) continue;
         std::vector<Handle> more;
-        collect_all_unlocked<Handle, Info>(it->second, vec, more);
+        collect_all_unlocked<Handle, Info>(b.descriptor, vec, more);
         for (auto& h : more)
             if (!hidden.count(h.name()))
                 results.push_back(std::move(h));
@@ -2000,14 +1779,13 @@ inline FunctionSearchResult find_function_in_hierarchy(
     if (name_exists) return {nullptr, 0};
 
     std::vector<MemberLocation> decls;
-    std::lock_guard<std::mutex> lk(pool_mutex());
     collect_base_named(C, name, &ClassInfo::functions, decls);
     dedup_decl(decls);
     if (subobject_count(C, decls) >= 2) return {nullptr, 0};
     for (const auto& [ci, idx] : decls)
         if (match_signature(ci->functions[idx].param_types, param_types))
             return {&ci->functions[idx],
-                    base_offset_unlocked(C->name, ci->name).value_or(0)};
+                    upcast_offset(C, ci->name).value_or(0)};
     return {nullptr, 0};
 }
 
@@ -2020,13 +1798,12 @@ inline FieldSearchResult find_field_in_hierarchy(
             return {&C->fields[i], 0};
 
     std::vector<MemberLocation> decls;
-    std::lock_guard<std::mutex> lk(pool_mutex());
     collect_base_named(C, name, &ClassInfo::fields, decls);
     dedup_decl(decls);
     if (subobject_count(C, decls) >= 2) return {nullptr, 0};
     if (!decls.empty())
         return {&decls[0].first->fields[decls[0].second],
-                base_offset_unlocked(C->name, decls[0].first->name).value_or(0)};
+                upcast_offset(C, decls[0].first->name).value_or(0)};
     return {nullptr, 0};
 }
 
@@ -2081,11 +1858,10 @@ inline std::vector<Field> Class::all_fields() const {
     std::vector<Field> results;
     if (!valid()) return results;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         detail::collect_all_unlocked<Field, FieldInfo>(
             info_, &ClassInfo::fields, results);
         dedup_handles(results);
-        exclude_ambiguous(results, info_->name);
+        exclude_ambiguous(results, info_.get());
     }
     return results;
 }
@@ -2109,11 +1885,10 @@ inline std::vector<Function> Class::all_functions() const {
     std::vector<Function> results;
     if (!valid()) return results;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         detail::collect_all_unlocked<Function, FunctionInfo>(
             info_, &ClassInfo::functions, results);
         dedup_handles(results);
-        exclude_ambiguous(results, info_->name);
+        exclude_ambiguous(results, info_.get());
     }
     return results;
 }
@@ -2151,11 +1926,10 @@ inline std::vector<StaticField> Class::all_static_fields() const {
     std::vector<StaticField> results;
     if (!valid()) return results;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         detail::collect_all_unlocked<StaticField, StaticFieldInfo>(
             info_, &ClassInfo::static_fields, results);
         dedup_handles(results);
-        exclude_ambiguous(results, info_->name);
+        exclude_ambiguous(results, info_.get());
     }
     return results;
 }
@@ -2186,19 +1960,17 @@ inline std::vector<StaticFunction> Class::all_static_functions() const {
     std::vector<StaticFunction> results;
     if (!valid()) return results;
     {
-        std::lock_guard<std::mutex> lk(pool_mutex());
         detail::collect_all_unlocked<StaticFunction, StaticFunctionInfo>(
             info_, &ClassInfo::static_functions, results);
         dedup_handles(results);
-        exclude_ambiguous(results, info_->name);
+        exclude_ambiguous(results, info_.get());
     }
     return results;
 }
 
 inline Class Base::as_class() const {
     if (!valid()) return Class{};
-    auto c = find_class(owner_->bases[idx_].name);
-    return c.value_or(Class{});
+    return Class(owner_->bases[idx_].descriptor);
 }
 
 // All base classes across the full inheritance graph (transitive),
@@ -2216,13 +1988,10 @@ inline std::vector<Base> Class::all_bases() const {
             const auto& b = C->bases[i];
             if (seen.insert(b.name).second) {
                 results.emplace_back(C, i);
-                auto it = class_pool().find(b.name);
-                if (it != class_pool().end())
-                    self(self, it->second);
+                if (b.descriptor) self(self, b.descriptor);
             }
         }
     };
-    std::lock_guard<std::mutex> lk(pool_mutex());
     walk(walk, info_);
     return results;
 }

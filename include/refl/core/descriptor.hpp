@@ -98,6 +98,7 @@ using NativeViewFn = ObjectView (*)(void*, LifetimeAnchor, bool);
 struct BaseInfo {
     std::string name;
     std::ptrdiff_t offset;  // byte offset of this base within the derived class
+    std::shared_ptr<const ClassInfo> descriptor = {};
 };
 
 struct ClassInfo {

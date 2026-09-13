@@ -107,3 +107,7 @@ test('core_contracts', core_contracts)
 runtime_contracts = executable('test_runtime_contracts', 'test_runtime_contracts.cpp',
   include_directories: inc, install: false)
 test('runtime_contracts', runtime_contracts)
+
+registry_contracts = executable('test_registry', 'test_registry.cpp',
+  include_directories: inc, install: false)
+test('registry_contracts', registry_contracts)

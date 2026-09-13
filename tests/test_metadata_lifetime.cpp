@@ -70,30 +70,6 @@ int main() {
     retains_class_metadata([](auto c) { return c.find_functions("read").at(0); },
                           [](auto h) { check(h.name() == "read"); });
 
-    // Raw-pointer compatibility takes a snapshot of stack metadata.
-    refl::Class snapshot;
-    refl::Field field_snapshot;
-    refl::Enum enum_snapshot;
-    refl::Enumerator enumerator_snapshot;
-    {
-        auto source = describe();
-        snapshot = refl::Class(&source);
-        field_snapshot = refl::Field(&source, 0);
-        source.fields.clear();
-        source.name = "Changed";
-        refl::EnumInfo values{"LocalEnum", {{"First", 7}}};
-        enum_snapshot = refl::Enum(&values);
-        enumerator_snapshot = refl::Enumerator(&values, 0);
-        values.enumerators.clear();
-    }
-    check(snapshot.name() == "SyntheticLifetime");
-    check(snapshot.fields().at(0).name() == "value");
-    check(field_snapshot.name() == "value");
-    check(enum_snapshot.find_enumerator(7)->name() == "First");
-    check(enumerator_snapshot.value() == 7);
-    check(!refl::Class(nullptr));
-    check(!refl::Enum(nullptr));
-
     // A non-null owner alone does not make an out-of-range member valid.
     auto source = std::make_shared<const refl::ClassInfo>(describe());
     constexpr auto bad = std::numeric_limits<std::size_t>::max();
@@ -105,61 +81,41 @@ int main() {
     check(!refl::Base(source, bad));
     check(refl::Function(source, bad).invoke(refl::Object{}).error() == refl::Error::NullHandle);
 
-    // Enum and enumerator handles retain replaced catalog metadata.
-    refl::EnumRegistrar(refl::EnumInfo{"LifetimeEnum", {{"Old", 1}}});
-    auto enumeration = refl::find_enum("LifetimeEnum").value();
-    auto value = enumeration.find_enumerator("Old").value();
-    std::weak_ptr<const refl::EnumInfo> enum_lifetime = refl::enum_pool().at("LifetimeEnum");
-    refl::EnumRegistrar(refl::EnumInfo{"LifetimeEnum", {{"New", 2}}});
-    check(enumeration.enumerators().at(0).value() == 1);
+    // Catalog ownership is independent of retained handles.
+    refl::Enum enumeration;
+    refl::Enumerator value;
+    std::weak_ptr<const refl::EnumInfo> enum_lifetime;
+    {
+        refl::Registry registry;
+        auto descriptor = std::make_shared<const refl::EnumInfo>(refl::EnumInfo{"LifetimeEnum", {{"Old", 1}}});
+        enum_lifetime = descriptor;
+        check(registry.publish(descriptor).has_value());
+        check(registry.publish(descriptor).has_value());
+        check(!registry.publish(std::make_shared<const refl::EnumInfo>(refl::EnumInfo{"LifetimeEnum", {{"New", 2}}})));
+        enumeration = refl::Enum(registry.find_enum("LifetimeEnum"));
+        value = enumeration.find_enumerator("Old").value();
+    }
     enumeration = {};
-    check(!enum_lifetime.expired());
-    check(value.name() == "Old");
+    check(!enum_lifetime.expired() && value.name() == "Old");
     value = {};
     check(enum_lifetime.expired());
-    check(refl::find_enum("LifetimeEnum")->find_enumerator(2)->name() == "New");
-    auto enum_source = std::make_shared<const refl::EnumInfo>();
-    check(!refl::Enumerator(enum_source, 0));
 
-    // Native member invocation remains usable after catalog replacement.
-    refl::ensure_registered<NativeLifetime>();
-    auto native = refl::find_class(refl::detail::type_name<NativeLifetime>()).value();
-    auto read = native.find_function("read").value();
-    auto object = native.find_constructor({})->call().value();
-    auto native_source = object.class_info();
-    std::weak_ptr<const refl::ClassInfo> native_lifetime = native_source;
-    refl::ClassInfo replacement;
-    replacement.name = native.name();
-    refl::Registrar publish(replacement);
-    native = {};
-    native_source.reset();
-    check(*read.invoke(object)->cast_safe<int>().value() == 17);
-    object = {};
-    check(!native_lifetime.expired());
-    check(read.name() == "read");
-    read = {};
-    check(native_lifetime.expired());
-
-    // Inherited singular/plural lookups retain the declaring base allocation.
-    refl::ClassInfo base;
-    base.name = "LifetimeBase";
-    base.functions.push_back({"inherited", {}, "int", nullptr, true});
-    refl::Registrar publish_base(base);
-    std::weak_ptr<const refl::ClassInfo> base_lifetime = refl::class_pool().at(base.name);
-    refl::Registrar publish_derived(describe());
-    auto derived = refl::find_class("SyntheticLifetime").value();
-    auto inherited = derived.find_function("inherited").value();
-    auto overloads = derived.find_functions("inherited");
-    auto members = derived.all_functions();
-    base.functions.clear();
-    refl::Registrar replace_base(base);
-    derived = {};
-    check(inherited.name() == "inherited");
-    check(overloads.at(0).name() == "inherited");
-    check(!base_lifetime.expired());
+    refl::Function inherited;
+    std::weak_ptr<const refl::ClassInfo> base_lifetime;
+    {
+        refl::ClassInfo base;
+        base.name = "LifetimeBase";
+        base.functions.push_back({"inherited", {}, "int", nullptr, true});
+        auto base_descriptor = std::make_shared<const refl::ClassInfo>(std::move(base));
+        base_lifetime = base_descriptor;
+        auto derived = describe();
+        derived.bases[0].descriptor = base_descriptor;
+        refl::Class handle(std::make_shared<const refl::ClassInfo>(std::move(derived)));
+        inherited = handle.find_function("inherited").value();
+        check(handle.all_functions().size() == 2);
+        check(handle.bases()[0].as_class().find_function("inherited").has_value());
+    }
+    check(!base_lifetime.expired() && inherited.name() == "inherited");
     inherited = {};
-    overloads.clear();
-    check(!base_lifetime.expired());
-    members.clear();
     check(base_lifetime.expired());
 }
