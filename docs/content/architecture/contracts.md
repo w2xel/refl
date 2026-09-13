@@ -94,14 +94,47 @@ references to borrows; allow a registration policy to assert receiver, argument,
 callable-context, or external lifetime. A target may instead supply an explicit
 result anchor when the owner depends on the call. Reject exporting a reference
 into call-frame temporary storage unless its backing storage is retained.
-Conservative policy can reject unannotated reference signatures involving
-temporary arguments initially.
+The initial runtime rejects unannotated reference calls involving temporary
+arguments before entering the target.
 
 Callable-context provenance retains the context of the target actually invoked,
 including an inner target when a decorator forwards its result. It must not retain
 whichever replacement happens to occupy the slot after the call. For example, a
 retained reference into a closure remains backed after that closure is replaced;
 a typed `T&` alone does not carry that owner to the caller.
+
+### Exporting a reference to the caller
+
+Result provenance and permission to discard its anchor are separate capabilities.
+Initially, ordinary typed `T&` and `const T&` returns require an explicit
+`caller_borrow` policy: the caller must independently keep the referent alive and
+address-stable throughout the call, synchronous observation, and subsequent use.
+This can describe an independently retained native receiver, a caller-owned lvalue
+argument, or external storage. The framework checks the declared policy and argument
+category; the caller remains responsible for fulfilling that lifetime assertion.
+
+Receiver-, argument-, or callable-context anchors alone do not grant this
+capability. Such results require retained extraction. Unknown provenance cannot
+be exported as a raw typed reference initially. Validate this restriction against
+the selected target before entering user code on every typed reference call, so
+replacement cannot bypass it. Structural binding may still succeed for a member
+whose reference result is available only through retained extraction.
+
+The proposed `try_call_retained<T>(source, member, args...)` returns
+`Result<RetainedRef<T>>`. `RetainedRef<T>` holds the referent address, metadata,
+access capability, and the actual result anchor; `get()` returns `T&` while the
+handle is retained. A const result requires `RetainedRef<const T>`. Reject a known
+unanchored policy before invocation; if a policy supplies its anchor dynamically,
+check the returned anchor before export and report a result-capture failure if it
+is absent. Never substitute the current slot owner for the invoked target's owner.
+Runtime calls returning `ObjectView` retain the same anchor without typed extraction.
+
+For example, a listener can replace a closure after it returns a reference into
+itself. Call-scoped ownership keeps that reference alive during delivery, but
+releasing the last owner on return would leave an ordinary `T&` dangling. Reject
+that ordinary typed call before invocation; the retained operation keeps the old
+closure alive after delivery and replacement. Capturing a generation alone does
+not solve this, because its slots can still be replaced.
 
 An anchor extends ownership, not address stability. Keeping a receiver alive does
 not preserve references into its vector after reallocation or into an erased
@@ -130,12 +163,28 @@ the interface type, so structural conformance never authorizes `cast<T>()`.
 using CallResult = std::variant<VoidResult, Object, ObjectView>;
 using InvokeFn = Result<CallResult> (*)(void* context, CallFrame& frame);
 
-struct CallTarget {
-    InvokeFn invoke;
-    void* context;
-    std::shared_ptr<void> context_owner;
-};
+class CallTarget;  // opaque retained value, produced by validated factories
 ```
+
+`CallTarget` retains an immutable invocation contract: complete signature and
+operation kind, erased thunk and owned context, any bound receiver and its anchor,
+result provenance/export policy, and declared native dependencies. These may live
+in shared internal records; the public API does not expose writable raw pointers.
+Generated native factories and signature-aware callable factories establish the
+contract. Registration options name `result_lifetime` (receiver, argument index,
+`callable_context`, or external) separately from `reference_export` (restricted by
+default, or explicitly `caller_borrow`). `native_dependency` defaults to unknown;
+`independent` is an explicit caller assertion. Per-call result anchors may refine
+ownership but cannot silently grant raw reference-export permission. Raw thunk
+construction is an internal backend boundary whose author must prove the same invariants.
+
+Installing an erased target compares its retained contract with the destination
+operation, including receiver access, signature, result policy, and capabilities.
+An incompatible target fails before publication and leaves the old target intact.
+A saved native target retains its adjusted receiver and concrete storage independently
+of the live provider. Restoring it after reset must never silently bind it to the
+new receiver. Decorators retain the previous target's receiver and result provenance
+when forwarding its result, and combine its dependencies with their own.
 
 `CallFrame` holds a receiver view, a span of argument views, and any temporary
 storage needed until completion. Runtime handles and typed wrappers construct the
@@ -144,7 +193,7 @@ and value category before the target runs. Unsupported implicit conversions fail
 before user code runs. A fast path may reuse a validated binding plan, but must
 preserve those checks that depend on the actual call.
 
-The owner in `CallTarget` keeps the context alive, not necessarily the returned
+The context owner in `CallTarget` keeps the context alive, not necessarily the returned
 reference. Result provenance is a separate concern. Ordinary native functions can
 use a stateless thunk; a replacement can retain a closure; a decorator retains its
 previous `CallTarget`.
@@ -156,6 +205,11 @@ lets target exceptions propagate unchanged. A typed convenience call can transla
 a validation error into `ReflectionError`; a `try_call` exposes the same diagnostic.
 Do not promise a completely non-throwing API unless a separate policy also defines
 allocation failure and target-exception handling.
+Argument preparation, erased result capture, and typed result extraction can also
+throw, including from user-defined copy/move operations. Document these stages
+separately from validation and target execution; a failure after target entry does
+not imply the target had no effects. Observation's completion boundary is defined
+in its [delivery contract](observation.md#delivery-contract).
 
 ## Dispatch handles and resolved calls
 

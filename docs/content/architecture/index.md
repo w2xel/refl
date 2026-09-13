@@ -36,8 +36,8 @@ auto view = try_bind<Drawable>(object).value();
 int pixels = view->render(2);
 
 auto dynamic = Dynamic<Drawable>::from(object).value();
-dynamic.implement(member<Drawable, "render", int(int) const>,
-                  [](int scale) { return 100 * scale; });
+constexpr auto render_member = member<Drawable, "render", int(int) const>;
+dynamic.implement(render_member, [](int scale) { return 100 * scale; }).value();
 
 auto observed = observe(dynamic, observer_error_sink);
 auto subscription = observed.after(render_member, record_result);
@@ -53,19 +53,34 @@ None of these choices changes the concrete C++ type of `Square`.
 
 | Name | Meaning |
 | --- | --- |
+| `Registry` | Application-owned type catalog |
+| `Object` / `ObjectView` | Owned storage / access that can retain an owner or borrow |
 | `Proxy<Interface>` | Typed forwarding through a structural binding |
 | `DispatchTable<Interface>` | Owned slots supplying replaceable operations |
 | `Dynamic<Interface>` | Dispatch table, optional native object, and typed proxy |
 | `Observed<Source>` | Adapter created by `observe(...)` that reports successful calls through itself |
 | `Subscription` | Scoped registration; destruction or `unsubscribe()` removes it |
 | `DispatchHandle` | Retained access to member dispatch |
-| `BindingPlan` / `BindingState` | Reusable structural mapping / per-instance binding |
-| `ResolvedCall` | Selected target, receiver, and owners retained for one call |
 | `CallCompletedEvent` | Read-only, call-scoped successful-completion event |
+| `RetainedRef<T>` | Reference result plus its actual lifetime anchor |
 
 `Dynamic::dispatch()` follows published state changes. `capture_binding()` returns
 a proxy tied to the current generation. `detach_native()` removes the native
-baseline and affected targets; `reset()` publishes a new native generation.
+baseline and affected targets; `reset(Object)` publishes a new native generation.
+`reset_native<T>(args...)` constructs the concrete type explicitly before reset.
+
+Start with the [usage guide](usage.md) for ownership, overload replacement,
+failed binding, state transitions, and retained results. Applications do not need
+to construct binding plans or call frames to use these operations.
+
+### Vocabulary for implementers
+
+`BindingPlan` records a reusable structural mapping; `BindingState` pairs it with
+an instance's dispatch handle. `ResolvedCall` retains the selected target, adjusted
+receiver, and owners for one invocation. `CallFrame` carries arguments and temporary
+storage. `CallTarget` is an opaque validated operation that backend authors can save
+and install. These are implementation and extension contracts, not additional
+steps in the basic application workflow.
 
 ## Dependency direction
 
@@ -96,6 +111,8 @@ them. Typed binding uses generated interface schemas and runtime resolution.
 the table and exposes live dispatch. `Observed` consumes the common dispatch-handle
 contract and runtime checked invocation; integration code connects it to `Dynamic`.
 The runtime never includes `Dynamic` or `Observed`.
+Within runtime, checked invocation is independent of registry and lookup headers;
+observation consumes only that invocation service and core contracts.
 
 ## Layer ownership
 
@@ -142,6 +159,9 @@ Read the assessment, then core contracts and runtime registry and invocation to
 establish the central invariants. Use generation and typed binding to implement
 the bridge. Add dynamic dispatch and call observation once the common call path
 is coherent. The migration chapter turns these boundaries into reviewable changes.
+The generation chapter's [initial capability table](generation.md#initial-callable-capabilities)
+is the reference for first-version support; broader operation sketches describe
+extension points, not a promise that all capabilities ship together.
 
 Diagrams use Mermaid through the existing Material theme's
 [native diagram integration](https://squidfunk.github.io/mkdocs-material/reference/diagrams/).

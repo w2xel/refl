@@ -4,6 +4,12 @@ The runtime makes descriptors discoverable and callable. It depends on core
 contracts; native descriptor generation is a producer, not a prerequisite for
 lookup. Proposed home: `refl/runtime/{registry,lookup,invoke}.hpp`.
 
+Keep `invoke.hpp` independently consumable: it includes contracts, not `registry.hpp`
+or `lookup.hpp`. Native lookup produces resolved operations; invocation consumes
+them without consulting a catalog. Observing an already-bound dispatch handle
+therefore requires neither registry storage nor name-resolution machinery. Enforce
+this boundary with include checks as well as the broader layer rules.
+
 Checked invocation accepts a `DispatchHandle` and produces a `ResolvedCall` before
 entering user code. Native dispatch resolves descriptor operations and receiver
 paths; dispatch tables expose their callable schema and resolve operations without

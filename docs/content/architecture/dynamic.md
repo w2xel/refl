@@ -30,8 +30,9 @@ struct Slot {
     CallTarget current;             // native, replacement, or decorator
 };
 
-auto previous = table.target(render_member);  // owns its context
-table.replace(render_member, make_target(lambda)).value();
+auto previous = table.target(render_member);  // retains contract and bound receiver
+auto replacement = make_target(render_member, lambda).value();
+table.replace(render_member, replacement).value();
 table.replace(render_member, previous).value();
 ```
 
@@ -39,6 +40,15 @@ A saved target owns its callable and receiver context. Replacing a map entry mus
 not destroy a context still referenced by a saved target or an executing call.
 Each invocation retains its selected target in a `ResolvedCall` before user code. This
 also defines behavior when a callable replaces itself reentrantly.
+
+Factories produce the opaque [target contract](contracts.md#one-call-contract).
+`replace` validates that contract against the destination operation before changing
+the slot. Signature, operation-kind, and access mismatches leave the old target
+untouched. Saving and restoring preserves reference-export policy and native
+dependencies as well as the callable. A saved native target installed after reset
+still calls its original retained receiver; `restore(member)` instead selects the
+current generation's baseline. Installing a target tied to another native receiver
+does not make it independent for detachment purposes.
 
 A dispatch table satisfies an interface; it is not an instance of that C++
 interface. Keep storage identity separate from interface schema identity.
@@ -93,7 +103,8 @@ stateDiagram-v2
 | `restore(member)` | Restore native baseline; report unavailable baseline in detached mode |
 | `wrap(member, fn)` | New owned decorator surrounds the current target |
 | `detach_native()` | Drop native baselines and targets with native or unknown dependencies; retain declared independent replacements |
-| `reset(args...)` | Build a new native object and complete slot table; discard replacements/wrappers on success |
+| `reset(Object object)` | Bind the supplied owned object and build a complete slot table; discard replacements/wrappers on success |
+| `reset_native<T>(args...)` | Construct an owned `T`, then perform `reset(Object)` |
 
 For `detach_native`, track native dependencies on generated targets, replacement
 registrations, and wrapper chains. A decorator inherits its previous target's
@@ -110,9 +121,22 @@ detachment guarantee covers these tracked dependencies; it cannot make an
 incorrectly declared borrowed capture safe. Dropping targets from current slots
 does not destroy contexts still owned by saved targets or active calls.
 
-`reset` is transactional with respect to dynamic state publication:
-construction/binding failure leaves the old state. This does not undo external
-side effects in a constructor.
+`reset(Object)` is the fundamental transition. The template parameter of
+`Dynamic<Interface>` describes requirements and does not select a constructor.
+The new object can have a different concrete type, provided binding validates the
+same advertised interface. `reset_native<T>(args...)` is explicit construction
+sugar; no previous-type factory is retained implicitly, including after detachment.
+
+```cpp
+// Target sketch: the implementation can change without changing the interface.
+auto dynamic = Dynamic<Drawable>::from(own(Square{4})).value();
+dynamic.reset(own(Triangle{6, 8})).value();
+dynamic.reset_native<Square>(5).value();
+```
+
+Both operations are transactional with respect to dynamic state publication:
+construction or binding failure leaves the old state. This does not undo external
+side effects in a constructor or caller mutation of a shared native object.
 
 Captured bindings and in-progress calls keep their old generation alive after
 a transition. A captured binding still sees replacements within that generation;
@@ -138,5 +162,9 @@ a mixture of native targets and independent replacements. A destruction counter
 should demonstrate that saved targets retain exactly the contexts they need.
 Include declared native captures, unknown dependencies, closure-owned reference
 results, and an old captured binding alongside live dispatch after reset.
+Reject mismatched erased targets without changing a slot. Save a native target,
+reset to another concrete type, and prove the saved target still uses its original
+receiver while `restore(member)` uses the new baseline. Verify retained reference
+export and rejection of ordinary typed closure references during reentrant replacement.
 
 Next: [call observation](observation.md).

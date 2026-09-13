@@ -66,6 +66,36 @@ and inheritance edges; let the runtime own visibility, hiding, and ambiguity.
 Where compiler metadata cannot describe a `using` declaration, expose the limitation
 or require an explicit policy entry. Do not silently claim raw-C++ equivalence.
 
+### Initial callable capabilities
+
+This table defines the first implementation target, separate from broader metadata
+description. Unsupported call capabilities produce an explicit diagnostic; adapters
+must not quietly drop qualifiers or choose a different overload. The early prototype
+proves the risky method/reference subset; the remaining supported rows need their
+own conformance fixtures before being advertised as implemented. Expanding this
+target requires updating the table and shared fixtures together.
+
+| Feature | Initial runtime and adapter behavior |
+| --- | --- |
+| Ordinary unqualified and `const` instance methods | Support with receiver access validation |
+| `volatile`, `const volatile`, and `&`/`&&` receiver qualifiers | Retain metadata; reject invocation, replacement registration, and interface binding |
+| Native `noexcept` methods | Allow checked runtime invocation; wrapper operations may still throw |
+| `noexcept` interface requirements | Reject typed binding and dispatch-table schema construction; allow a native `noexcept` method to satisfy a throwing requirement |
+| Value, `T&`, `const T&`, and `T&&` parameters | Support exact type uses and supported public upcasts; require explicit consumption for moves |
+| Volatile-qualified parameter or result access | Retain metadata; reject invocation and binding initially |
+| Movable value results, including move-only values; `void` | Support owning results and explicit void success |
+| Immovable value results and rvalue-reference results | Reject invocation and binding initially |
+| Lvalue-reference results | Support erased views and anchored retained extraction; ordinary typed export requires explicit `caller_borrow` policy |
+| Unannotated reference results with temporary arguments | Reject before target entry |
+| Static functions | Support class-level runtime calls; exclude from instance proxy requirements |
+| Native fields | Support available copy/read/write/view operations; retain constness and assignability restrictions |
+| Virtual properties and generated operator syntax | Defer public adapter support until the initial method/reference prototype passes |
+
+Reference policies and retained extraction are specified by
+[core contracts](contracts.md#exporting-a-reference-to-the-caller). Receiver
+qualification restrictions are distinct from reference parameters: rejecting an
+`&&`-qualified method does not reject an ordinary method taking `T&&`.
+
 ## Generate operations, not assumptions about layout
 
 Prefer generated access and cast thunks at the boundary:

@@ -30,13 +30,13 @@ come gradually; start with the smallest split that makes a dependency enforceabl
 | Step | Concrete change | Completion evidence |
 | --- | --- | --- |
 | 0. Establish baseline | Run existing configured tests; add existing dispatch/observation executables to Meson; inventory API/documentation mismatches | Report each component's pass/fail state separately; do not treat unregistered files as tested |
-| 0a. Prove the risky contracts | Build a narrow end-to-end prototype across runtime, proxy, slots, and observation before broad migration | Out-parameter, move-only, and closure-reference scenarios below pass; record initial compile time and dispatch allocations |
+| 0a. Prove the risky contracts | Build a narrow end-to-end prototype across runtime, proxy, slots, and observation before broad migration | Out-parameter, move-only, retained-reference and raw-export rejection scenarios below pass; record initial compile time and dispatch allocations |
 | 1. Extract contracts | Introduce complete type uses/member IDs, immutable descriptor handles, explicit value access, dispatch handles and resolved calls; preserve legacy API translation | Qualifier/case collisions are distinguishable; synthetic handles survive source destruction; contracts compile without reflection |
-| 2. Unify calls | Add common argument frames, validation, result/lifetime policies, and owned call targets; route runtime calls through them | Out-parameter, const, move-only, reference, void, and exception contract scenarios pass; callable-context anchors survive replacement |
+| 2. Unify calls | Add common argument frames, validation, result/lifetime policies, and opaque validated call targets; route runtime calls through them | Out-parameter, const, move-only, reference, void, and exception contract scenarios pass; callable-context anchors survive replacement; mismatched erased targets cannot be installed |
 | 3. Separate generation/publication | Extract native/interface schemas; put pools behind `Registry`; remove global dependency from descriptor relationships | Interface-only description has no linker dependence on method definitions; two isolated registries work |
 | 4. Unify binding | Centralize hierarchy resolution; separate structural plans, binding states, and resolved calls; route typed calls through common frames | Runtime/proxy conformance matrix agrees; failed rebind preserves old view; shared plans isolate instances and observe later replacements |
-| 5. Stabilize dynamic state | Use member-keyed owned targets; separate dispatch table from proxy; implement live dispatch handles and declared capture dependencies | Saved targets survive replacement; wrapping composes; detachment handles tracked and unknown dependencies; captured bindings and live dispatch handles follow their specified generations |
-| 6. Isolate observation | Add public Observed adapter, subscription tokens, read-only events, explicit delivery policy | Native dispatch handles work without Dynamic; source lifetime, reentrancy, listener failure, and subscription survival across reset pass |
+| 5. Stabilize dynamic state | Use member-keyed owned targets; separate dispatch table from proxy; implement live dispatch handles, explicit object reset, and declared capture dependencies | Saved targets preserve receiver and policy across reset to another concrete type; wrapping composes; detachment handles tracked and unknown dependencies; captured bindings and live dispatch handles follow their specified generations |
+| 6. Isolate observation | Add public Observed adapter, subscription tokens, read-only events, explicit delivery and failure stages | Native dispatch handles work without Dynamic or registry lookup; source lifetime, reentrancy, listener failure, capture/extraction failure, and subscription survival across reset pass |
 | 7. Publish the boundaries | Finish header moves behind compatibility includes; align API docs/samples; complete consumer target | Old includes compile; accumulated dependency and standalone-consumer checks pass; diagrams match actual dependencies |
 
 If step 0 exposes failures, record them and fix those blocking the vertical
@@ -60,6 +60,28 @@ replacement. Bind two instances with one structural plan and prove isolation.
 Check that subsequent calls see replacements, captured bindings keep their generation
 after reset, and observed calls follow fresh state while direct calls emit no
 events. Include declared native captures and unknown detachment dependencies.
+
+Exercise the boundary that call-scoped retention alone cannot prove: a closure
+returns a reference, an observer replaces its slot, and the caller then accesses
+the result. `try_call_retained` must keep the original closure alive. The equivalent
+ordinary typed reference call must fail its export-policy check before the target
+runs; do not test this by dereferencing an intentionally dangling reference.
+Also exercise a declared `caller_borrow` with an independently owned lvalue.
+
+Reject an erased target with the wrong signature without changing the slot. Save
+a native target, reset from `Square` to `Triangle`, and verify that the saved target
+still invokes the old receiver while a restored baseline invokes the new one.
+Test `reset(Object)` after detachment and a failed incompatible reset. Inject
+preparation, result-capture, and typed-extraction failures to verify target effects
+and the completion-event boundary, including an extraction failure after delivery.
+
+Use the [initial capability table](generation.md#initial-callable-capabilities) as
+the acceptance scope. Compile explicit rejection fixtures for receiver ref qualifiers,
+volatile access, `noexcept` interface requirements, and unsupported result categories.
+Do not turn prototype limitations into silently reduced signatures. If evidence
+requires revising the subset, update the table, diagnostics, and fixtures before
+broad migration. Promote the [usage sketches](usage.md) into consumer samples as
+their operations become available.
 
 Record clean consumer compile time and direct/runtime/proxy/slot/observed call
 costs and allocation counts on the same toolchain. Use this evidence to decide
@@ -141,6 +163,8 @@ migration guide. A name in an earlier sketch does not imply an implemented API.
 | `Class`, `Function`, `Field`, and related metadata access objects | `ClassHandle`, `FunctionHandle`, `FieldHandle`, and corresponding `*Handle` names | Handles retain their descriptors |
 | Virtual fields used as a generic term | Properties | `FieldDescriptor` denotes native storage; `PropertyDescriptor` denotes capabilities |
 | Unqualified access to live or captured state | `dispatch()` and `capture_binding()` | Live dispatch follows reset; a captured `Proxy<Interface>` keeps its generation |
+| `reset(args...)` with an implied concrete type | `reset(Object)`; `reset_native<T>(args...)` | Supply new storage or name the concrete constructor explicitly; the interface does not choose it |
+| Unrestricted typed reference forwarding | `caller_borrow` policy or `try_call_retained<T>` | Raw typed export requires independent caller lifetime; dispatch-owned references retain the actual result anchor |
 | `Reg<T>` and `ensure_registered<T>()` | `register_type<T>(registry)` | Explicit registration is the primary spelling; the default registry remains available |
 
 Keep `Proxy<Interface>`, `Registry`, `TypeUse`, `BindingPlan`, `CallFrame`, and
@@ -211,11 +235,14 @@ coverage.
 | Const receiver with mutating member | Reject | Reject or unavailable syntax | Same access validation | No success event |
 | Move-only value parameter/result | Explicit consumption | Same category behavior | Generic callable thunk | Observe without copy |
 | Return reference into argument | Correct anchor/borrow | Document typed borrow | Same provenance policy | Retention requires capability |
-| Return reference into replacement closure | Retain invoked context | Typed return remains a borrow | Retained result survives replacement | Preserve result anchor through delivery |
+| Return reference into replacement closure | Retain invoked context | Reject ordinary typed export; offer retained extraction | Retained result survives replacement | Replace during delivery; caller's retained result stays valid |
+| Explicit `caller_borrow` result | Preserve borrow and access policy | Validate policy before target entry; caller retains referent | Recheck selected policy after replacement | Caller lifetime includes delivery and later use |
+| Saved native target across reset | Retain bound receiver | New calls through live views use new generation | Saved target uses old receiver; baseline restore uses new receiver | Subscriptions follow live interface identity |
 | Two instances sharing a structural plan | Resolve each dispatch handle | No instance state in plan | Replacing one leaves the other intact | Events belong to the invoked adapter |
 | Two overloads sharing a name | Select exact declaration | Bind each independently | Replace one only | Subscribe to one only |
 | Ambiguous repeated base | Diagnose | Bind fails | Native wiring uses same resolver | No synthetic success |
 | User exception | Propagate target exception | Same | Same | No success event |
+| Result capture or typed extraction throws | Target effects may remain | Extraction may fail after successful erased call | Preserve selected owners through failure | No event on capture failure; event already delivered before typed extraction failure |
 | Retained member handle | Descriptor remains alive | Plan retains descriptors | Synthetic descriptor remains alive | Event cannot escape unretained storage |
 
 Add lifecycle sequences for save → replace → restore, wrap → wrap → restore,
@@ -237,6 +264,10 @@ adapters; `runtime` cannot include generation; dispatch tables cannot include pr
 no lower layer includes observation. Call observation depends on contracts/runtime
 and cannot include dynamic internals. Integration/umbrella headers are the deliberate
 exceptions.
+Within runtime, `invoke.hpp` cannot include registry or lookup headers. A standalone
+fixture must observe a pre-bound synthetic dispatch handle through checked invocation
+without catalog or name-resolution headers. The observation adapter's direct runtime
+dependency is invocation only.
 Exercise public operations from small consumer programs rather than granting tests
 special access to internals.
 

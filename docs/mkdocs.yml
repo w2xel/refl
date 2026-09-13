@@ -47,6 +47,7 @@ nav:
   - Dyn: dyn.md
   - Architecture:
       - Overview: architecture/index.md
+      - Proposed API usage: architecture/usage.md
       - Repository assessment: architecture/assessment.md
       - "Layer 1: Core contracts": architecture/contracts.md
       - "Layer 2: Reflection and descriptor generation": architecture/generation.md

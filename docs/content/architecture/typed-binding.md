@@ -19,8 +19,6 @@ struct Square {
     int render(int scale) const { return side * side * scale; }
 };
 
-refl::Registry registry;
-refl::register_type<Square>(registry);
 auto square = refl::own(Square{4});
 auto view = refl::try_bind<Drawable>(square).value();
 int pixels = view->render(2);
@@ -28,6 +26,8 @@ int pixels = view->render(2);
 
 The interface has no method bodies and the implementation has no inheritance
 relationship to it. Keep this property through every internal change.
+Binding a known object needs its generated descriptor but no registry publication.
+Use a registry when discovery by name is part of the application workflow.
 
 ## Bind requirements to operations
 
@@ -84,14 +84,15 @@ object. The common dispatch handle and resolved call contracts are defined in
 | Parameter and return type uses | Exact match, preserving qualifiers and references |
 | Const method | Implementation must provide the const receiver guarantee |
 | Mutable method | Const implementation may satisfy it if the full remaining contract matches |
-| `noexcept` method | Implementation must satisfy the guarantee; otherwise reject |
+| `noexcept` interface requirement | Reject initially; a throwing interface may bind a native `noexcept` implementation |
 | Read-only property | Matching read/view capability |
 | Writable property | Matching read/write capabilities |
 | Ambiguous inherited member | Reject binding with path/candidate details |
 | Unsupported qualifier combination | Reject explicitly; never select the first declaration |
 
-If native-looking syntax cannot safely expose a `noexcept` member because wrapper
-validation or result storage can throw, reject that interface requirement initially.
+The [initial capability table](generation.md#initial-callable-capabilities) fixes
+qualifier and result support across entry points. Typed wrappers do not advertise
+`noexcept` initially because validation, storage, and extraction can throw.
 Retaining metadata is not itself a promise that every adapter supports it.
 
 ## Share call semantics
@@ -117,11 +118,15 @@ sequenceDiagram
 
 Do not copy every argument into a decayed tuple in the adapter. Use the common
 argument builder so `T&`, `const T&`, and `T&&` behave consistently with runtime
-invocation. A typed reference return is still a C++ borrow; its validity must
-follow the underlying object's lifetime and mutation rules. Offer a retained-view
-operation when a caller needs lifetime extension.
-That operation retains the declared receiver, argument, or callable-context owner;
-it does not protect an element reference from invalidating mutations.
+invocation. Ordinary typed reference returns require the selected target's explicit
+`caller_borrow` policy and the caller's independent lifetime guarantee. Binding
+validates structural compatibility; each raw reference call additionally checks
+this export capability before invocation. A closure-backed result can therefore
+bind structurally while its ordinary `view->member()` call fails validation.
+Use `try_call_retained<T>(source, member, args...)` for an anchored result instead.
+The [reference-export contract](contracts.md#exporting-a-reference-to-the-caller)
+defines this operation and its failure behavior. Neither a retained view nor a
+captured binding prevents mutations from invalidating the referent's address.
 
 A const proxy grants read-only access to its receiver. It does not make all
 objects reachable through pointer-valued members deeply const. Document that
@@ -142,10 +147,13 @@ code so the dispatch table does not depend on this adapter. The migration guide
 maps the current implementation onto these responsibilities.
 
 Run the structural sample with both unrelated native implementations and a slot
-implementation. Verify mixed-return overloads, ref-qualified rejection/support,
+implementation. Verify mixed-return overloads, explicit ref-qualified rejection,
 const requirements, failed rebinding, move behavior, and inherited receiver paths.
 Use the same out-parameter and move-only scenarios as runtime invocation.
 Bind two instances with one structural plan and prove their targets stay isolated.
 Replace a slot after binding and verify that the next call sees the replacement.
+Include rejection of raw reference export after a replacement changes provenance,
+and retained extraction through an observed adapter that replaces the target during
+delivery. The retained call must preserve observation instead of unwrapping its source.
 
 Next: [dynamic dispatch](dynamic.md).

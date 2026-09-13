@@ -59,13 +59,32 @@ Choose the following initial semantics:
 
 | Situation | Behavior |
 | --- | --- |
-| Target succeeds | Deliver after-only event synchronously |
+| Checked target invocation returns a captured erased result | Deliver after-only event synchronously, before typed extraction |
 | Target fails validation or throws | No success event; preserve the original failure |
+| Argument preparation or delivery bookkeeping fails before target entry | Propagate preparation failure; target is not entered and no event is delivered |
+| Target returns but erased result capture fails | Propagate capture failure; target effects remain and no completion event is available |
+| Typed result extraction throws after delivery | Propagate extraction failure; the completion event has already been delivered |
 | Listener throws | Send exception to a configured non-throwing observer-error sink; continue listeners |
 | Listener subscribes during delivery | New subscription begins with the next event |
 | Listener unsubscribes during delivery | Check active status before each delivery; skip inactive listeners |
 | Listener recursively invokes source | Nested event is delivered synchronously; caller controls recursion |
 | Concurrent subscribe/unsubscribe/invoke | Caller synchronizes in the initial version |
+
+“Completed” means the target returned and its erased result was captured. It does
+not promise that the caller received a typed value. A user-defined move into result
+storage can fail after a target mutation; a later move out can fail after listeners
+run. Keep preparation, target execution, result capture, observer delivery, and typed
+extraction distinct in the documented failure model. `Result` does not convert
+allocation or user copy/move exceptions into validation failures or roll back effects.
+
+Prepare the listener snapshot and required delivery bookkeeping before target entry.
+This fixes the eligible listeners for the outer call; subscriptions added by the
+target or a listener begin with the next call, including a nested call. Check each
+snapshot entry's active flag immediately before delivery. Deliver from this prepared
+state without further adapter-owned allocation after result capture. Optional copies
+or read-back requested by a listener are listener work and use the observer-error
+sink on failure. Result capture itself can still allocate or throw; this is not a
+promise of allocation-free or non-throwing invocation.
 
 Require an explicit observer-error sink when enabling observation; a collecting
 sink is useful for tests. Do not silently discard observer exceptions or turn a
@@ -77,6 +96,21 @@ can be observed without copying it. Listeners that need to retain data must requ
 an owning copy or retained view when the value's capability and lifetime allow it.
 `const Object&` alone is insufficient if its casts still grant mutable access;
 use the contract layer's read-only view.
+
+The event exposes member identity and operation kind, a read-only receiver view
+where applicable, post-call argument views with their original categories, and the
+captured erased result. Argument views describe the supplied argument storage,
+not destroyed by-value parameter locals. Out-parameters reflect writes; arguments
+consumed into by-value parameters may be moved from. There is no implicit snapshot
+of original inputs. Listeners may inspect only what the value's post-call state
+supports. An anchored view of an owning result also does not freeze its value:
+later typed extraction can move from that storage. Retention extends lifetime;
+an explicit supported copy is needed to preserve pre-extraction contents.
+
+`try_call_retained<T>(observed, member, args...)` uses this same delivery path and
+exports the actual result anchor. It must not bypass subscriptions by extracting
+the underlying source handle. Ordinary typed reference calls obey the core
+reference-export check before target entry, even when observation is enabled.
 
 Read-only access through an event does not prevent a listener from mutating the
 same object through another handle. Listeners must respect the invalidation rules
@@ -124,5 +158,10 @@ reentrant calls, move-only results, write-only properties, observer exceptions,
 and subscription survival across replacement/reset. Include a direct-access case
 that deliberately emits no event, so the interception boundary remains visible.
 Also observe a native dispatch handle without creating a dispatch table or typed proxy.
+Inject failures in preparation, erased capture, and typed extraction and assert both
+target effects and event counts. Verify post-call moved-from argument views and
+subscriptions added during target execution. Return a closure reference, replace
+its slot in a listener, and prove retained extraction survives while ordinary typed
+export is rejected before invocation.
 
 Next: [migration and verification](migration.md).
