@@ -1,7 +1,7 @@
-# Architecture vision
+# Architecture and migration
 
-This library should be a small runtime type system generated from C++ declarations,
-with optional typed views, replaceable implementations, and observation. Its
+The library generates runtime metadata from C++ declarations and provides typed
+views, replaceable implementations, and observation. Its
 distinctive capability is the bridge: a caller can discover an object by name,
 then bind it to a typed interface without requiring that object to inherit from
 the interface.
@@ -9,7 +9,11 @@ the interface.
 Keep that bridge central. Make each layer agree on what a type, member, argument,
 reference, and callable means. Convenience APIs should compose those definitions.
 
-!!! info "A target design, not the current API"
+The [implemented architecture](current-state.md) records the extracted core
+metadata boundary and its verified dependencies. The layers below describe the
+remaining destination; migration status distinguishes shipped changes from sketches.
+
+!!! info "Target design beyond the implemented boundaries"
 
     This section reviews repository revision `29ddfd2` and proposes a direction.
     C++ sketches and proposed paths describe the target, not compilable examples

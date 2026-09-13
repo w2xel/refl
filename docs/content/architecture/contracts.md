@@ -1,6 +1,16 @@
 # Layer 1: Core contracts
 
-This layer defines the language spoken by generation, runtime lookup, proxies, and
+## Implemented boundary
+
+`refl/core/descriptor.hpp` defines the existing metadata records and erased
+operation declarations; `refl/core/error.hpp` defines `Error`. Both depend only on
+the standard library and compile without reflection. The umbrella includes them
+for compatibility. See [implemented architecture](current-state.md) for the
+current ownership limits and verification.
+
+## Remaining target contracts
+
+The target layer defines the language spoken by generation, runtime lookup, proxies, and
 slots. It depends only on the standard library. Its non-template runtime surface
 must not require `<meta>`, global pools, or an adapter header.
 

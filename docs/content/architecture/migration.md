@@ -7,6 +7,15 @@ step working as responsibilities move behind new boundaries.
 The milestones below are ordered by semantic dependencies. Header moves alone
 are not proof that a layer has been extracted.
 
+## Current progress
+
+The [implemented architecture](current-state.md) records completed extractions.
+Step 0 is complete with eight baseline tests passing. The first bounded slice of
+step 1 extracts metadata declarations and errors into independently compiled core
+headers; ten tests now cover the suite and those boundaries. This preparatory
+change preserves invocation semantics. Step 0a remains pending, as do the complete
+identity, ownership, value, and dispatch contracts in step 1.
+
 ## Proposed destination
 
 ```text

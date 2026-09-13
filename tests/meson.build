@@ -46,3 +46,25 @@ test_hooks = executable(
   install: false,
 )
 test('hooks_api', test_hooks)
+
+# Each extracted contract compiles by itself, without reflection extensions.
+foreach header : ['error', 'descriptor']
+  assert(cpp.compiles(
+    '#include <refl/core/' + header + '.hpp>\nint main() {}',
+    include_directories: inc,
+    args: ['-std=c++23', '-fno-reflection'],
+    name: 'standalone core/' + header + '.hpp without reflection',
+  ), 'core contract header is not independently consumable')
+endforeach
+
+core_headers = executable(
+  'test_core_headers',
+  'test_core_headers.cpp',
+  include_directories: inc,
+  cpp_args: ['-fno-reflection'],
+  override_options: ['cpp_std=c++23'],
+  install: false,
+)
+test('core_headers', core_headers)
+
+test('core_include_boundaries', find_program('check_core_includes.py'))
