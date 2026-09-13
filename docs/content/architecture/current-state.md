@@ -11,6 +11,7 @@
 | `runtime/registry.hpp` | Independent class/enum catalogs; explicit publication |
 | `runtime/invoke.hpp` | Argument, receiver, result and reference-export validation |
 | `extensions/observed.hpp` | Read-only call events and subscription tokens |
+| `dyn/proxy.hpp` | Shared structural binding plans and typed call targets |
 | `refl.hpp` | Object/class handles, full descriptor generation and runtime lookup |
 
 Core, registry, and invocation headers compile without reflection. Generation uses
@@ -73,6 +74,17 @@ listener failure, and reentry. Its state provider remains a test fixture.
 Builds use GCC 16.2, `-O2`, warnings as errors, and no LTO. Static analysis is opt-in;
 see [build measurements](../getting-started.md#build-and-test).
 
-Completed: core extraction, contract prototype, native runtime calls, and independent
-registries. Next: shared typed binding. Production dynamic state, full observation
+Completed: core extraction, contract prototype, native runtime calls, independent
+registries, and shared typed binding. Production dynamic state, full observation
 integration, and final header/API cleanup follow.
+
+## Typed binding
+
+`Proxy<T>` separates shared plans from owning instance state. Plans match complete
+signatures and retain selected declarations. Methods and properties own call targets
+and use common argument frames. Rebinding is transactional; moves transfer prepared
+state without lookup. Existing bound mock views see later slot replacements.
+
+Removed: raw overload arrays, tuple argument copies, string-normalized typed matching,
+and duplicate rebind lookup. Mock implementations now preserve reference parameters
+and accept arbitrary parameter counts. See [typed binding](typed-binding.md).

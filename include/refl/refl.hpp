@@ -784,6 +784,7 @@ ClassInfo generate_class() {
             using MemberBare = std::remove_cvref_t<MemberType>;
 
             fi.is_const = std::is_const_v<MemberType>;
+            fi.signature.result = type_use<MemberType>();
             fi.member = member_id<m>();
 
             // Getter: only for copy-constructible members (getter copies
@@ -823,6 +824,7 @@ ClassInfo generate_class() {
             using MemberBare = std::remove_cvref_t<MemberType>;
 
             fi.is_const = std::is_const_v<MemberType>;
+            fi.signature.result = type_use<MemberType>();
             fi.member = member_id<m>();
 
             // Capture the address for get_ref.  const static members may
@@ -1811,17 +1813,10 @@ inline FieldSearchResult find_field_in_hierarchy(
 
 inline std::expected<Object, Error>
 Object::invoke_op(std::string_view name, const Object& arg) const {
-    if (!valid()) return std::unexpected(Error::NullHandle);
-    if (!arg.valid()) return std::unexpected(Error::NullHandle);
-    if (!class_info_) return std::unexpected(Error::NotFound);
-    const ClassInfo* info = class_info_.get();
-    if (!info) return std::unexpected(Error::NotFound);
-    std::vector<std::string> param_types = {
-        detail::normalize_type(arg.class_name())};
-    auto r = detail::find_function_in_hierarchy(info, name, param_types);
-    if (!r.fi) return std::unexpected(Error::NotFound);
-    void* adj = static_cast<char*>(ptr_) + r.offset;
-    return r.fi->invoker(owner_, adj, &arg);
+    if (!valid() || !arg.valid()) return std::unexpected(Error::NullHandle);
+    auto function = Class(class_info_).find_function(name, {arg.class_name()});
+    if (!function) return std::unexpected(function.error());
+    return function->invoke(*this, arg);
 }
 
 inline std::expected<Constructor, Error> Class::find_constructor(

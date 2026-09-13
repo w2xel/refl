@@ -4,39 +4,25 @@ Generation translates C++ declarations into the common descriptors and callable
 targets. It depends on contracts, the concrete type, and compiler reflection. It
 does not choose a registry or allocate per-instance replacement state.
 
-Proposed home: `refl/reflect/{schema,native,policy}.hpp`, plus a registration facade
-that includes both generation and runtime registration.
+Native operations and interface schemas are in `refl/reflect/{native,schema}.hpp`.
+Full class/enum description and the default-registration helpers remain in `refl.hpp`.
 
 ## Separate description from publication
 
-```mermaid
-flowchart LR
-    T[C++ declarations] --> Q[Shared reflection queries]
-    Q --> I[Interface schema]
-    Q --> N[Native descriptor and thunks]
-    N --> A[Explicit registration facade]
-    A --> R[Application registry]
-    I --> P[Typed binding generator]
-    I --> M[Dispatch table generator]
-```
-
 ```cpp
-// Target sketch: inspecting T is independent of global state.
-auto descriptor = describe_native<Square>();
-auto requirements = describe_interface<Drawable>();
+auto descriptor = refl::describe_class<Square>();
+auto requirements = refl::describe_interface<Drawable>();
 
-Registry registry;
-registry.add(descriptor).value();
+refl::Registry registry;
+registry.publish(descriptor).value();
 
-// Process-wide discovery is an explicit registry choice.
-register_type<Square>(default_registry());
+// Optional process-wide discovery.
+refl::default_registry().publish(descriptor).value();
 ```
 
-Interface description must work on declaration-only interfaces without taking
-addresses of undefined methods. Native description emits actual constructor,
-function, field, clone, and cast thunks where supported. Both use the same member
-selection and signature construction routines; only native generation needs
-callable definitions.
+Interface description records declarations without taking method addresses. Native
+description emits callable operations and retains base descriptors. Both use the
+same signature contracts. Description does not publish a catalog entry.
 
 Compile-time enumeration does not require every descriptor container to be
 constant-initialized. Materializing immutable runtime storage during initialization

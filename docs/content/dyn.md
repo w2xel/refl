@@ -18,14 +18,13 @@ p->set(10, 20);           // overload resolved by argument type
 int s = p->sum();          // real return type
 int x = p->x;              // implicit conversion (read)
 p->x = 42;                 // assignment (write)
-p->coords[0] = 99;         // operator[] for subscriptable members
+p.get().coords[0] = 99;         // operator[] for subscriptable members
 p.reset(100, 200);         // swap the underlying object
 p.get().x                  // typed escape hatch (int&)
 ```
 
 One `TypedMethod<Sigs...>` field per function name, one `TypedProperty<T>`
-field per data member, one `TypedStaticProperty<T>` per static data member,
-one `TypedStaticMethod<R>` per static member function.  Overload resolution
+field per data member. Static members use `get_class()`.  Overload resolution
 is by argument type at compile time via the `matches_sig` concept — mixed
 return types work (`TypedMethod<int(int), double(double)>`).
 
@@ -57,13 +56,13 @@ alive (per-method mocking); `restore<^^T::method>()` removes an override;
 back to a real object.  String-based `implement<"method">(...)` is also
 available (compile-time checked).
 
-## Limitations
+## Binding boundary
 
-- Inherited members are not in the dispatch struct — use the core
-  `find_class` / `Function` path for inherited methods.
-- `Dyn<T>` is non-copyable, non-movable (dispatch fields point into it).
-- Same-arity same-type overloads are ambiguous (match the first declared).
-- `implement` trampolines support 0–2 parameters (3+ not yet supported).
-- Static functions with parameters are not callable via `->` (the
-  `TypedStaticMethod` field is nullary-only); use the core `StaticFunction`
-  path instead.
+Typed fields use shared call frames. Plans retain metadata; each proxy binds its own
+receiver. Failed rebinding preserves the old view. Inherited members are included.
+Dyn is movable and non-copyable. Static members use `get_class()`.
+
+Mockable implementations preserve parameter qualifiers and accept arbitrary parameter
+counts. Dyn implementation/wrap helpers still support at most two arguments.
+Production slot ownership and reset remain the next migration step.
+See [typed binding](architecture/typed-binding.md) for the implemented boundary.

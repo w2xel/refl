@@ -11,8 +11,8 @@ are not proof that a layer has been extracted.
 
 Core contracts, native runtime calls, and independent registries are implemented.
 Descriptors retain their base graphs. Interface descriptions need no method definitions.
-Shared typed binding is next. Production dynamic state and full observation
-integration remain later work. See [implemented architecture](current-state.md).
+Shared typed binding is implemented with retained plans and common call frames.
+Production dynamic state and full observation integration remain later work. See [implemented architecture](current-state.md).
 
 ## Proposed destination
 

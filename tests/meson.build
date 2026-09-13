@@ -111,3 +111,7 @@ test('runtime_contracts', runtime_contracts)
 registry_contracts = executable('test_registry', 'test_registry.cpp',
   include_directories: inc, install: false)
 test('registry_contracts', registry_contracts)
+
+binding_contracts = executable('test_binding', 'test_binding.cpp',
+  include_directories: inc, install: false)
+test('binding_contracts', binding_contracts)

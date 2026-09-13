@@ -1,21 +1,4 @@
-// proxy — typed proxy field types for the dyn dispatch layer.
-//
-// TypedMethod<Sigs...> and TypedProperty<T> are the compile-time field
-// types used by Proxy<T> and Dyn<T>'s synthesized Dispatch struct.  Each
-// proxies a single reflected member with real C++ types at the call site
-// — no std::any, no std::variant.
-//
-//   TypedMethod<int(), void(int)>     — overload-resolved method dispatch
-//   TypedProperty<int>               — data member get/set via operator=/cast
-//
-// Proxy<T> synthesizes a Dispatch struct from T's public interface at
-// compile time, then wires it to a type-erased Object at runtime via its
-// ClassInfo.  Statics are not proxied — use Proxy<T>::get_class() for
-// static access via refl::Class.
-//
-// Pure primitives: no dependency on Dyn<T>.  Dyn<T> (in refl/dyn.hpp)
-// includes this header and builds its Dispatch struct from these field
-// types.
+// Typed views share structural plans and invoke through common call frames.
 #pragma once
 
 #include <refl/refl.hpp>
@@ -24,235 +7,154 @@
 #include <stdexcept>
 
 namespace refl {
-// ---------------------------------------------------------------------------
-// TypedMethod<Sigs...> — variadic callable, one template arg per overload
-// signature.  Each Sigs is a function type R(Args...).  operator() uses a
-// concept to pick the matching Sig at compile time and returns that Sig's
-// return type — no std::variant, no std::any at the call site.
-//
-//   TypedMethod<int(), void(int), void(int,int)>
-//     p->sum()       → int
-//     p->set(42)     → void
-//     p->set(1, 2)   → void
-//
-// Mixed return types are fine: TypedMethod<int(int), double(double)>
-//     p->compute(3)    → int
-//     p->compute(3.0)   → double
-//
-// The invoker returns Object internally; the cast to the real return
-// type happens inside operator() — the caller never sees Object.
-// No std::function, no heap, no variant.
-//
-// Argument matching is exact (after remove_cvref_t) — no implicit
-// conversions.  Calling p->render(short{2}) against int render(int) is a
-// compile error, not a conversion.  This is stricter than C++ overload
-// resolution but keeps the dispatch unambiguous at compile time.
-//
-// Const-correctness: a const TypedMethod (accessed through a const Proxy
-// or Dyn via operator->() const) blocks non-const overloads — calling a
-// non-const method through a const proxy throws at call time.  Each
-// overload's const-ness is stored at bind time in OverloadEntry::is_const.
-//
-// Reference returns: R& get_ref() returns a real R& into the bound object.
-// The reference's lifetime is tied to the Proxy's bound Object — rebinding
-// or destroying the proxy dangles the reference.  The caller must keep
-// the proxy alive while holding the reference.
-// ---------------------------------------------------------------------------
-
-// Extract R and Args... from a function type R(Args...).
-template <typename Sig> struct sig_traits;
-template <typename R, typename... Args>
-struct sig_traits<R(Args...)> {
-    using return_type = R;
-    using args_type = std::tuple<std::remove_cvref_t<Args>...>;
-};
-
-// Concept: do the call's argument types match this signature?
-template <typename Sig, typename... CallArgs>
-concept matches_sig = std::same_as<
-    typename sig_traits<Sig>::args_type,
-    std::tuple<std::remove_cvref_t<CallArgs>...>>;
-
-// Helper alias for building function types via substitute.
-template <typename R, typename... Args> using fn_type = R(Args...);
-
 namespace detail {
-
-// Shared overload-entry type used by all TypedMethod<Sigs...> specializations.
-// Defined here (in detail) rather than nested in TypedMethod so Dyn<T> can
-// store std::vector<OverloadEntry> without knowing the specific Sigs pack.
-struct OverloadEntry {
-    InvokerFn invoker;
-    bool is_const = false;  // matches the interface overload's const-ness
+inline CallTarget require_target(Result<CallTarget> result) {
+    if (!result) throw ReflectionError(result.error());
+    return std::move(*result);
+}
+struct BindingPlan {
+    std::shared_ptr<const ClassInfo> descriptor;
+    std::map<std::string, std::vector<MemberLocation>> methods;
+    std::map<std::string, MemberLocation> properties;
+};
+struct BindingState {
+    Object object;
+    std::shared_ptr<const BindingPlan> plan;
 };
 
-// consteval: build a function-type reflection R(Args...) from a member.
-consteval std::meta::info make_fn_sig(std::meta::info m) {
-    auto rt = std::meta::return_type_of(m);
-    auto params = std::meta::parameters_of(m);
-    std::vector<std::meta::info> args = {rt};
-    for (auto p : params)
-        args.push_back(std::meta::type_of(p));
-    return std::meta::substitute(^^fn_type, args);
+// Dyn and Mockable still supply raw backend thunks. Validation stays in invoke_target.
+template<class S> CallTarget bind_backend(const FunctionInfo& function, Object object,
+                                         std::ptrdiff_t offset) {
+    if constexpr (!supported_signature(signature_of<S>())) {
+        throw ReflectionError({DiagnosticCode::unsupported});
+    } else {
+        using Traits = signature_traits<S>;
+        using R = typename Traits::result;
+        using Args = typename Traits::arguments;
+        TargetOptions options;
+        options.receiver = object.view();
+        options.reference_export = ReferenceExport::caller_borrow;
+        options.result_lifetime = ResultLifetime::receiver;
+        return [&]<std::size_t... I>(std::index_sequence<I...>) {
+            return make_target<S>([object, offset, invoker = function.invoker](std::tuple_element_t<I, Args>... args) -> R {
+                std::array<Object, sizeof...(I)> refs{Object(std::forward<std::tuple_element_t<I, Args>>(args))...};
+                auto result = invoker(object.owner(), static_cast<char*>(object.raw()) + offset, refs.data());
+                if constexpr (!std::is_void_v<R>) {
+                    auto pointer = result.template cast_ref<std::remove_reference_t<R>>();
+                    if (!pointer) throw ReflectionError({DiagnosticCode::type_mismatch});
+                    if constexpr (std::is_reference_v<R>) return **pointer;
+                    else return R(std::move(**pointer));
+                }
+            }, options).value();
+        }(std::make_index_sequence<std::tuple_size_v<Args>>{});
+    }
 }
 
-}  // namespace detail
-
-template <typename... Sigs>
-struct TypedMethod {
-    const detail::OverloadEntry* overloads = nullptr;
-    std::size_t num = 0;
-    void* obj = nullptr;
-    std::shared_ptr<void> owner;  // shared_ptr for aliasing invoker calls
-
-    // Returns normalized param-type names per overload, in Sigs-pack
-    // (interface declaration) order.  Used by populate() to match the
-    // impl's FunctionInfo entries by signature, not just by name — so
-    // overloads are correctly paired even when the impl type declares
-    // them in a different order than the interface.
-    static std::vector<std::vector<std::string>> expected_param_types() {
-        return { sig_param_names<typename sig_traits<Sigs>::args_type>()... };
+template<class R, class... A> R call_bound(const CallTarget& target, bool readonly, A&&... args) {
+    if (!target.valid()) throw ReflectionError({DiagnosticCode::null_handle});
+    std::array<ArgumentView, sizeof...(A)> arguments{native_argument(std::forward<A>(args))...};
+    project_legacy_arguments(arguments, target.signature());
+    auto receiver = target.options().receiver;
+    CallFrame frame{readonly ? receiver.as_const() : receiver, arguments};
+    auto result = invoke_target(target, frame, {},
+        std::is_reference_v<R> ? ExportKind::raw_reference : ExportKind::erased);
+    if (!result) throw ReflectionError(result.error());
+    if constexpr (!std::is_void_v<R>) {
+        auto pointer = result_view(*result).template get<std::remove_reference_t<R>>();
+        if (!pointer) throw ReflectionError(pointer.error());
+        if constexpr (std::is_reference_v<R>) return **pointer;
+        else return R(std::move(**pointer));
     }
+}
+consteval std::meta::info make_fn_sig(std::meta::info member) {
+    return std::meta::type_of(member);
+}
+}
 
-    // Returns normalized return-type strings per overload, in Sigs-pack
-    // order.  Both sides (interface and impl) are normalized via
-    // detail::normalize_type so const/ref-qualifier differences don't
-    // cause false mismatches — same pattern as expected_type() for
-    // TypedProperty.
-    static std::vector<std::string> expected_return_types() {
-        return { std::string(detail::normalize_type(
-            detail::type_name<
-                std::remove_cvref_t<typename sig_traits<Sigs>::return_type>>()))... };
+template<class Sig> struct sig_traits : detail::signature_traits<Sig> {
+    using return_type = typename detail::signature_traits<Sig>::result;
+};
+template<class Sig, class... A> concept matches_sig = []<std::size_t... I>(std::index_sequence<I...>) {
+    using Args = typename sig_traits<Sig>::arguments;
+    return std::is_same_v<std::tuple<std::remove_cvref_t<std::tuple_element_t<I, Args>>...>,
+                          std::tuple<std::remove_cvref_t<A>...>>;
+}(std::make_index_sequence<std::tuple_size_v<typename sig_traits<Sig>::arguments>>{});
+
+template<class... Sigs> struct TypedMethod {
+    std::vector<CallTarget> targets;
+    static std::vector<Signature> signatures() { return {signature_of<Sigs>()...}; }
+    void bind(const detail::BindingState& state, const std::vector<detail::MemberLocation>& entries) {
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            (bind_one<std::tuple_element_t<I, std::tuple<Sigs...>>>(state.object, entries[I]), ...);
+        }(std::index_sequence_for<Sigs...>{});
     }
-
-private:
-    template <typename Tuple>
-    static std::vector<std::string> sig_param_names() {
-        return sig_param_names_impl<Tuple>(
-            std::make_index_sequence<std::tuple_size_v<Tuple>>{});
-    }
-
-    template <typename Tuple, std::size_t... I>
-    static std::vector<std::string> sig_param_names_impl(
-            std::index_sequence<I...>) {
-        return { std::string(detail::normalize_type(
-            detail::type_name<std::tuple_element_t<I, Tuple>>()))... };
-    }
-
-public:
-
-    // Deducing-this: a const TypedMethod (accessed through a const
-    // Proxy/Dyn, i.e. operator->() const) blocks non-const overloads —
-    // a const view cannot mutate the object.  Const is a per-overload
-    // property stored in OverloadEntry::is_const at bind time.
-    template <typename Self, typename... Args>
-    decltype(auto) operator()(this Self&& self, Args&&... args) {
-        constexpr bool ConstCall =
-            std::is_const_v<std::remove_reference_t<Self>>;
-        return self.template call_dispatch<ConstCall, 0, Args...>(
-            std::forward<Args>(args)...);
-    }
-
-    template <bool ConstCall, std::size_t I, typename... Args>
-    decltype(auto) call_dispatch(Args&&... args) const {
-        using Sig = std::tuple_element_t<I, std::tuple<Sigs...>>;
-        if constexpr (matches_sig<Sig, Args...>) {
-            using R = typename sig_traits<Sig>::return_type;
-            if (!overloads || I >= num)
-                throw std::runtime_error(
-                    "Proxy: call to unbound or missing overload");
-            if constexpr (ConstCall) {
-                if (!overloads[I].is_const)
-                    throw std::runtime_error(
-                        "Proxy: non-const method called through const proxy");
-            }
-            // Build Object arg array from forwarded args.
-            std::tuple<std::decay_t<Args>...> storage(
-                std::forward<Args>(args)...);
-            std::array<Object, sizeof...(Args)> refs;
-            if constexpr (sizeof...(Args) > 0) {
-                [&]<std::size_t... J>(std::index_sequence<J...>) {
-                    ((refs[J] = Object(std::get<J>(storage))), ...);
-                }(std::make_index_sequence<sizeof...(Args)>{});
-            }
-            const Object* args_ptr =
-                sizeof...(Args) == 0 ? nullptr : refs.data();
-            Object result = overloads[I].invoker(
-                owner, obj, args_ptr);
-            if constexpr (std::is_void_v<R>) return;
-            else {
-                auto cr = result.template cast_ref<std::remove_cvref_t<R>>();
-                if (!cr) throw std::runtime_error(
-                    "Proxy: return type mismatch on method call");
-                // Preserve references: return *ptr as R& for reference
-                // return types, as R by value for non-reference types.
-                if constexpr (std::is_reference_v<R>)
-                    return static_cast<R>(*cr.value());
-                else
-                    return R(std::move(*cr.value()));
-            }
+    template<class S> void bind_one(const Object& object, const detail::MemberLocation& entry) {
+        const auto& function = entry.first->functions[entry.second];
+        auto native = detail::operation(*entry.first, function.member, OperationKind::method);
+        if (native) {
+            auto receiver = detail::project_legacy_view(object.view(), *entry.first);
+            if (!receiver) throw ReflectionError(receiver.error());
+            TargetOptions options;
+            options.reference_export = ReferenceExport::caller_borrow;
+            options.result_lifetime = ResultLifetime::receiver;
+            auto target = native->bind(*receiver, options);
+            if (!target) throw ReflectionError(target.error());
+            targets.push_back(std::move(*target));
         } else {
-            if constexpr (I + 1 < sizeof...(Sigs))
-                return call_dispatch<ConstCall, I + 1, Args...>(std::forward<Args>(args)...);
-            else
-                static_assert(false,
-                    "no matching overload for the given argument types");
+            if (!function.invoker) throw ReflectionError({DiagnosticCode::unsupported});
+            auto offset = detail::upcast_offset(object.class_info().get(), entry.first->name).value();
+            targets.push_back(detail::bind_backend<S>(function, object, offset));
         }
+    }
+    template<class Self, class... A> decltype(auto) operator()(this Self&& self, A&&... args) {
+        return self.template call_dispatch<std::is_const_v<std::remove_reference_t<Self>>, 0>(std::forward<A>(args)...);
+    }
+    template<bool Const, std::size_t I, class... A> decltype(auto) call_dispatch(A&&... args) const {
+        using S = std::tuple_element_t<I, std::tuple<Sigs...>>;
+        if constexpr (matches_sig<S, A...>) {
+            if (I >= targets.size()) throw ReflectionError({DiagnosticCode::null_handle});
+            return detail::call_bound<typename sig_traits<S>::return_type>(targets[I], Const, std::forward<A>(args)...);
+        } else if constexpr (I + 1 < sizeof...(Sigs)) {
+            return call_dispatch<Const, I + 1>(std::forward<A>(args)...);
+        } else static_assert(false, "no matching overload");
     }
 };
 
-// ---------------------------------------------------------------------------
-// TypedProperty<T, Readonly> — mimics a public data member via operator=
-// and implicit conversion.  p->x = 42 writes; int v = p->x reads.
-// Const members use Readonly=true, which deletes operator= at compile time.
-// Subscriptable members (std::array, std::vector) do NOT offer operator[];
-// access elements via Dyn<T>::get() or through a Proxy<T> bound to the
-// object.  operator[] was removed to keep the field type hook-free — the
-// raw-pointer arithmetic it used is incompatible with Dyn's getter/setter
-// wrapping for on_change hooks (obj is redirected to a hook context).
-// ---------------------------------------------------------------------------
-template <typename T, bool Readonly = false>
-struct TypedProperty {
+template<class T, bool Readonly = false> struct TypedProperty {
     using value_type = T;
-    GetterFn getter = nullptr;
-    SetterFn setter = nullptr;  // always nullptr when Readonly=true
-    void* obj = nullptr;
-    std::shared_ptr<void> owner;  // shared_ptr for getter/setter calls
-    std::size_t member_offset = 0;  // byte offset of the member within T
-
-    // Implicit conversion to T (read).
-    operator T() const {
-        if (!obj) throw std::runtime_error(
-            "Proxy: read from unbound property");
-        if (!getter) throw std::runtime_error(
-            "Proxy: property has no getter (move-only or non-copyable)");
-        Object result = getter(obj);
-        auto cr = result.template cast_ref<T>();
-        if (!cr) throw std::runtime_error(
-            "Proxy: property type mismatch on read");
-        return std::move(*cr.value());
-    }
-
-    // Assignment from T (write).  Compile error when Readonly=true.
-    void operator=(T val) requires (!Readonly) {
-        if (!obj) throw std::runtime_error("Proxy: write to unbound property");
-        if (!setter) throw std::runtime_error(
-            "Proxy: property has no setter (move-only or non-assignable)");
-        std::decay_t<T> storage(std::move(val));
-        Object val_ref(storage);
-        setter(obj, &val_ref);
-    }
-
+    CallTarget read, write;
     static constexpr bool is_readonly() { return Readonly; }
-
-    // Expected type name of the proxied data member, normalized for
-    // comparison against the impl's ClassInfo field type.  Both sides use
-    // normalize_type so const-qualifier differences (the interface strips
-    // cv-ref via remove_cvref_t, the impl stores the raw display string)
-    // don't cause false mismatches.
-    static std::string expected_type() {
-        return std::string(detail::normalize_type(
-            detail::type_name<T>()));
+    operator T() const { return detail::call_bound<T>(read, true); }
+    void operator=(T value) requires (!Readonly) { detail::call_bound<void>(write, false, std::move(value)); }
+    void bind(const Object& object, const detail::MemberLocation& entry) {
+        const auto& field = entry.first->fields[entry.second];
+        auto offset = detail::upcast_offset(object.class_info().get(), entry.first->name).value();
+        auto receiver = object.view();
+        auto native_read = detail::operation(*entry.first, field.member, OperationKind::read);
+        auto native_write = detail::operation(*entry.first, field.member, OperationKind::write);
+        if (native_read || native_write) {
+            auto adjusted = detail::project_legacy_view(receiver, *entry.first).value();
+            if (native_read) read = detail::require_target(native_read->bind(adjusted, {}));
+            if constexpr (!Readonly) if (native_write) write = detail::require_target(native_write->bind(adjusted, {}));
+        } else {
+            auto pointer = static_cast<char*>(object.raw()) + offset;
+            TargetOptions options;
+            options.receiver = receiver;
+            options.operation = OperationKind::read;
+            if constexpr (std::is_copy_constructible_v<T>) {
+                if (field.getter) read = make_target<T() const>([object, pointer, get = field.getter] {
+                    auto result = get(pointer);
+                    return T(std::move(**result.template cast_ref<T>()));
+                }, options).value();
+            }
+            options.operation = OperationKind::write;
+            if constexpr (!Readonly && std::is_move_assignable_v<T>) {
+                if (field.setter) write = make_target<void(T)>([object, pointer, set = field.setter](T value) {
+                    Object argument(value);
+                    set(pointer, &argument);
+                }, options).value();
+            }
+        }
     }
 };
 
@@ -348,25 +250,6 @@ consteval void collect_instance_members(std::meta::info type,
     }
 }
 
-// consteval: collect the const-ness of all overloads for a named method
-// on the interface type, in Sigs-pack order.  Used by populate() to
-// verify the impl's method const-ness matches the interface's.
-// Reuses collect_all_methods (the single hierarchy walker with name-
-// hiding) and filters by name, so the walk + name-hiding logic lives in
-// one place.  Order is preserved: own methods in declaration order, then
-// inherited non-hidden — matching the Sigs-pack order built by
-// make_dispatch_specs, so exp_const_arr[i] pairs with exp_params[i].
-consteval std::vector<bool> collect_const_quals(std::meta::info type,
-                                                   std::string_view name) {
-    std::vector<std::meta::info> all;
-    collect_all_methods(type, all);
-    std::vector<bool> result;
-    for (auto m : all)
-        if (std::meta::identifier_of(m) == name)
-            result.push_back(is_const_method(m));
-    return result;
-}
-
 // consteval: build the dispatch struct member specs for T's public
 // interface — non-static methods (TypedMethod) and data members
 // (TypedProperty), including inherited members via base hierarchy walk.
@@ -449,64 +332,7 @@ consteval void make_dispatch_specs(std::meta::info type, bool add_obj,
 
 }  // namespace detail
 
-// ---------------------------------------------------------------------------
-// Proxy<T> — typed dispatch struct with type-erased object binding.
-//
-// Synthesizes a Dispatch struct from T's public interface at compile time
-// (same field types as Dyn<T>: TypedMethod, TypedProperty, etc.).  At
-// runtime, bind(Object) wires the dispatch fields from the Object's
-// ClassInfo — so calls through the proxy dispatch to the object's methods
-// with T's typed return types.
-//
-// The object behind the proxy can be any type whose interface is
-// structurally compatible with T (same method names and signatures),
-// not just T itself.  Matching is by method name + param-type signature
-// (overloads are paired correctly even if the impl declares them in a
-// different order).  This is structural typing through the reflection
-// pool: any type with compatible public methods works.
-//
-// T need not be abstract or have pure-virtual methods — it is a
-// compile-time interface descriptor only.  Its methods are never called;
-// they exist solely for signature extraction via reflection.
-//
-//   struct IDrawable { int render(int scale); void set_tint(int t); };
-//   struct Square { int side; Square(int s) : side(s) {}
-//                  int render(int scale) const { ... } };
-//
-//   refl::ensure_registered<Square>();
-//   auto cls = *refl::find_class("Square");
-//   auto obj = *cls.constructors()[0].call(4);  // type-erased Object
-//   refl::Proxy<IDrawable> p(obj);
-//   int a = p->render(2);   // calls Square::render, returns int
-//
-// Validation: bind() and the constructor throw std::runtime_error at bind
-// time if:
-//   1. The Object is non-owning (not backed by a shared_ptr) — the proxy
-//      outlives a borrow, so non-owning Objects are rejected.
-//   2. The object's type is not registered in the reflection pool.
-//   3. Any interface method or field has no match in the object's ClassInfo.
-//   4. A matched method's return type or a matched field's type differs
-//      from the interface's.
-// This catches structural mismatches and lifetime issues as early as
-// possible — before any call through the proxy.
-//
-// Thread safety: NOT thread-safe.  Concurrent bind() + operator->(), or
-// concurrent bind() from multiple threads, is a data race on the dispatch
-// fields.  The caller must synchronize.  Calls through operator->() from
-// multiple threads are safe only if no bind() is in progress.
-//
-// Const-correctness: a const Proxy<T> (operator->() const) yields a const
-// view — non-const methods throw at call time, readonly properties block
-// writes, and operator[] yields const references.  Non-const methods,
-// non-readonly properties, and mutable operator[] require a non-const
-// Proxy.
-//
-// Proxy<T> is non-copyable.  Movable: move transfers the bound Object
-// and re-populates the dispatch fields (which point into overload_storage_,
-// a member of the Proxy, so they must be re-pointed after the move).  A
-// moved-from Proxy is unbound: is_bound() returns false and calls through
-// operator->() throw rather than use stale pointers.
-// ---------------------------------------------------------------------------
+// A typed view binds an immutable structural plan to one owning object.
 template <typename T>
 class Proxy {
     struct Dispatch;
@@ -516,196 +342,87 @@ class Proxy {
         std::meta::define_aggregate(^^Dispatch, specs);
     }
 
-    Dispatch dispatch_;
-    Object obj_;
-    std::map<std::string, std::vector<detail::OverloadEntry>> overload_storage_;
+    Dispatch dispatch_{};
+    detail::BindingState state_;
 
-    static void check_owned(const Object& obj) {
-        if (obj.valid() && !obj.is_owned())
-            throw std::runtime_error(
-                "Proxy: non-owning Object cannot be bound — the proxy "
-                "outlives the borrow. Use a shared_ptr-backed Object.");
-    }
-
-    static std::string join_types(const std::vector<std::string>& types) {
-        std::string s;
-        for (std::size_t i = 0; i < types.size(); ++i) {
-            if (i) s += ", ";
-            s += types[i];
+    static std::shared_ptr<const detail::BindingPlan> plan_for(std::shared_ptr<const ClassInfo> descriptor) {
+        static std::mutex mutex;
+        static std::map<const ClassInfo*, std::weak_ptr<const detail::BindingPlan>> cache;
+        std::lock_guard lock(mutex);
+        std::erase_if(cache, [](const auto& entry) { return entry.second.expired(); });
+        if (auto found = cache.find(descriptor.get()); found != cache.end())
+            if (auto plan = found->second.lock()) return plan;
+        auto plan = std::make_shared<detail::BindingPlan>();
+        plan->descriptor = descriptor;
+        static constexpr auto fields = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch, std::meta::access_context::unchecked()));
+        template for (constexpr auto field : fields) {
+            using F = [:std::meta::type_of(field):];
+            auto name = std::string(std::meta::identifier_of(field));
+            if constexpr (detail::is_typed_method_v<F>) {
+                std::vector<detail::MemberLocation> candidates;
+                auto own = detail::own_indices(descriptor->functions, name);
+                for (auto index : own) candidates.emplace_back(descriptor, index);
+                if (own.empty()) detail::collect_base_named(descriptor.get(), name, &ClassInfo::functions, candidates);
+                detail::dedup_decl(candidates);
+                if (detail::subobject_count(descriptor.get(), candidates) > 1)
+                    throw ReflectionError({DiagnosticCode::ambiguous});
+                auto& selected = plan->methods[name];
+                for (const auto& expected : F::signatures()) {
+                    if (!supported_signature(expected)) throw ReflectionError({DiagnosticCode::unsupported});
+                    auto match = std::find_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+                        return compatible_signature(expected, candidate.first->functions[candidate.second].signature);
+                    });
+                    if (match == candidates.end()) throw ReflectionError({DiagnosticCode::type_mismatch});
+                    selected.push_back(*match);
+                }
+            } else {
+                std::vector<detail::MemberLocation> candidates;
+                auto own = detail::own_indices(descriptor->fields, name);
+                for (auto index : own) candidates.emplace_back(descriptor, index);
+                if (own.empty()) detail::collect_base_named(descriptor.get(), name, &ClassInfo::fields, candidates);
+                detail::dedup_decl(candidates);
+                if (detail::subobject_count(descriptor.get(), candidates) > 1)
+                    throw ReflectionError({DiagnosticCode::ambiguous});
+                if (candidates.empty()) throw ReflectionError({DiagnosticCode::not_found});
+                const auto& selected = candidates.front();
+                const auto& property = selected.first->fields[selected.second];
+                if (property.signature.result.type != type_id<typename F::value_type>() ||
+                    (!F::is_readonly() && property.is_const))
+                    throw ReflectionError({DiagnosticCode::type_mismatch});
+                plan->properties.emplace(name, selected);
+            }
         }
-        return s;
+        cache[descriptor.get()] = plan;
+        return plan;
     }
-
-    // Check the impl's const-ness matches the interface's for one overload.
-    // A const impl satisfies a non-const interface declaration (const is the
-    // stronger guarantee — calling a const method on a non-const object is
-    // fine).  Only the reverse is a contract violation: a non-const impl
-    // cannot satisfy a const interface requirement.
-    // Shared by operator and named-method binding paths.
-    template <typename ConstArr>
-    static void check_const_qual(const ConstArr& exp_const,
-            std::size_t oi, const FunctionInfo* fi, std::string_view key) {
-        if (oi < exp_const.size() && exp_const[oi] && !fi->is_const)
-            throw std::runtime_error(
-                "Proxy: const-ness mismatch on '" + std::string(key) +
-                "' — interface expects const, impl is non-const");
-    }
-
     void populate() {
-        if (!obj_.valid()) return;
-        overload_storage_.clear();
-        auto ci = obj_.class_info();
-        if (!ci)
-            throw std::runtime_error(
-                "Proxy: object has no ClassInfo — type '" +
-                std::string(obj_.class_name()) +
-                "' is not registered in the reflection pool");
-        const ClassInfo* info = ci.get();
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto field : dm) {
-            if constexpr (std::meta::has_identifier(field)) {
-                using FieldType = [:std::meta::type_of(field):];
-                if constexpr (detail::is_typed_method_v<
-                        std::remove_cv_t<FieldType>>) {
-                    using TM = std::remove_cv_t<FieldType>;
-                    dispatch_.[:field:].owner = obj_.owner();
-                    constexpr auto nm_sv = std::meta::identifier_of(field);
-                    static constexpr auto exp_const_arr = []() consteval {
-                        return std::define_static_array(
-                            detail::collect_const_quals(^^T, nm_sv));
-                    }();
-                    auto key = std::string(nm_sv);
-                    auto& vec = overload_storage_[key];
-                    auto exp_params = TM::expected_param_types();
-                    auto exp_returns = TM::expected_return_types();
-                    std::ptrdiff_t method_off = 0;
-                    for (std::size_t oi = 0; oi < exp_params.size(); ++oi) {
-                        auto r = detail::find_function_in_hierarchy(
-                            info, key, exp_params[oi]);
-                        if (!r.fi)
-                            throw std::runtime_error(
-                                "Proxy: no matching overload for '" + key +
-                                "' with params [" +
-                                join_types(exp_params[oi]) +
-                                "] in type '" +
-                                std::string(obj_.class_name()) + "'");
-                        if (detail::normalize_type(r.fi->return_type)
-                                != exp_returns[oi])
-                            throw std::runtime_error(
-                                "Proxy: return type mismatch on '" +
-                                key + "' — interface expects '" +
-                                exp_returns[oi] +
-                                "', impl returns '" +
-                                r.fi->return_type + "'");
-                        check_const_qual(exp_const_arr, oi, r.fi, key);
-                        vec.push_back({r.fi->invoker, r.fi->is_const});
-                        method_off = r.offset;
-                    }
-                    dispatch_.[:field:].obj =
-                        static_cast<char*>(obj_.raw()) + method_off;
-                    dispatch_.[:field:].overloads = vec.data();
-                    dispatch_.[:field:].num = vec.size();
-                } else {
-                    using TP = std::remove_cv_t<FieldType>;
-                    dispatch_.[:field:].owner = obj_.owner();
-                    constexpr auto nm_sv = std::meta::identifier_of(field);
-                    auto key = std::string(nm_sv);
-                    auto exp_type = TP::expected_type();
-                    auto r = detail::find_field_in_hierarchy(info, key);
-                    if (!r.fi)
-                        throw std::runtime_error(
-                            "Proxy: no field '" + key +
-                            "' in type '" +
-                            std::string(obj_.class_name()) + "'");
-                    auto impl_type = detail::normalize_type(r.fi->type);
-                    if (impl_type != exp_type)
-                        throw std::runtime_error(
-                            "Proxy: field type mismatch on '" + key +
-                            "' — interface expects '" + exp_type +
-                            "', impl has '" + impl_type + "'");
-                    dispatch_.[:field:].obj =
-                        static_cast<char*>(obj_.raw()) + r.offset;
-                    dispatch_.[:field:].member_offset =
-                        static_cast<std::size_t>(r.fi->offset);
-                    dispatch_.[:field:].getter = r.fi->getter;
-                    dispatch_.[:field:].setter = r.fi->setter;
-                }
-            }
+        static constexpr auto fields = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch, std::meta::access_context::unchecked()));
+        template for (constexpr auto field : fields) {
+            using F = [:std::meta::type_of(field):];
+            auto name = std::string(std::meta::identifier_of(field));
+            if constexpr (detail::is_typed_method_v<F>)
+                dispatch_.[:field:].bind(state_, state_.plan->methods.at(name));
+            else dispatch_.[:field:].bind(state_.object, state_.plan->properties.at(name));
         }
-    }
-
-    // Reset all dispatch fields to the unbound state so a moved-from
-    // Proxy throws cleanly instead of calling through stale pointers.
-    void clear_dispatch() {
-        static constexpr auto dm = std::define_static_array(
-            std::meta::nonstatic_data_members_of(^^Dispatch,
-                std::meta::access_context::unchecked()));
-        template for (constexpr auto field : dm) {
-            if constexpr (std::meta::has_identifier(field)) {
-                using FieldType = [:std::meta::type_of(field):];
-                if constexpr (detail::is_typed_method_v<
-                        std::remove_cv_t<FieldType>>) {
-                    dispatch_.[:field:].overloads = nullptr;
-                    dispatch_.[:field:].num = 0;
-                    dispatch_.[:field:].obj = nullptr;
-                    dispatch_.[:field:].owner.reset();
-                } else {
-                    dispatch_.[:field:].getter = nullptr;
-                    dispatch_.[:field:].setter = nullptr;
-                    dispatch_.[:field:].obj = nullptr;
-                    dispatch_.[:field:].owner.reset();
-                }
-            }
-        }
-        overload_storage_.clear();
     }
 public:
     Proxy() = default;
-
-    // Bind a type-erased Object — wires T's dispatch fields to the
-    // Object's methods via its ClassInfo.  The Object must be owning
-    // (backed by a shared_ptr); non-owning Objects are rejected because
-    // the proxy outlives the borrow.  Use shared_ptr-backed Objects or
-    // the implicit shared_ptr<T> → Object conversion:
-    //
-    //   auto sp = std::make_shared<Square>(4);
-    //   refl::Proxy<IDrawable> p(sp);   // implicit, owning
-    explicit Proxy(Object obj) : obj_(std::move(obj)) { check_owned(obj_); populate(); }
-    // Transactional rebind: build a temporary proxy bound to the new object
-    // (which validates structural compatibility via populate()) before
-    // releasing the existing binding.  populate() clears overload_storage_
-    // then walks the ClassInfo and can throw partway through (missing
-    // overload, return-type mismatch, const-ness mismatch, missing field).
-    // Before this fix, a throw there left dispatch_ overloads pointers
-    // dangling into the freed overload_storage_ vectors while obj_ already
-    // pointed at the new object — a use-after-free on the next call.  Now
-    // the failed populate destroys the temporary without touching *this.
-    // ponytail: double populate() walk (once in the temporary, once in the
-    // move-assign) on success — O(members), negligible for realistic types.
-    void bind(Object obj) {
-        check_owned(obj);
-        Proxy tmp(std::move(obj));
-        *this = std::move(tmp);
+    explicit Proxy(Object object) {
+        if (!object.valid()) return;
+        if (!object.is_owned()) throw ReflectionError({DiagnosticCode::missing_anchor});
+        if (!object.class_info()) throw ReflectionError({DiagnosticCode::null_handle});
+        state_ = {std::move(object), {}};
+        state_.plan = plan_for(state_.object.class_info());
+        populate();
     }
-
+    void bind(Object object) { *this = Proxy(std::move(object)); }
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }
-
-    bool is_bound() const { return obj_.valid(); }
-
-    // The Class of the bound object's actual runtime type (not T).
-    // Statics are class-level, not instance-level — access them through
-    // this Class instead of the dispatch struct:
-    //   auto c = p.get_class();
-    //   int n = *c.find_static_function("instance_count")->invoke().value()
-    //                .cast_ref<int>().value();
-    // Returns an invalid Class if not bound or the type is unregistered.
-    Class get_class() const {
-        if (!obj_.valid()) return {};
-        return Class(obj_.class_info());
-    }
+    bool is_bound() const { return state_.object.valid(); }
+    Class get_class() const { return Class(state_.object.class_info()); }
+    const std::shared_ptr<const detail::BindingPlan>& binding_plan() const { return state_.plan; }
 
     // -----------------------------------------------------------------------
     // Operators — looked up at call time via Object::invoke_op, which
@@ -730,13 +447,13 @@ public:
         requires requires(T a, T b) { a symbol b; } \
     { \
         using R = decltype(std::declval<T>() symbol std::declval<T>()); \
-        Object arg = other.obj_; \
-        auto result = obj_.invoke_op(op_name, arg); \
+        Object arg = other.state_.object; \
+        auto result = state_.object.invoke_op(op_name, arg); \
         if (!result) \
             throw std::runtime_error( \
                 "Proxy: " op_name " — no matching overload for '" + \
                 std::string(arg.class_name()) + "' in '" + \
-                std::string(obj_.class_name()) + "'"); \
+                std::string(state_.object.class_name()) + "'"); \
         if constexpr (std::is_void_v<R>) return; \
         else if constexpr (std::is_class_v<std::remove_cvref_t<R>>) \
             return Proxy(std::move(*result)); \
@@ -756,12 +473,12 @@ public:
     { \
         using R = decltype(std::declval<T>() symbol std::declval<U>()); \
         Object arg(std::forward<U>(val)); \
-        auto result = obj_.invoke_op(op_name, arg); \
+        auto result = state_.object.invoke_op(op_name, arg); \
         if (!result) \
             throw std::runtime_error( \
                 "Proxy: " op_name " — no matching overload for '" + \
                 std::string(arg.class_name()) + "' in '" + \
-                std::string(obj_.class_name()) + "'"); \
+                std::string(state_.object.class_name()) + "'"); \
         if constexpr (std::is_void_v<R>) return; \
         else if constexpr (std::is_class_v<std::remove_cvref_t<R>>) \
             return Proxy(std::move(*result)); \
@@ -790,22 +507,22 @@ public:
 #undef PROXY_BINARY_OP
 
     Proxy(const Proxy&) = delete;
-    Proxy(Proxy&& other)
-        : obj_(std::move(other.obj_)) {
-        if (obj_.valid()) { populate(); }
-        other.obj_ = {};
-        other.clear_dispatch();
-    }
     Proxy& operator=(const Proxy&) = delete;
-    Proxy& operator=(Proxy&& other) {
+    Proxy(Proxy&& other) noexcept
+        : dispatch_(std::move(other.dispatch_)), state_(std::move(other.state_)) {
+        other.dispatch_ = {};
+        other.state_ = {};
+    }
+    Proxy& operator=(Proxy&& other) noexcept {
         if (this != &other) {
-            obj_ = std::move(other.obj_);
-            other.obj_ = {};
-            if (obj_.valid()) { populate(); }
-            other.clear_dispatch();
+            dispatch_ = std::move(other.dispatch_);
+            state_ = std::move(other.state_);
+            other.dispatch_ = {};
+            other.state_ = {};
         }
         return *this;
     }
+
 };
 
 }  // namespace refl

@@ -83,16 +83,22 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
     // emit duplicate symbols for reflection-NTTP thunks instantiated through
     // repeated implement<Method, F> calls with different lambda types.
     template <typename R, typename... Args>
-    static Object impl_trampoline(const std::shared_ptr<void>&,
+    static Object impl_trampoline(const std::shared_ptr<void>& owner,
                                   void* ctx, const Object* args) {
         auto& fn = *static_cast<std::function<R(Args...)>*>(ctx);
         return [&]<std::size_t... I>(std::index_sequence<I...>) -> Object {
             if constexpr (std::is_void_v<R>) {
-                fn((*static_cast<Args*>(args[I].raw()))...);
+                fn(detail::extract_arg<Args>(args, I)...);
                 return Object{};
+            } else if constexpr (std::is_lvalue_reference_v<R>) {
+                auto& value = fn(detail::extract_arg<Args>(args, I)...);
+                auto* pointer = const_cast<void*>(static_cast<const void*>(std::addressof(value)));
+                Object result(owner, pointer, detail::ensure_class_info<std::remove_cvref_t<R>>());
+                if constexpr (std::is_const_v<std::remove_reference_t<R>>) return result.as_const();
+                else return result;
             } else {
                 return Object(std::make_shared<R>(
-                    fn((*static_cast<Args*>(args[I].raw()))...)),
+                    fn(detail::extract_arg<Args>(args, I)...)),
                     detail::ensure_class_info<R>());
             }
         }(std::index_sequence_for<Args...>{});
@@ -193,6 +199,8 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
     static std::shared_ptr<const ClassInfo> make_class_info() {
         auto ci = std::make_shared<ClassInfo>();
         ci->name = std::string(detail::type_name<T>()) + "$mock";
+        ci->identity = type_id<Mockable<T>>();
+        ci->make_view = &reflect_detail::native_view<Mockable<T>>;
         if constexpr (std::is_class_v<T>) {
             static constexpr auto all_members = []() consteval {
                 std::vector<std::meta::info> members;
@@ -206,6 +214,9 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
                     FunctionInfo fi;
                     fi.name = std::string(std::meta::identifier_of(m));
                     fi.is_const = detail::is_const_method(m);
+                    using S = [:std::meta::type_of(m):];
+                    fi.signature = signature_of<S>();
+                    fi.member = member_id<m>();
                     fi.return_type = std::string(
                         std::meta::display_string_of(
                             std::meta::return_type_of(m)));
@@ -229,6 +240,8 @@ class Mockable : public std::enable_shared_from_this<Mockable<T>> {
                     fi.offset = 0;
                     using MemberType = [:std::meta::type_of(m):];
                     fi.is_const = std::is_const_v<MemberType>;
+                    fi.signature.result = type_use<MemberType>();
+                    fi.member = member_id<m>();
                     fi.getter = get_prop_get_tramp<m>();
                     fi.setter = std::is_const_v<MemberType>
                         ? nullptr
@@ -304,29 +317,15 @@ public:
 
     template <std::meta::info Method, typename F>
     void implement(F fn) {
-        using R = [: std::meta::return_type_of(Method) :];
-        constexpr auto params = std::define_static_array(
-            std::meta::parameters_of(Method));
-        auto key = method_key<Method>();
-        // Store the lambda in a shared_ptr so the slot's ctx can point
-        // at it independently — saving the slot captures the specific
-        // lambda and its ownership, not a mutable map entry.
-        if constexpr (params.size() == 0) {
-            auto holder = std::make_shared<std::function<R()>>(std::move(fn));
-            method_slots_[key] = {&impl_trampoline<R>, holder.get(), holder};
-        } else if constexpr (params.size() == 1) {
-            using P0 = [: std::meta::type_of(params[0]) :];
-            using C0 = std::remove_cvref_t<P0>;
-            auto holder = std::make_shared<std::function<R(C0)>>(std::move(fn));
-            method_slots_[key] = {&impl_trampoline<R, C0>, holder.get(), holder};
-        } else if constexpr (params.size() == 2) {
-            using P0 = [: std::meta::type_of(params[0]) :];
-            using P1 = [: std::meta::type_of(params[1]) :];
-            using C0 = std::remove_cvref_t<P0>;
-            using C1 = std::remove_cvref_t<P1>;
-            auto holder = std::make_shared<std::function<R(C0, C1)>>(std::move(fn));
-            method_slots_[key] = {&impl_trampoline<R, C0, C1>, holder.get(), holder};
-        }
+        using S = [:std::meta::type_of(Method):];
+        using Traits = detail::signature_traits<S>;
+        using R = typename Traits::result;
+        using Args = typename Traits::arguments;
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            auto holder = std::make_shared<std::function<R(std::tuple_element_t<I, Args>...)>>(std::move(fn));
+            method_slots_[method_key<Method>()] = {
+                &impl_trampoline<R, std::tuple_element_t<I, Args>...>, holder.get(), holder};
+        }(std::make_index_sequence<std::tuple_size_v<Args>>{});
     }
 
     // ======================================================================

@@ -345,11 +345,8 @@ Limitations:
 - Enum values are stored as `long long`.  Enums with an unsigned underlying
   type and values exceeding `LLONG_MAX` undergo an implementation-defined
   conversion; the stored value may not match the true enumerator value.
-- Registration is static-init order dependent — `find_class` only works after
-  `Reg<T>` has been instantiated (or `ensure_registered<T>()` called).  The
-  global pools and public handles share const `ClassInfo`/`EnumInfo` descriptors.
-  Handles retain their records across pool rehashing, catalog replacement, and
-  synthetic backend destruction. Raw-pointer handle constructors copy a snapshot;
-  shared-pointer constructors retain published immutable metadata. Base traversal
-  still uses the current global catalog. See the
-  [implemented architecture](architecture/current-state.md) for the ownership boundary.
+- Free name lookups use `default_registry()`. Local `Registry` instances provide
+  isolated catalogs. `describe_class<T>()` needs no publication. Handles retain
+  immutable metadata and base graphs after registry destruction. Raw-pointer
+  metadata constructors are removed; pass shared descriptors. See the
+  [implemented architecture](architecture/current-state.md).
