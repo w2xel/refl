@@ -1,6 +1,17 @@
 # Layer 3: Runtime registry and invocation
 
-The runtime makes descriptors discoverable and callable. It depends on core
+## Implemented metadata ownership
+
+Public class, enum, and member handles retain const shared metadata. Registration
+publishes a copy, and catalog replacement leaves existing handles' records alive.
+Inherited lookup carries the declaring descriptor's ownership into each member
+handle. Global pools and name-based base relationships remain in `refl/refl.hpp`;
+local registries and an independent invocation service are not implemented. The
+[implemented architecture](current-state.md) documents these boundaries and tests.
+
+## Remaining runtime destination
+
+The target runtime makes descriptors discoverable and callable. It depends on core
 contracts; native descriptor generation is a producer, not a prerequisite for
 lookup. Proposed home: `refl/runtime/{registry,lookup,invoke}.hpp`.
 

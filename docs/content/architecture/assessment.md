@@ -13,6 +13,11 @@ does not erase the evidence behind the recommendations. This assessment describe
 responsibilities using the target vocabulary; it does not claim that the target
 symbols already exist in the implementation.
 
+Subsequent migration has extracted reflection-independent metadata/error headers
+and made public metadata handles retain const descriptors. The
+[implemented architecture](current-state.md) records those changes; the findings
+below remain the historical assessment of `29ddfd2`.
+
 ## What exists
 
 Structural binding and replaceable dispatch are already separate components,

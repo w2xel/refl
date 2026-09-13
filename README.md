@@ -14,11 +14,15 @@ meson compile -C builddir -j 2
 meson test -C builddir --print-errorlogs
 ```
 
-The test run covers all five test executables and all three samples. LTO defaults
+The test run covers all five component suites, all three samples, metadata
+lifetime regressions, and reflection-independent core-header checks. LTO defaults
 to off because GCC 16.2 crashes linking the reflection-heavy Dyn coverage; warnings
 as errors and the available GCC static analyzer remain enabled. See
 [Getting Started](docs/content/getting-started.md) for existing build directories
 and toolchain setup.
+
+The [implemented architecture](docs/content/architecture/current-state.md) records
+current metadata boundaries and ownership, alongside the remaining migration plan.
 
 ## Two layers
 

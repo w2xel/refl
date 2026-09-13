@@ -12,9 +12,12 @@ are not proof that a layer has been extracted.
 The [implemented architecture](current-state.md) records completed extractions.
 Step 0 is complete with eight baseline tests passing. The first bounded slice of
 step 1 extracts metadata declarations and errors into independently compiled core
-headers; ten tests now cover the suite and those boundaries. This preparatory
-change preserves invocation semantics. Step 0a remains pending, as do the complete
-identity, ownership, value, and dispatch contracts in step 1.
+headers (commit `eb474e2`). The second completed slice gives public metadata handles const
+shared ownership, preserves raw-pointer construction through snapshots, and retains
+inherited lookup results. Eleven tests cover the suite, boundaries, and metadata
+lifetimes. Step 0a remains pending, as do the complete identity, value, and dispatch
+contracts in step 1. The [current-state page](current-state.md) records compatibility
+changes and remaining global hierarchy dependencies.
 
 ## Proposed destination
 

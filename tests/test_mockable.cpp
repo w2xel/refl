@@ -178,6 +178,31 @@ int main() {
         CHECK(view->area(0) == 22, "next call should see the replacement");
     }
 
+    // Metadata outlives the synthetic backend without retaining its instance.
+    {
+        refl::Class metadata;
+        refl::Function method;
+        std::weak_ptr<const refl::ClassInfo> metadata_lifetime;
+        std::weak_ptr<refl::Mockable<IShape>> backend_lifetime;
+        {
+            auto backend = refl::Mockable<IShape>::create();
+            backend_lifetime = backend;
+            auto object = backend->as_object();
+            metadata_lifetime = object.class_info();
+            auto view = backend->proxy();
+            metadata = view.get_class();
+            method = metadata.find_function("area").value();
+        }
+        CHECK(backend_lifetime.expired(), "metadata must not retain the backend instance");
+        CHECK(!metadata_lifetime.expired(), "class handle must retain synthetic metadata");
+        CHECK(metadata.find_function("area").has_value(), "retained class supports lookup");
+        metadata = {};
+        CHECK(!metadata_lifetime.expired(), "member alone must retain synthetic metadata");
+        CHECK(method.name() == "area", "member metadata survives backend and class destruction");
+        method = {};
+        CHECK(metadata_lifetime.expired(), "last member releases synthetic metadata");
+    }
+
     printf("All mockable tests passed.\n");
     return 0;
 }

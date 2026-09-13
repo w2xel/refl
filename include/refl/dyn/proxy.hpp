@@ -704,7 +704,7 @@ public:
     // Returns an invalid Class if not bound or the type is unregistered.
     Class get_class() const {
         if (!obj_.valid()) return {};
-        return Class(obj_.class_info().get());
+        return Class(obj_.class_info());
     }
 
     // -----------------------------------------------------------------------

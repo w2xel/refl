@@ -68,3 +68,11 @@ core_headers = executable(
 test('core_headers', core_headers)
 
 test('core_include_boundaries', find_program('check_core_includes.py'))
+
+metadata_lifetime = executable(
+  'test_metadata_lifetime',
+  'test_metadata_lifetime.cpp',
+  include_directories: inc,
+  install: false,
+)
+test('metadata_lifetime', metadata_lifetime)

@@ -5,8 +5,10 @@
 `refl/core/descriptor.hpp` defines the existing metadata records and erased
 operation declarations; `refl/core/error.hpp` defines `Error`. Both depend only on
 the standard library and compile without reflection. The umbrella includes them
-for compatibility. See [implemented architecture](current-state.md) for the
-current ownership limits and verification.
+for compatibility. Public class, enum, and member handles retain const descriptor
+storage; raw-pointer constructors copy snapshots. See
+[implemented architecture](current-state.md) for construction, ownership limits,
+and verification.
 
 ## Remaining target contracts
 

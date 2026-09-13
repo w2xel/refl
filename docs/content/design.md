@@ -177,8 +177,8 @@ Initial implementation. The API above is working:
 - The `*Info` structs (`FunctionInfo`, `StaticFunctionInfo`, `FieldInfo`,
   `StaticFieldInfo`, `ConstructorInfo`) are internal metadata stored in
   `ClassInfo`.  The public API returns handle types (`Function`, `Field`,
-  etc.) that wrap them; call the handle methods (`name()`, `param_types()`,
-  `invoke()`, `get()`, etc.) directly.
+  etc.) that retain const shared metadata; call the handle methods (`name()`,
+  `param_types()`, `invoke()`, `get()`, etc.) directly.
 - `Object::cast_safe<T>()` checks the class name at runtime and returns
   `std::expected<std::shared_ptr<T>, Error>` — the shared_ptr keeps the
   object alive independently of the Object.  Succeeds if T matches the
@@ -347,7 +347,9 @@ Limitations:
   conversion; the stored value may not match the true enumerator value.
 - Registration is static-init order dependent — `find_class` only works after
   `Reg<T>` has been instantiated (or `ensure_registered<T>()` called).  The
-  global pool holds each `ClassInfo`/`EnumInfo` in a `unique_ptr`, so
-  `Class`/`Field`/`Function`/... handles (which point into the pool) stay
-  valid even if a later `ensure_registered<T>()` grows the pool and rehashes
-  it — registration may safely happen at runtime after lookups have started.
+  global pools and public handles share const `ClassInfo`/`EnumInfo` descriptors.
+  Handles retain their records across pool rehashing, catalog replacement, and
+  synthetic backend destruction. Raw-pointer handle constructors copy a snapshot;
+  shared-pointer constructors retain published immutable metadata. Base traversal
+  still uses the current global catalog. See the
+  [implemented architecture](architecture/current-state.md) for the ownership boundary.

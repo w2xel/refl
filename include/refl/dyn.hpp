@@ -188,7 +188,7 @@ public:
 
     Class get_class() const {
         // Class-level statics belong to T, not its synthetic dispatch metadata.
-        return Class(detail::lookup_class_info(detail::type_name<T>()).get());
+        return Class(detail::lookup_class_info(detail::type_name<T>()));
     }
 
     // --- reset: swap real object, re-wire slots ---

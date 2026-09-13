@@ -44,20 +44,17 @@ namespace refl {
 // ---------------------------------------------------------------------------
 // Global class and enum pools — Meyers singletons to avoid SIOF.
 //
-// Values are held in shared_ptr so that Object can carry a
-// shared_ptr<const ClassInfo> directly — the Object keeps its ClassInfo
-// alive for its lifetime, and mock-owned ClassInfos are cleaned up when
-// the last referencing Object dies.  The heap-allocated info objects never
-// move (unordered_map rehashing only moves the shared_ptr handles, not
-// the pointees), so ClassInfo* / Function / Field handles remain stable.
+// Pools publish const snapshots. Objects and metadata handles share ownership
+// of their descriptors, including after a catalog entry is replaced. Metadata
+// ownership does not retain concrete receivers or callable contexts.
 // ---------------------------------------------------------------------------
-inline std::unordered_map<std::string, std::shared_ptr<ClassInfo>>& class_pool() {
-    static std::unordered_map<std::string, std::shared_ptr<ClassInfo>> pool;
+inline std::unordered_map<std::string, std::shared_ptr<const ClassInfo>>& class_pool() {
+    static std::unordered_map<std::string, std::shared_ptr<const ClassInfo>> pool;
     return pool;
 }
 
-inline std::unordered_map<std::string, std::unique_ptr<EnumInfo>>& enum_pool() {
-    static std::unordered_map<std::string, std::unique_ptr<EnumInfo>> pool;
+inline std::unordered_map<std::string, std::shared_ptr<const EnumInfo>>& enum_pool() {
+    static std::unordered_map<std::string, std::shared_ptr<const EnumInfo>> pool;
     return pool;
 }
 
@@ -69,14 +66,14 @@ inline std::mutex& pool_mutex() {
 struct Registrar {
     explicit Registrar(const ClassInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        class_pool()[info.name] = std::make_shared<ClassInfo>(std::move(info));
+        class_pool()[info.name] = std::make_shared<const ClassInfo>(info);
     }
 };
 
 struct EnumRegistrar {
     explicit EnumRegistrar(const EnumInfo& info) {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        enum_pool()[info.name] = std::make_unique<EnumInfo>(std::move(info));
+        enum_pool()[info.name] = std::make_shared<const EnumInfo>(info);
     }
 };
 
@@ -1072,8 +1069,12 @@ EnumInfo EnumRegistrarHolder<T>::make_enum_info() {
 class Constructor {
 public:
     Constructor() = default;
+    Constructor(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     Constructor(const ClassInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : Constructor(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::vector<std::string>& param_types() const {
         return owner_->constructors[idx_].param_types;
@@ -1096,19 +1097,23 @@ public:
         return detail::checked_call(ci.factory, *args_ptr);
     }
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->constructors.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
-    const ClassInfo* owner_ = nullptr;
+    std::shared_ptr<const ClassInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class Function {
 public:
     Function() = default;
+    Function(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     Function(const ClassInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : Function(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1141,20 +1146,24 @@ public:
         return detail::checked_call(fi.invoker, obj.owner(), adj, *args_ptr);
     }
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->functions.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
     friend class Class;
-    const ClassInfo* owner_ = nullptr;
+    std::shared_ptr<const ClassInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class Field {
 public:
     Field() = default;
+    Field(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     Field(const ClassInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : Field(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->fields[idx_].name; }
     const std::string& type() const { return owner_->fields[idx_].type; }
@@ -1227,20 +1236,24 @@ public:
                                     adj, &val_ref);
     }
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->fields.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
     friend class Class;
-    const ClassInfo* owner_ = nullptr;
+    std::shared_ptr<const ClassInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class StaticField {
 public:
     StaticField() = default;
+    StaticField(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     StaticField(const ClassInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : StaticField(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->static_fields[idx_].name; }
     const std::string& type() const { return owner_->static_fields[idx_].type; }
@@ -1298,20 +1311,24 @@ public:
                                     &val_ref);
     }
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->static_fields.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
     friend class Class;
-    const ClassInfo* owner_ = nullptr;
+    std::shared_ptr<const ClassInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class StaticFunction {
 public:
     StaticFunction() = default;
+    StaticFunction(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     StaticFunction(const ClassInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : StaticFunction(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->static_functions[idx_].name; }
     const std::vector<std::string>& param_types() const {
@@ -1339,36 +1356,44 @@ public:
         return detail::checked_call(sf.invoker, *args_ptr);
     }
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->static_functions.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
     friend class Class;
-    const ClassInfo* owner_ = nullptr;
+    std::shared_ptr<const ClassInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class Enumerator {
 public:
     Enumerator() = default;
+    Enumerator(std::shared_ptr<const EnumInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     Enumerator(const EnumInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : Enumerator(owner ? std::make_shared<const EnumInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->enumerators[idx_].name; }
     long long value() const { return owner_->enumerators[idx_].value; }
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->enumerators.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
-    const EnumInfo* owner_ = nullptr;
+    std::shared_ptr<const EnumInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class Enum {
 public:
     Enum() = default;
-    explicit Enum(const EnumInfo* info) : info_(info) {}
+    explicit Enum(std::shared_ptr<const EnumInfo> info) : info_(std::move(info)) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
+    explicit Enum(const EnumInfo* info)
+        : Enum(info ? std::make_shared<const EnumInfo>(*info) : nullptr) {}
 
     const std::string& name() const {
         static const std::string empty;
@@ -1390,14 +1415,18 @@ public:
     explicit operator bool() const { return valid(); }
 
 private:
-    const EnumInfo* info_ = nullptr;
+    std::shared_ptr<const EnumInfo> info_;
 };
 
 class Base {
 public:
     Base() = default;
+    Base(std::shared_ptr<const ClassInfo> owner, std::size_t idx)
+        : owner_(std::move(owner)), idx_(idx) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
     Base(const ClassInfo* owner, std::size_t idx)
-        : owner_(owner), idx_(idx) {}
+        : Base(owner ? std::make_shared<const ClassInfo>(*owner) : nullptr, idx) {}
 
     const std::string& name() const { return owner_->bases[idx_].name; }
     std::ptrdiff_t offset() const { return owner_->bases[idx_].offset; }
@@ -1406,19 +1435,23 @@ public:
     // registered — e.g. it was never Reg<T>'d).
     Class as_class() const;
 
-    bool valid() const { return owner_ != nullptr; }
+    bool valid() const { return owner_ && idx_ < owner_->bases.size(); }
     explicit operator bool() const { return valid(); }
 
 private:
     friend class Class;
-    const ClassInfo* owner_ = nullptr;
+    std::shared_ptr<const ClassInfo> owner_;
     std::size_t idx_ = 0;
 };
 
 class Class {
 public:
     Class() = default;
-    explicit Class(const ClassInfo* info) : info_(info) {}
+    explicit Class(std::shared_ptr<const ClassInfo> info) : info_(std::move(info)) {}
+
+    // Compatibility: raw metadata is copied, never borrowed.
+    explicit Class(const ClassInfo* info)
+        : Class(info ? std::make_shared<const ClassInfo>(*info) : nullptr) {}
 
     const std::string& name() const {
         static const std::string empty;
@@ -1545,7 +1578,7 @@ private:
         std::set<std::pair<const ClassInfo*, std::size_t>> seen;
         v.erase(std::remove_if(v.begin(), v.end(),
             [&seen](const Handle& h) {
-                return !seen.insert({h.owner_, h.idx_}).second;
+                return !seen.insert({h.owner_.get(), h.idx_}).second;
             }), v.end());
     }
 
@@ -1563,7 +1596,7 @@ private:
             }), v.end());
     }
 
-    const ClassInfo* info_ = nullptr;
+    std::shared_ptr<const ClassInfo> info_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1575,7 +1608,7 @@ inline std::expected<Class, Error> find_class(std::string_view name) {
     auto it = class_pool().find(std::string(name));
     if (it == class_pool().end())
         return std::unexpected(Error::NotFound);
-    return Class(it->second.get());
+    return Class(it->second);
 }
 
 // Enumerate all registered class names.
@@ -1594,7 +1627,7 @@ inline std::expected<Enum, Error> find_enum(std::string_view name) {
     auto it = enum_pool().find(std::string(name));
     if (it == enum_pool().end())
         return std::unexpected(Error::NotFound);
-    return Enum(it->second.get());
+    return Enum(it->second);
 }
 
 // Enumerate all registered enum names.
@@ -1629,6 +1662,9 @@ inline std::vector<std::string> list_all_enums() {
 // ---------------------------------------------------------------------------
 namespace detail {
 
+// A declaration retains its metadata through lookup and handle construction.
+using MemberLocation = std::pair<std::shared_ptr<const ClassInfo>, std::size_t>;
+
 // Indices in `v` whose `.name == name`.
 template <typename Info>
 std::vector<std::size_t> own_indices(const std::vector<Info>& v,
@@ -1648,7 +1684,7 @@ std::set<std::string> own_names(const std::vector<Member>& members) {
     return names;
 }
 
-// Recursively collect (declaring ClassInfo*, idx) for members named `name`
+// Recursively collect retained declarations for members named `name`
 // in C's base hierarchy, respecting name hiding: a base that declares `name`
 // hides the same name in its own bases (we don't descend into them);
 // sibling bases are all searched (their declarations may be ambiguous).
@@ -1656,16 +1692,16 @@ std::set<std::string> own_names(const std::vector<Member>& members) {
 template <typename Info>
 void collect_base_named(const ClassInfo* C, std::string_view name,
     const std::vector<Info> ClassInfo::* vec,
-    std::vector<std::pair<const ClassInfo*, std::size_t>>& out) {
+    std::vector<MemberLocation>& out) {
     for (const auto& b : C->bases) {
         auto it = class_pool().find(b.name);
         if (it == class_pool().end()) continue;
-        const ClassInfo* bc = it->second.get();
-        auto idxs = own_indices(bc->*vec, name);
+        const auto& bc = it->second;
+        auto idxs = own_indices((*bc).*vec, name);
         if (!idxs.empty()) {
             for (auto i : idxs) out.emplace_back(bc, i);
         } else {
-            collect_base_named(bc, name, vec, out);
+            collect_base_named(bc.get(), name, vec, out);
         }
     }
 }
@@ -1673,10 +1709,10 @@ void collect_base_named(const ClassInfo* C, std::string_view name,
 // Dedup (ClassInfo*, idx) pairs — a diamond reaches the same declaration
 // via two paths.  Order-preserving.
 inline void dedup_decl(
-    std::vector<std::pair<const ClassInfo*, std::size_t>>& v) {
+    std::vector<MemberLocation>& v) {
     std::set<std::pair<const ClassInfo*, std::size_t>> seen;
     v.erase(std::remove_if(v.begin(), v.end(),
-        [&seen](const auto& p) { return !seen.insert(p).second; }), v.end());
+        [&seen](const auto& p) { return !seen.insert({p.first.get(), p.second}).second; }), v.end());
 }
 
 // Number of distinct base subobjects that offer `name` in C's hierarchy.
@@ -1685,7 +1721,7 @@ inline void dedup_decl(
 // Caller must hold pool_mutex.
 inline std::size_t subobject_count(
     const ClassInfo* C,
-    const std::vector<std::pair<const ClassInfo*, std::size_t>>& decls) {
+    const std::vector<MemberLocation>& decls) {
     std::set<std::string> classes;
     for (const auto& [ci, idx] : decls)
         classes.insert(ci->name);
@@ -1699,21 +1735,21 @@ inline std::size_t subobject_count(
 // number of distinct base subobjects offering the name is checked: >=2 →
 // Ambiguous; otherwise return the first declaration (first overload).
 template <typename Handle, typename Info>
-std::expected<Handle, Error> find_named(const ClassInfo* C,
+std::expected<Handle, Error> find_named(const std::shared_ptr<const ClassInfo>& C,
     std::string_view name,
     const std::vector<Info> ClassInfo::* vec) {
     // Own members are read without the lock — ClassInfo is immutable after
     // registration.  The base walk dereferences the pool, so it locks.
-    for (std::size_t i = 0; i < (C->*vec).size(); ++i)
-        if ((C->*vec)[i].name == name)
+    for (std::size_t i = 0; i < ((*C).*vec).size(); ++i)
+        if (((*C).*vec)[i].name == name)
             return Handle(C, i);  // own hides bases
 
-    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::vector<MemberLocation> decls;
     {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        collect_base_named(C, name, vec, decls);
+        collect_base_named(C.get(), name, vec, decls);
         dedup_decl(decls);
-        if (subobject_count(C, decls) >= 2) return std::unexpected(Error::Ambiguous);
+        if (subobject_count(C.get(), decls) >= 2) return std::unexpected(Error::Ambiguous);
         if (!decls.empty()) return Handle(decls[0].first, decls[0].second);
     }
     return std::unexpected(Error::NotFound);
@@ -1725,7 +1761,7 @@ std::expected<Handle, Error> find_named(const ClassInfo* C,
 // name-lookup set (before overload resolution), matching C++.  Among base
 // hits, the first signature match is returned.
 template <typename Handle, typename Info>
-std::expected<Handle, Error> find_named_sig(const ClassInfo* C,
+std::expected<Handle, Error> find_named_sig(const std::shared_ptr<const ClassInfo>& C,
     std::string_view name,
     std::initializer_list<std::string_view> types,
     const std::vector<Info> ClassInfo::* vec) {
@@ -1733,23 +1769,23 @@ std::expected<Handle, Error> find_named_sig(const ClassInfo* C,
     for (auto t : types) query.push_back(normalize_type(t));
 
     bool name_exists = false;
-    for (std::size_t i = 0; i < (C->*vec).size(); ++i) {
-        if ((C->*vec)[i].name == name) {
+    for (std::size_t i = 0; i < ((*C).*vec).size(); ++i) {
+        if (((*C).*vec)[i].name == name) {
             name_exists = true;
-            if (match_signature((C->*vec)[i].param_types, query))
+            if (match_signature(((*C).*vec)[i].param_types, query))
                 return Handle(C, i);
         }
     }
     if (name_exists) return std::unexpected(Error::NotFound);
 
-    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::vector<MemberLocation> decls;
     {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        collect_base_named(C, name, vec, decls);
+        collect_base_named(C.get(), name, vec, decls);
         dedup_decl(decls);
-        if (subobject_count(C, decls) >= 2) return std::unexpected(Error::Ambiguous);
+        if (subobject_count(C.get(), decls) >= 2) return std::unexpected(Error::Ambiguous);
         for (const auto& [ci, idx] : decls)
-            if (match_signature((ci->*vec)[idx].param_types, query))
+            if (match_signature(((*ci).*vec)[idx].param_types, query))
                 return Handle(ci, idx);
     }
     return std::unexpected(Error::NotFound);
@@ -1759,19 +1795,19 @@ std::expected<Handle, Error> find_named_sig(const ClassInfo* C,
 // Own members hide bases.  Diamond-ambiguous declarations (path count >1)
 // are omitted.  Returns handles by value.
 template <typename Handle, typename Info>
-std::vector<Handle> find_all_named(const ClassInfo* C,
+std::vector<Handle> find_all_named(const std::shared_ptr<const ClassInfo>& C,
     std::string_view name,
     const std::vector<Info> ClassInfo::* vec) {
     std::vector<Handle> results;
-    for (std::size_t i = 0; i < (C->*vec).size(); ++i)
-        if ((C->*vec)[i].name == name)
+    for (std::size_t i = 0; i < ((*C).*vec).size(); ++i)
+        if (((*C).*vec)[i].name == name)
             results.emplace_back(C, i);
     if (!results.empty()) return results;  // own hides bases
 
-    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::vector<MemberLocation> decls;
     {
         std::lock_guard<std::mutex> lk(pool_mutex());
-        collect_base_named(C, name, vec, decls);
+        collect_base_named(C.get(), name, vec, decls);
         dedup_decl(decls);
         std::erase_if(decls, [&](const auto& p) {
             return base_path_offsets_unlocked(C->name, p.first->name).size() > 1;
@@ -1786,17 +1822,17 @@ std::vector<Handle> find_all_named(const ClassInfo* C,
 // hiding (a class's own names hide same-name members in its bases).
 // Caller must hold pool_mutex.
 template <typename Handle, typename Info>
-void collect_all_unlocked(const ClassInfo* C,
+void collect_all_unlocked(const std::shared_ptr<const ClassInfo>& C,
     const std::vector<Info> ClassInfo::* vec,
     std::vector<Handle>& results) {
-    auto hidden = own_names(C->*vec);
-    for (std::size_t i = 0; i < (C->*vec).size(); ++i)
+    auto hidden = own_names((*C).*vec);
+    for (std::size_t i = 0; i < ((*C).*vec).size(); ++i)
         results.emplace_back(C, i);
     for (const auto& b : C->bases) {
         auto it = class_pool().find(b.name);
         if (it == class_pool().end()) continue;
         std::vector<Handle> more;
-        collect_all_unlocked<Handle, Info>(it->second.get(), vec, more);
+        collect_all_unlocked<Handle, Info>(it->second, vec, more);
         for (auto& h : more)
             if (!hidden.count(h.name()))
                 results.push_back(std::move(h));
@@ -1840,7 +1876,7 @@ inline FunctionSearchResult find_function_in_hierarchy(
     }
     if (name_exists) return {nullptr, 0};
 
-    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::vector<MemberLocation> decls;
     std::lock_guard<std::mutex> lk(pool_mutex());
     collect_base_named(C, name, &ClassInfo::functions, decls);
     dedup_decl(decls);
@@ -1860,7 +1896,7 @@ inline FieldSearchResult find_field_in_hierarchy(
         if (C->fields[i].name == name)
             return {&C->fields[i], 0};
 
-    std::vector<std::pair<const ClassInfo*, std::size_t>> decls;
+    std::vector<MemberLocation> decls;
     std::lock_guard<std::mutex> lk(pool_mutex());
     collect_base_named(C, name, &ClassInfo::fields, decls);
     dedup_decl(decls);
@@ -2052,14 +2088,14 @@ inline std::vector<Base> Class::all_bases() const {
     // Recursively append bases, deduping by name.  Uses (owner_, idx) where
     // owner_ is the *derived* class that lists this base — so each Base
     // handle reports the correct per-derivation offset.
-    auto walk = [&](auto& self, const ClassInfo* C) -> void {
+    auto walk = [&](auto& self, const std::shared_ptr<const ClassInfo>& C) -> void {
         for (std::size_t i = 0; i < C->bases.size(); ++i) {
             const auto& b = C->bases[i];
             if (seen.insert(b.name).second) {
                 results.emplace_back(C, i);
                 auto it = class_pool().find(b.name);
                 if (it != class_pool().end())
-                    self(self, it->second.get());
+                    self(self, it->second);
             }
         }
     };
