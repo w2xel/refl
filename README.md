@@ -17,7 +17,8 @@ meson test -C builddir --print-errorlogs
 The test run covers all five component suites, all three samples, metadata
 lifetime regressions, and reflection-independent core-header checks. LTO defaults
 to off because GCC 16.2 crashes linking the reflection-heavy Dyn coverage; warnings
-as errors and the available GCC static analyzer remain enabled. See
+as errors remain enabled. GCC static analysis is opt-in (`-Dstatic_analysis=true`)
+because it uses substantial memory on generated reflection code. See
 [Getting Started](docs/content/getting-started.md) for existing build directories
 and toolchain setup.
 

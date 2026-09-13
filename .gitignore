@@ -1,6 +1,7 @@
 # Build artifacts
 /builddir
 /build
+/build-analysis
 /result
 
 # direnv

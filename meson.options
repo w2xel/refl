@@ -1,0 +1,2 @@
+option('static_analysis', type: 'boolean', value: false,
+       description: 'Run GCC static analysis during compilation (high memory use)')

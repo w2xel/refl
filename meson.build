@@ -2,6 +2,7 @@ project(
   'cpp_runtime_reflection',
   'cpp',
   version: '0.1.0',
+  meson_version: '>=1.1',
   default_options: [
     'cpp_std=c++26',
     'warning_level=3',      # -Wall -Wextra
@@ -27,8 +28,9 @@ assert(has_reflection,
        'compiler has no C++26 reflection; need GCC 16+ built with -freflection')
 add_project_arguments('-freflection', language: 'cpp')
 
-# GCC static analyzer — the flagship built-in linter, no clang required.
-if cpp.has_argument('-fanalyzer')
+# Keep expensive path analysis separate from normal compilation.
+if get_option('static_analysis')
+  assert(cpp.has_argument('-fanalyzer'), 'compiler does not support -fanalyzer')
   add_project_arguments('-fanalyzer', language: 'cpp')
 endif
 

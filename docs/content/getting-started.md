@@ -26,7 +26,7 @@ and the GCC-bundled gcov/gprof/gdb — all clang-free.
 
 ```sh
 meson setup builddir
-meson compile -C builddir
+meson compile -C builddir -j 2
 meson test -C builddir --print-errorlogs
 ```
 
@@ -34,15 +34,35 @@ The `selfcheck` test verifies the toolchain can compile C++26 reflection by
 reflecting a `struct Point { int x; int y; }` and asserting two members.
 The default test run also includes the core, Dyn/Proxy, Mockable, and Hooks suites
 and smoke tests for all three samples. Core contract headers also have standalone
-C++23 compilation, synthetic metadata, and include-boundary checks. Warnings remain errors and GCC's static
-analyzer remains enabled when available.
+C++23 compilation, synthetic metadata, and include-boundary checks. Warnings remain errors.
 
 LTO is disabled by default because the configured GCC 16.2 compiler crashes while
 linking the reflection-heavy Dyn tests. Existing build directories keep their old
 options; update one explicitly with `meson configure builddir -Db_lto=false`.
 Use `-Db_lto=true` only when investigating compiler support; it is not part of the
-verified baseline. Limit compile parallelism with `meson compile -C builddir -j 2`
-if the reflection and analyzer passes consume too much memory.
+verified baseline.
+
+GCC static analysis is off by default. Use a separate build for it:
+
+```sh
+meson setup build-analysis -Dstatic_analysis=true
+meson compile -C build-analysis -j 1
+```
+
+Analysis of a large reflection test can exceed 39 GiB per compiler process.
+The normal build keeps `-O2`, debug information, and compiler warnings.
+Use `-j 2` to limit concurrent compiler processes. Ninja otherwise chooses
+parallelism from the CPU count.
+
+Local measurement for `test_refl.cpp`, GCC 16.2, during runtime migration:
+
+| Static analysis | Peak compiler memory | Compile time |
+| --- | ---: | ---: |
+| On | At least 38.9 GiB | Stopped after 4 min |
+| Off | 3.14 GiB | 82 s |
+
+Existing builds pick up the new default when Meson regenerates. If analysis was
+enabled explicitly, use `meson configure builddir -Dstatic_analysis=false`.
 
 ## Run a sample
 
