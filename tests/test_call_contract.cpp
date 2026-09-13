@@ -1,5 +1,5 @@
 #include <refl/extensions/observed.hpp>
-#include "prototype/source.hpp"
+#include <refl/dynamic/dispatch_table.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <source_location>
@@ -38,7 +38,7 @@ int main() {
         {value, "value", refl::signature_of<std::unique_ptr<int>()>()},
         {reference, "reference", refl::signature_of<int&()>()}
     });
-    prototype::Source source(schema);
+    refl::DispatchTable source(schema);
     int calls = 0;
     auto update_target = refl::make_target<void(int&)>([&](int& n) { ++calls; n = 42; }).value();
     auto value_target = refl::make_target<std::unique_ptr<int>()>([] { return std::make_unique<int>(9); }).value();
@@ -49,7 +49,7 @@ int main() {
         return refl::make_target<int&()>([owned, &calls]() -> int& { ++calls; return *owned; },
             {.result_lifetime = refl::ResultLifetime::callable_context}).value();
     }();
-    check(source.reset({{update, update_target}, {value, value_target}, {reference, ref_target}}).has_value());
+    check(source.reset({{{update, refl::OperationKind::method}, update_target}, {{value, refl::OperationKind::method}, value_target}, {{reference, refl::OperationKind::method}, ref_target}}).has_value());
     ref_target = {};
     int n = 0;
     auto live = source.dispatch();
@@ -82,7 +82,7 @@ int main() {
     check(calls == before);
     auto retained = refl::try_call_retained<int>(observed, reference);
     // The native baseline also retains the initial target until this reset.
-    source.reset({{update, update_target}, {value, value_target}, {reference, source.target(reference)}}).value();
+    source.reset({{{update, refl::OperationKind::method}, update_target}, {{value, refl::OperationKind::method}, value_target}, {{reference, refl::OperationKind::method}, source.target(reference).value()}}).value();
     check(!closure_lifetime.expired() && retained->get() == 73);
     retained = std::unexpected(refl::Diagnostic{refl::DiagnosticCode::not_found});
     check(closure_lifetime.expired());
@@ -92,20 +92,20 @@ int main() {
     check(&refl::try_call<int&>(live, reference).value().get() == &n);
     // Captures keep their generation; live dispatch and observation follow reset.
     auto captured = source.capture();
-    source.reset({{update, refl::make_target<void(int&)>([](int& x) { x = 100; }).value()},
-                  {value, value_target}, {reference, source.target(reference)}}).value();
+    source.reset({{{update, refl::OperationKind::method}, refl::make_target<void(int&)>([](int& x) { x = 100; }).value()},
+                  {{value, refl::OperationKind::method}, value_target}, {{reference, refl::OperationKind::method}, source.target(reference).value()}}).value();
     refl::try_call<void>(captured, update, n).value(); check(n == 42);
     refl::try_call<void>(live, update, n).value(); check(n == 100);
     check(!source.reset({}));
     refl::try_call<void>(observed, update, n).value(); check(n == 100);
     // One schema is reused by independent instance states.
-    prototype::Source second(schema);
-    second.reset({{update, update_target}, {value, value_target}, {reference, source.target(reference)}}).value();
+    refl::DispatchTable second(schema);
+    second.reset({{{update, refl::OperationKind::method}, update_target}, {{value, refl::OperationKind::method}, value_target}, {{reference, refl::OperationKind::method}, source.target(reference).value()}}).value();
     refl::try_call<void>(second.dispatch(), update, n).value(); check(n == 42);
     refl::try_call<void>(live, update, n).value(); check(n == 100);
     source.replace(value, refl::make_target<std::unique_ptr<int>()>([] { return std::make_unique<int>(9); },
         {.native_dependency = refl::NativeDependency::independent}).value()).value();
-    source.detach();
+    source.detach_native();
     check(!refl::try_call<void>(live, update, n));
     check(refl::try_call<std::unique_ptr<int>>(observed, value).has_value());
     // Native targets retain their original receiver across reset and restore.
@@ -116,12 +116,12 @@ int main() {
     };
     auto square = make_native(std::make_shared<Square>(4));
     auto triangle = make_native(std::make_shared<Triangle>(6));
-    source.reset({{update, square}, {value, value_target}, {reference, second.target(reference)}}).value();
-    auto saved = source.target(update);
-    source.reset({{update, triangle}, {value, value_target}, {reference, second.target(reference)}}).value();
+    source.reset({{{update, refl::OperationKind::method}, square}, {{value, refl::OperationKind::method}, value_target}, {{reference, refl::OperationKind::method}, second.target(reference).value()}}).value();
+    auto saved = source.target(update).value();
+    source.reset({{{update, refl::OperationKind::method}, triangle}, {{value, refl::OperationKind::method}, value_target}, {{reference, refl::OperationKind::method}, second.target(reference).value()}}).value();
     source.replace(update, saved).value();
     refl::try_call<void>(live, update, n).value(); check(n == 4);
-    source.restore(update);
+    source.restore(update).value();
     refl::try_call<void>(live, update, n).value(); check(n == 6);
     // Move-only input requires an explicit rvalue.
     auto consume = refl::make_target<int(std::unique_ptr<int>)>([](auto p) { return *p; }).value();
@@ -169,7 +169,7 @@ int main() {
     refl::try_call<void>(ordered, update, n).value();
     check(order == std::vector<int>({1, 1, 3}));
     try {
-        prototype::Source unsupported(std::make_shared<const refl::InterfaceSchema>(refl::InterfaceSchema{
+        refl::DispatchTable unsupported(std::make_shared<const refl::InterfaceSchema>(refl::InterfaceSchema{
             {update, "noexcept", refl::signature_of<int() noexcept>()}}));
         check(false);
     } catch (const refl::ReflectionError& error) { check(error.diagnostic.code == refl::DiagnosticCode::unsupported); }

@@ -61,10 +61,10 @@ int main() {
     // --- Switch to dynamic (mock) mode.
     std::printf("\n=== Mock Circle ===\n");
     int mock_color = 0;
-    circle.implement<^^Circle::area>([](refl::Dyn<Circle>&, int scale) {
+    circle.implement<^^Circle::area>([](refl::Dyn<Circle>::Self&, int scale) {
         return scale * 1000;  // mock: always 1000*scale
     });
-    circle.implement<^^Circle::set_color>([&mock_color](refl::Dyn<Circle>&, int c) {
+    circle.implement<^^Circle::set_color>([&mock_color](refl::Dyn<Circle>::Self&, int c) {
         mock_color = c;
     });
     std::printf("  is_dynamic = %d\n", circle.is_dynamic());
@@ -75,7 +75,7 @@ int main() {
 
     // --- Switch back to real mode.
     std::printf("\n=== Back to Real Circle (radius=10) ===\n");
-    circle.reset(10);
+    circle.reset_native<Circle>(10);
     std::printf("  is_dynamic = %d\n", circle.is_dynamic());
     int ra = circle->area(1);
     std::printf("  real area(1) = %d\n", ra);
@@ -86,10 +86,10 @@ int main() {
     int stored_color = 0;
     int fake_radius = 7;
 
-    renderer.implement<^^IRenderer::area>([fake_radius](refl::Dyn<IRenderer>&, int scale) {
+    renderer.implement<^^IRenderer::area>([fake_radius](refl::Dyn<IRenderer>::Self&, int scale) {
         return scale * fake_radius * fake_radius;
     });
-    renderer.implement<^^IRenderer::set_color>([&stored_color](refl::Dyn<IRenderer>&, int c) {
+    renderer.implement<^^IRenderer::set_color>([&stored_color](refl::Dyn<IRenderer>::Self&, int c) {
         stored_color = c;
         std::printf("  set_color(%d) — stored\n", c);
     });
@@ -101,7 +101,7 @@ int main() {
 
     // Re-implement at runtime.
     std::printf("\n=== Re-implemented IRenderer ===\n");
-    renderer.implement<^^IRenderer::area>([](refl::Dyn<IRenderer>&, int scale) {
+    renderer.implement<^^IRenderer::area>([](refl::Dyn<IRenderer>::Self&, int scale) {
         return scale * 7;
     });
     int r_area2 = renderer->area(3);

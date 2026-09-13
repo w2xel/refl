@@ -1,4 +1,4 @@
-#include <refl/mockable.hpp>
+#include <refl/dyn.hpp>
 #include <cassert>
 struct BindingBase { int value = 5; void update(int& out) { out = value; } };
 struct BindingNative : BindingBase {
@@ -57,11 +57,11 @@ int main() {
     auto moved = std::move(first);
     assert(!first.is_bound() && moved->read() == 9);
     try { (void)first->read(); assert(false); } catch (const refl::ReflectionError&) {}
-    auto mock = refl::Mockable<BindingMock>::create();
+    auto mock = std::make_shared<refl::Dyn<BindingMock>>();
     mock->implement<^^BindingMock::update>([](int& value) { value = 11; });
     mock->implement<^^BindingMock::take>([](std::unique_ptr<int> value) { return *value; });
     mock->implement<^^BindingMock::sum>([](int x, int y, int z) { return x+y+z; });
-    auto view = mock->proxy();
+    auto view = mock->capture_binding();
     view->update(out);
     assert(out == 11 && view->sum(1,2,3) == 6);
     assert(view->take(std::make_unique<int>(12)) == 12);

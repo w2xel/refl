@@ -102,6 +102,7 @@ template<class T, std::meta::info M> void fields(std::vector<NativeOperation>& o
                 auto ptr = receiver.template get<const T>();
                 if (!ptr) return std::unexpected(ptr.error());
                 options.receiver = receiver;
+                options.native_dependency = NativeDependency::native;
                 options.operation = OperationKind::read;
                 return make_target<U() const>([ptr = *ptr] { return ptr->[:M:]; }, options);
             };
@@ -114,6 +115,7 @@ template<class T, std::meta::info M> void fields(std::vector<NativeOperation>& o
             auto ptr = receiver.template get<const T>();
             if (!ptr) return std::unexpected(ptr.error());
             options.receiver = receiver;
+            options.native_dependency = NativeDependency::native;
             options.operation = OperationKind::view;
             options.result_lifetime = ResultLifetime::receiver;
             return make_target<const U&() const>([ptr = *ptr]() -> const U& { return ptr->[:M:]; }, options);
@@ -127,6 +129,7 @@ template<class T, std::meta::info M> void fields(std::vector<NativeOperation>& o
                 auto ptr = receiver.template get<T>();
                 if (!ptr) return std::unexpected(ptr.error());
                 options.receiver = receiver;
+                options.native_dependency = NativeDependency::native;
                 options.operation = OperationKind::write;
                 return make_target<void(U)>([ptr = *ptr](U value) { ptr->[:M:] = std::move(value); }, options);
             };

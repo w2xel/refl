@@ -13,6 +13,16 @@ template<class T> std::shared_ptr<const InterfaceSchema> describe_interface() {
                           !std::meta::is_static_member(m)) {
                 using S = [:std::meta::type_of(m):];
                 result.push_back({member_id<m>(), std::string(reflect_detail::name<m>()), signature_of<S>()});
+            } else if constexpr (std::meta::is_nonstatic_data_member(m) && std::meta::is_public(m) && !std::meta::is_bit_field(m)) {
+                using V = [:std::meta::type_of(m):];
+                using U = std::remove_cv_t<V>;
+                if constexpr (!std::is_volatile_v<V> && !std::is_array_v<V>) {
+                    result.push_back({member_id<m>(), std::string(reflect_detail::name<m>()), signature_of<const U&() const>(), OperationKind::view});
+                    if constexpr (std::is_copy_constructible_v<U>)
+                        result.push_back({member_id<m>(), std::string(reflect_detail::name<m>()), signature_of<U() const>(), OperationKind::read});
+                    if constexpr (!std::is_const_v<V> && std::is_move_assignable_v<U>)
+                        result.push_back({member_id<m>(), std::string(reflect_detail::name<m>()), signature_of<void(U)>(), OperationKind::write});
+                }
             }
         }
         static constexpr auto bases = std::define_static_array(

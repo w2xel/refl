@@ -1,7 +1,7 @@
 # Layer 4: Typed binding
 
 `Proxy<Interface>` is a typed view of an owning object. It binds native metadata or
-Mockable metadata. It does not own slot replacement or observation policy.
+live or captured dispatch handles. It does not own slot replacement or observation policy.
 The implementation is in `refl/dyn/proxy.hpp`.
 
 ## Bind without registration
@@ -50,21 +50,19 @@ the caller. Move-only values require explicit consumption. Const proxies reject
 mutable receiver calls. Typed wrappers can throw diagnostics and do not advertise
 `noexcept`.
 
-Native targets use generated operations. Mockable targets adapt their backend
-trampolines at the boundary; the next call reads the current slot. Mock
-implementations preserve parameter qualifiers and support arbitrary parameter counts.
-The adapter uses the common validator, not a separate argument-validation path.
+Native targets use generated operations. Dynamic views resolve the current target
+through a dispatch handle before each call. Captured handles retain one generation;
+live handles follow state publication. Both use the common validator.
 
-Typed raw reference returns retain the existing caller-borrow policy: callers keep
-the referent alive. Production dynamic provenance and retained-reference integration
-remain part of the dynamic-state migration. The strict core API already supports
-explicit export policies and `try_call_retained`.
+Native typed raw references retain the caller-borrow policy. Dynamic replacements
+default to restricted export. `try_call_retained` retains the selected target's
+declared result anchor across replacement and observation.
 
 ## Verification
 
 `binding_contracts` checks shared plans, isolated receivers, inherited adjustment,
 mutable arguments, const rejection, move-only inputs/results, qualifier mismatch,
-failed rebinding, moves, and slot replacement. Existing Dyn/Proxy/Mockable/Hooks
+failed rebinding, moves, and slot replacement. Existing Dyn/Proxy/Hooks
 suites cover overloads, properties, operators, and saved slot behavior.
 
 Removed: raw overload arrays, copied argument tuples, string-normalized typed

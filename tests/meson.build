@@ -31,13 +31,13 @@ test_dyn = executable(
 )
 test('dyn_api', test_dyn)
 
-test_mockable = executable(
-  'test_mockable',
-  'test_mockable.cpp',
+test_dispatch_table = executable(
+  'test_dispatch_table',
+  'test_dispatch_table.cpp',
   include_directories: inc,
   install: false,
 )
-test('mockable_api', test_mockable)
+test('dispatch_table_api', test_dispatch_table)
 
 test_hooks = executable(
   'test_hooks',
@@ -115,3 +115,7 @@ test('registry_contracts', registry_contracts)
 binding_contracts = executable('test_binding', 'test_binding.cpp',
   include_directories: inc, install: false)
 test('binding_contracts', binding_contracts)
+
+dynamic_state = executable('test_dynamic_state', 'test_dynamic_state.cpp',
+  include_directories: inc, install: false)
+test('dynamic_state', dynamic_state)

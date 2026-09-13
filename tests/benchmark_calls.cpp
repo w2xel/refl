@@ -1,5 +1,5 @@
 #include <refl/extensions/observed.hpp>
-#include "prototype/source.hpp"
+#include <refl/dynamic/dispatch_table.hpp>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -38,8 +38,8 @@ int main() {
     refl::DispatchHandle native(schema, [target](auto) -> refl::Result<refl::ResolvedCall> {
         return refl::ResolvedCall{target, {}, {}};
     });
-    prototype::Source table(schema);
-    table.reset({{render, target}}).value();
+    refl::DispatchTable table(schema);
+    table.reset({{{render, refl::OperationKind::method}, target}}).value();
     auto slots = table.dispatch();
     auto observed = refl::observe(slots, [](std::exception_ptr) noexcept {});
     int deliveries = 0;

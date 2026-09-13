@@ -211,11 +211,9 @@ struct MoveOnlyProp {
     MoveOnlyProp() : ptr(std::make_unique<int>(0)) {}
 };
 
-// The current runtime resolves base metadata through the registration pool.
+// Explicit publication for tests that discover native types by name.
 [[maybe_unused]] static refl::Reg<Base> reg_base;
 [[maybe_unused]] static refl::Reg<Prefix> reg_prefix;
-[[maybe_unused]] static refl::Dyn<Point> reg_point;
-[[maybe_unused]] static refl::Dyn<Mixed> reg_mixed;
 [[maybe_unused]] static refl::Reg<OverloadImpl> reg_overload_impl;
 [[maybe_unused]] static refl::Reg<HasPartial> reg_has_partial;
 [[maybe_unused]] static refl::Reg<DoubleReturn> reg_double_return;
@@ -232,8 +230,7 @@ struct MoveOnlyProp {
 [[maybe_unused]] static refl::Reg<LongAddImpl> reg_long_add;
 [[maybe_unused]] static refl::Reg<ConstArrImpl> reg_const_arr;
 [[maybe_unused]] static refl::Reg<ArrImpl> reg_arr;
-[[maybe_unused]] static refl::Dyn<RefGet> reg_ref_get;
-[[maybe_unused]] static refl::Dyn<MoveOnlyProp> reg_move_only;
+[[maybe_unused]] static refl::Reg<RefGet> reg_ref_get;
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { \
@@ -253,21 +250,21 @@ int main() {
     // and a receiver adjusted to a non-first base subobject.
     {
         refl::Dyn<OffsetPoint> inherited;
-        inherited.reset();
+        inherited.reset_native<OffsetPoint>();
         CHECK(inherited->base_method() == 26, "inherited method should use the Base receiver");
         inherited->base_val = 17;
         CHECK(inherited.get().base_val == 17, "inherited field writes should reach Base");
         CHECK(inherited.get().padding == 777, "base adjustment must preserve the first base");
-        inherited.implement<^^Base::base_method>([](refl::Dyn<OffsetPoint>&) { return 99; });
+        inherited.implement<^^Base::base_method>([](refl::Dyn<OffsetPoint>::Self&) { return 99; });
         CHECK(inherited->base_method() == 99, "inherited method should support replacement");
         inherited.restore<^^Base::base_method>();
         CHECK(inherited->base_method() == 34, "restored inherited method should retain its offset");
-        inherited.make_dynamic();
+        inherited.detach_native();
         bool missing_native = false;
         try { (void)inherited->base_method(); }
         catch (const std::runtime_error&) { missing_native = true; }
-        CHECK(missing_native, "make_dynamic should remove native slots");
-        inherited.reset();
+        CHECK(missing_native, "detach_native must remove native slots");
+        inherited.reset_native<OffsetPoint>();
         CHECK(inherited->base_method() == 26, "reset should repopulate inherited native slots");
     }
 
@@ -300,7 +297,7 @@ int main() {
     // --- hooks are user-side: wrap your lambda in implement ---
     // (connect/on_change removed; use implement with a wrapped lambda)
     int hook_result = 0;
-    rp.implement<^^Point::sum>([&hook_result](refl::Dyn<Point>& self) {
+    rp.implement<^^Point::sum>([&hook_result](refl::Dyn<Point>::Self& self) {
         int r = self.get().x + self.get().y;
         hook_result = r;
         return r;
@@ -309,13 +306,9 @@ int main() {
     CHECK(hook_result == 119, "hook via wrapped lambda should fire after sum() with result 119 (99+20)");
     rp.restore<^^Point::sum>();
 
-    // --- on_change is user-side: wrap your setter via implement_property ---
-    // (on_change removed; use Mockable::implement_property with a hook in the setter)
-    // (property hooks on real objects need Mockable access; tested in test_mockable)
-
-    // --- registration still works via default constructor ---
-    // (Dyn<Point> reg_point above + rp(1,2) registered Point)
-    CHECK(refl::find_class("Point").has_value(), "Point should still be registered");
+    // Dynamic construction does not publish to the default registry.
+    CHECK(!refl::find_class("Point"), "dynamic construction must not publish metadata");
+    CHECK(rp.get_class().name() == "Point", "native metadata stays available without registration");
 
     // === array element access via get() ===
     // TypedProperty no longer offers operator[] (removed to keep the field
@@ -354,7 +347,7 @@ int main() {
     CHECK(Point::instance_count == 0, "after reset_count(), instance_count should be 0");
 
     // === swap via reset() ===
-    rp.reset(100, 200);
+    rp.reset_native<Point>(100, 200);
     CHECK(rp.get().x == 100, "after reset(100,200), x should be 100");
     CHECK(rp.get().y == 200, "after reset(100,200), y should be 200");
     rp->set(5, 6);
@@ -374,10 +367,10 @@ int main() {
     // Dyn<IShape> with an abstract T — no object constructed, methods
     // implemented via runtime callables.
     refl::Dyn<IShape> ishape;
-    ishape.implement<^^IShape::area>([](refl::Dyn<IShape>&, int scale) {
+    ishape.implement<^^IShape::area>([](refl::Dyn<IShape>::Self&, int scale) {
         return scale * 100;
     });
-    ishape.implement<^^IShape::set_color>([](refl::Dyn<IShape>&, int) {
+    ishape.implement<^^IShape::set_color>([](refl::Dyn<IShape>::Self&, int) {
         // no-op for test
     });
 
@@ -387,7 +380,7 @@ int main() {
     CHECK(true, "set_color called successfully");
 
     // Re-implement at runtime
-    ishape.implement<^^IShape::area>([](refl::Dyn<IShape>&, int scale) {
+    ishape.implement<^^IShape::area>([](refl::Dyn<IShape>::Self&, int scale) {
         return scale * 200;
     });
     int ar2 = ishape->area(5);
@@ -400,7 +393,7 @@ int main() {
     CHECK(rp2->sum() == 7, "real sum() should be 7 (3+4)");
 
     // Per-method override: keep real object, override just sum().
-    rp2.implement<^^Point::sum>([](refl::Dyn<Point>&) { return 999; });
+    rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self&) { return 999; });
     CHECK(!rp2.is_dynamic(), "rp2 should NOT be in full dynamic mode (partial override)");
     CHECK(rp2->sum() == 999, "overridden sum() should be 999");
     rp2->set(10, 20);
@@ -411,28 +404,28 @@ int main() {
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 30, "restored sum() should be 30 (10+20)");
 
-    // Full dynamic mode: make_dynamic() then implement everything.
-    rp2.make_dynamic();
+    // Full dynamic mode: detach_native() then implement everything.
+    rp2.detach_native();
     CHECK(rp2.is_dynamic(), "rp2 should be in dynamic mode after make_dynamic");
-    rp2.implement<^^Point::sum>([](refl::Dyn<Point>&) { return 42; });
+    rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self&) { return 42; });
     CHECK(rp2->sum() == 42, "mocked sum() should be 42");
     // Note: ^^Point::set can't be used — it's an overload set.
-    rp2.implement<^^Point::sum>([](refl::Dyn<Point>&) { return 84; });
+    rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self&) { return 84; });
     CHECK(rp2->sum() == 84, "re-implemented sum() should be 84");
 
     // Switch back to real mode.
-    rp2.reset(1, 2);
+    rp2.reset_native<Point>(1, 2);
     CHECK(!rp2.is_dynamic(), "rp2 should be in real mode after reset");
     CHECK(rp2->sum() == 3, "real sum() should be 3 (1+2)");
 
     // String-based implement (no ^^ syntax, compile-time checked).
-    rp2.implement<"sum">([](refl::Dyn<Point>&) { return 777; });
+    rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self&) { return 777; });
     CHECK(rp2->sum() == 777, "string-based implement sum() should be 777");
     rp2.restore<^^Point::sum>();
     CHECK(rp2->sum() == 3, "restored sum() should be 3 again");
 
     // Verify the self reference can access the real object.
-    rp2.implement<"sum">([](refl::Dyn<Point>& self) {
+    rp2.implement<^^Point::sum>([](refl::Dyn<Point>::Self& self) {
         return self.get().x + self.get().y + 100;
     });
     CHECK(rp2->sum() == 103, "self-ref sum() should be 103 (1+2+100)");
@@ -441,7 +434,7 @@ int main() {
 
     // === hooks are user-side (multi-hook via wrapped lambda) ===
     int hook_a = 0, hook_b = 0;
-    rp2.implement<^^Point::sum>([&hook_a, &hook_b](refl::Dyn<Point>& self) {
+    rp2.implement<^^Point::sum>([&hook_a, &hook_b](refl::Dyn<Point>::Self& self) {
         int r = self.get().x + self.get().y;
         hook_a = r;
         hook_b = r;
@@ -734,7 +727,7 @@ int main() {
     // must mutate the underlying object.
     {
         refl::Dyn<RefGet> d;
-        d.reset();
+        d.reset_native<RefGet>();
         d.get().x = 7;
         auto& ref = d->get_ref();
         static_assert(std::is_same_v<decltype(ref), int&>,
@@ -749,7 +742,7 @@ int main() {
     // a const method through a const Proxy failed to compile.
     {
         refl::Dyn<RefGet> d;
-        d.reset();
+        d.reset_native<RefGet>();
         d.get().x = 42;
         const refl::Dyn<RefGet>& cd = d;
         int v = cd->val();  // const method through const proxy
@@ -757,10 +750,9 @@ int main() {
     }
 
     // === Dyn: move-only member access via get() ===
-    // (on_change removed; move-only property hooks tested via Mockable)
     {
         refl::Dyn<MoveOnlyProp> m;
-        m.reset();
+        m.reset_native<MoveOnlyProp>();
         m->ptr = std::make_unique<int>(55);
         CHECK(*m.get().ptr == 55,
             "move-only member should be set to 55");

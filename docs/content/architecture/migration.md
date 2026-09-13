@@ -12,7 +12,7 @@ are not proof that a layer has been extracted.
 Core contracts, native runtime calls, and independent registries are implemented.
 Descriptors retain their base graphs. Interface descriptions need no method definitions.
 Shared typed binding is implemented with retained plans and common call frames.
-Production dynamic state and full observation integration remain later work. See [implemented architecture](current-state.md).
+Production dynamic state is implemented. Full observation integration is next. See [implemented architecture](current-state.md).
 
 ## Proposed destination
 
@@ -210,8 +210,8 @@ migration guide. A name in an earlier sketch does not imply an implemented API.
 
 | Earlier name or term | Target name | Migration meaning |
 | --- | --- | --- |
-| `Dyn<T>`; inconsistent `Dynamic<T>` spelling | `Dynamic<Interface>` | Use the full name for the composition facade; keep the abbreviated API as compatibility sugar |
-| `Mockable<T>`; slot backend | `DispatchTable<Interface>` | Replaceable operations are useful beyond mocking |
+| `Dynamic<T>` sketch | `Dyn<Interface>` | Keep one facade name; no compatibility alias |
+| `Mockable<T>`; raw slot backend | `DispatchTable` | Removed; the production table consumes an explicit interface schema |
 | `Hooks<T>` | `Observed<Source>` via `observe(...)` | Compose a separate observed adapter instead of inheriting from the dynamic facade |
 | Connection token; `connection.disconnect()` | `Subscription`; `subscription.unsubscribe()` | The token owns a subscription; destruction unsubscribes |
 | `EndpointHandle` | `DispatchHandle` | Retained access to member dispatch, exposed by `dispatch()` |

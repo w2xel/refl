@@ -58,19 +58,31 @@ int main() {
     CHECK(hook_b == 62, "p hook B should fire with 62 (42+20)");
     CHECK(cross_result == 62, "cross-object should receive 62");
 
+    // Stored event payloads keep their values after delivery and facade destruction.
+    refl::Object saved_result, saved_property;
+    {
+        refl::Hooks<Point> source(2, 3);
+        source.connect<^^Point::sum>([&](refl::Object& result) { saved_result = result; });
+        source.on_change<^^Point::x>([&](refl::Object& result) { saved_property = result; });
+        (void)source->sum();
+        source->x = 8;
+    }
+    CHECK(saved_result.is_owned() && *saved_result.cast_safe<int>().value() == 5, "method event retains its payload");
+    CHECK(saved_property.is_owned() && *saved_property.cast_safe<int>().value() == 8, "property event retains its payload");
+
     // Wrappers retain replaced implementations and compose in installation order.
     {
         refl::Dyn<Point> wrapped(1, 2);
         auto context = std::make_shared<int>(10);
         std::weak_ptr<int> lifetime = context;
-        wrapped.implement<^^Point::sum>([context](refl::Dyn<Point>&) {
+        wrapped.implement<^^Point::sum>([context](refl::Dyn<Point>::Self&) {
             return *context;
         });
         context.reset();
-        wrapped.wrap<^^Point::sum>([](auto& original, refl::Dyn<Point>&) {
+        wrapped.wrap<^^Point::sum>([](auto& original, refl::Dyn<Point>::Self&) {
             return original() + 1;
         });
-        wrapped.wrap<^^Point::sum>([](auto& original, refl::Dyn<Point>&) {
+        wrapped.wrap<^^Point::sum>([](auto& original, refl::Dyn<Point>::Self&) {
             return original() * 2;
         });
         CHECK(!lifetime.expired(), "wrapper chain should retain its implementation");

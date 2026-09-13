@@ -1,68 +1,38 @@
-# Dyn — typed dispatch and dynamic implementation
-
-`#include <refl/dyn.hpp>`
-
-`Dyn<T>` is the layer on top of the refl core (`refl/refl.hpp`).  It wraps a
-`std::shared_ptr<T>` and synthesizes a compile-time dispatch struct (via
-`define_aggregate`) with named callable fields for each member, so you get
-real return types at the call site — no `std::any`, no `std::variant`.
-
-This layer is experimental and likely to change; this doc is intentionally
-bare-bones.
-
-## Dispatch struct
+# Dynamic dispatch
 
 ```cpp
-refl::Dyn<Point> p(1, 2);
-p->set(10, 20);           // overload resolved by argument type
-int s = p->sum();          // real return type
-int x = p->x;              // implicit conversion (read)
-p->x = 42;                 // assignment (write)
-p.get().coords[0] = 99;         // operator[] for subscriptable members
-p.reset(100, 200);         // swap the underlying object
-p.get().x                  // typed escape hatch (int&)
+#include <refl/dyn.hpp>
+
+refl::Dyn<Point> point;
+point.reset_native<Point>(1, 2);
+point->set(10, 20);
+int sum = point->sum();
+point->x = 42;
+point.get().coords[0] = 99;
 ```
 
-One `TypedMethod<Sigs...>` field per function name, one `TypedProperty<T>`
-field per data member. Static members use `get_class()`.  Overload resolution
-is by argument type at compile time via the `matches_sig` concept — mixed
-return types work (`TypedMethod<int(int), double(double)>`).
-
-## Hooks (Qt-style, after-only)
+`Dyn<T>` is movable and non-copyable. Default construction creates interface-only
+state. Native construction and reset do not publish to a registry. Static members
+remain available through `get_class()` when native storage is present.
 
 ```cpp
-p.connect("sum", [](refl::Object& result) { ... });   // fires after sum()
-p.on_change("x", [](refl::Object& newval) { ... });   // fires after x = ...
-p.emit("custom", 42);                                 // fire connected callbacks
+point.implement<^^Point::sum>([] { return 100; });
+point.wrap<^^Point::sum>([](auto& previous) { return previous() + 1; });
+point.restore<^^Point::sum>();
 ```
 
-After-only observers — they see the result/value but cannot veto or modify.
-Multiple `connect` calls on the same name accumulate (multi-listener).
+Callbacks preserve argument qualifiers and support arbitrary parameter counts.
+A callback can accept `Dyn<Point>::Self&` before its ordinary arguments when it
+needs backend access. This handle locks weak state for the duration of the call.
 
-## Runtime method implementation (mocking)
+`dispatch()` follows reset; `capture_binding()` retains the current generation.
+`reset(Object)` validates before publication. `reset_native<U>(args...)` can change
+the concrete type while keeping the interface. `detach_native()` keeps only targets
+explicitly declared independent of native state.
 
-```cpp
-refl::Dyn<IShape> s;                         // abstract T — no object
-s.implement<^^IShape::area>([](refl::Dyn<IShape>&, int scale) {
-    return scale * 100;
-});
-int a = s->area(5);
-```
+Reference replacements require explicit export/lifetime policies. Properties have
+separate read, write, and read-only view operations. See the
+[dynamic architecture](architecture/dynamic.md) for ownership and migration details.
 
-The lambda receives `Dyn<T>&` as its first argument.  For concrete T,
-`implement` overrides individual methods while keeping the real object
-alive (per-method mocking); `restore<^^T::method>()` removes an override;
-`make_dynamic()` switches to fully dynamic mode; `reset(args...)` switches
-back to a real object.  String-based `implement<"method">(...)` is also
-available (compile-time checked).
-
-## Binding boundary
-
-Typed fields use shared call frames. Plans retain metadata; each proxy binds its own
-receiver. Failed rebinding preserves the old view. Inherited members are included.
-Dyn is movable and non-copyable. Static members use `get_class()`.
-
-Mockable implementations preserve parameter qualifiers and accept arbitrary parameter
-counts. Dyn implementation/wrap helpers still support at most two arguments.
-Production slot ownership and reset remain the next migration step.
-See [typed binding](architecture/typed-binding.md) for the implemented boundary.
+`Hooks<T>` remains an event facade over owned targets. Full observation integration
+is the next migration step.

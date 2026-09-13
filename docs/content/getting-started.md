@@ -32,7 +32,7 @@ meson test -C builddir --print-errorlogs
 
 The `selfcheck` test verifies the toolchain can compile C++26 reflection by
 reflecting a `struct Point { int x; int y; }` and asserting two members.
-The default test run also includes the core, Dyn/Proxy, Mockable, and Hooks suites
+The default test run also includes the core, Dyn/Proxy, dispatch-table, and Hooks suites
 and smoke tests for all three samples. Core contract headers also have standalone
 C++23 compilation, synthetic metadata, and include-boundary checks. Warnings remain errors.
 

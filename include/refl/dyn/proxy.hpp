@@ -2,6 +2,7 @@
 #pragma once
 
 #include <refl/refl.hpp>
+#include <refl/reflect/schema.hpp>
 
 #include <map>
 #include <stdexcept>
@@ -21,34 +22,6 @@ struct BindingState {
     Object object;
     std::shared_ptr<const BindingPlan> plan;
 };
-
-// Dyn and Mockable still supply raw backend thunks. Validation stays in invoke_target.
-template<class S> CallTarget bind_backend(const FunctionInfo& function, Object object,
-                                         std::ptrdiff_t offset) {
-    if constexpr (!supported_signature(signature_of<S>())) {
-        throw ReflectionError({DiagnosticCode::unsupported});
-    } else {
-        using Traits = signature_traits<S>;
-        using R = typename Traits::result;
-        using Args = typename Traits::arguments;
-        TargetOptions options;
-        options.receiver = object.view();
-        options.reference_export = ReferenceExport::caller_borrow;
-        options.result_lifetime = ResultLifetime::receiver;
-        return [&]<std::size_t... I>(std::index_sequence<I...>) {
-            return make_target<S>([object, offset, invoker = function.invoker](std::tuple_element_t<I, Args>... args) -> R {
-                std::array<Object, sizeof...(I)> refs{Object(std::forward<std::tuple_element_t<I, Args>>(args))...};
-                auto result = invoker(object.owner(), static_cast<char*>(object.raw()) + offset, refs.data());
-                if constexpr (!std::is_void_v<R>) {
-                    auto pointer = result.template cast_ref<std::remove_reference_t<R>>();
-                    if (!pointer) throw ReflectionError({DiagnosticCode::type_mismatch});
-                    if constexpr (std::is_reference_v<R>) return **pointer;
-                    else return R(std::move(**pointer));
-                }
-            }, options).value();
-        }(std::make_index_sequence<std::tuple_size_v<Args>>{});
-    }
-}
 
 template<class R, class... A> R call_bound(const CallTarget& target, bool readonly, A&&... args) {
     if (!target.valid()) throw ReflectionError({DiagnosticCode::null_handle});
@@ -82,6 +55,8 @@ template<class Sig, class... A> concept matches_sig = []<std::size_t... I>(std::
 
 template<class... Sigs> struct TypedMethod {
     std::vector<CallTarget> targets;
+    DispatchHandle source;
+    std::vector<MemberId> members;
     static std::vector<Signature> signatures() { return {signature_of<Sigs>()...}; }
     void bind(const detail::BindingState& state, const std::vector<detail::MemberLocation>& entries) {
         [&]<std::size_t... I>(std::index_sequence<I...>) {
@@ -100,11 +75,7 @@ template<class... Sigs> struct TypedMethod {
             auto target = native->bind(*receiver, options);
             if (!target) throw ReflectionError(target.error());
             targets.push_back(std::move(*target));
-        } else {
-            if (!function.invoker) throw ReflectionError({DiagnosticCode::unsupported});
-            auto offset = detail::upcast_offset(object.class_info().get(), entry.first->name).value();
-            targets.push_back(detail::bind_backend<S>(function, object, offset));
-        }
+        } else throw ReflectionError({DiagnosticCode::unsupported});
     }
     template<class Self, class... A> decltype(auto) operator()(this Self&& self, A&&... args) {
         return self.template call_dispatch<std::is_const_v<std::remove_reference_t<Self>>, 0>(std::forward<A>(args)...);
@@ -112,6 +83,11 @@ template<class... Sigs> struct TypedMethod {
     template<bool Const, std::size_t I, class... A> decltype(auto) call_dispatch(A&&... args) const {
         using S = std::tuple_element_t<I, std::tuple<Sigs...>>;
         if constexpr (matches_sig<S, A...>) {
+            if (source.valid()) {
+                auto call = source.resolve(members.at(I));
+                if (!call) throw ReflectionError(call.error());
+                return detail::call_bound<typename sig_traits<S>::return_type>(call->target, Const, std::forward<A>(args)...);
+            }
             if (I >= targets.size()) throw ReflectionError({DiagnosticCode::null_handle});
             return detail::call_bound<typename sig_traits<S>::return_type>(targets[I], Const, std::forward<A>(args)...);
         } else if constexpr (I + 1 < sizeof...(Sigs)) {
@@ -122,39 +98,35 @@ template<class... Sigs> struct TypedMethod {
 
 template<class T, bool Readonly = false> struct TypedProperty {
     using value_type = T;
-    CallTarget read, write;
+    CallTarget read, write, view;
+    DispatchHandle read_source, write_source;
+    MemberId member = {};
     static constexpr bool is_readonly() { return Readonly; }
-    operator T() const { return detail::call_bound<T>(read, true); }
-    void operator=(T value) requires (!Readonly) { detail::call_bound<void>(write, false, std::move(value)); }
+    operator T() const {
+        if (!read_source.valid()) return detail::call_bound<T>(read, true);
+        auto call = read_source.resolve(member);
+        if (!call) throw ReflectionError(call.error());
+        return detail::call_bound<T>(call->target, true);
+    }
+    void operator=(T value) requires (!Readonly) {
+        if (!write_source.valid()) return detail::call_bound<void>(write, false, std::move(value));
+        auto call = write_source.resolve(member);
+        if (!call) throw ReflectionError(call.error());
+        detail::call_bound<void>(call->target, false, std::move(value));
+    }
     void bind(const Object& object, const detail::MemberLocation& entry) {
         const auto& field = entry.first->fields[entry.second];
-        auto offset = detail::upcast_offset(object.class_info().get(), entry.first->name).value();
         auto receiver = object.view();
+        auto native_view = detail::operation(*entry.first, field.member, OperationKind::view);
         auto native_read = detail::operation(*entry.first, field.member, OperationKind::read);
         auto native_write = detail::operation(*entry.first, field.member, OperationKind::write);
-        if (native_read || native_write) {
+        if (native_read || native_write || native_view) {
             auto adjusted = detail::project_legacy_view(receiver, *entry.first).value();
+            if (native_view) view = detail::require_target(native_view->bind(adjusted, {}));
             if (native_read) read = detail::require_target(native_read->bind(adjusted, {}));
             if constexpr (!Readonly) if (native_write) write = detail::require_target(native_write->bind(adjusted, {}));
-        } else {
-            auto pointer = static_cast<char*>(object.raw()) + offset;
-            TargetOptions options;
-            options.receiver = receiver;
-            options.operation = OperationKind::read;
-            if constexpr (std::is_copy_constructible_v<T>) {
-                if (field.getter) read = make_target<T() const>([object, pointer, get = field.getter] {
-                    auto result = get(pointer);
-                    return T(std::move(**result.template cast_ref<T>()));
-                }, options).value();
-            }
-            options.operation = OperationKind::write;
-            if constexpr (!Readonly && std::is_move_assignable_v<T>) {
-                if (field.setter) write = make_target<void(T)>([object, pointer, set = field.setter](T value) {
-                    Object argument(value);
-                    set(pointer, &argument);
-                }, options).value();
-            }
         }
+
     }
 };
 
@@ -344,6 +316,7 @@ class Proxy {
 
     Dispatch dispatch_{};
     detail::BindingState state_;
+    DispatchHandle source_;
 
     static std::shared_ptr<const detail::BindingPlan> plan_for(std::shared_ptr<const ClassInfo> descriptor) {
         static std::mutex mutex;
@@ -417,10 +390,61 @@ public:
         state_.plan = plan_for(state_.object.class_info());
         populate();
     }
+    Proxy(DispatchHandle methods, DispatchHandle reads = {}, DispatchHandle writes = {}) : source_(methods) {
+        if (!methods.valid()) throw ReflectionError({DiagnosticCode::null_handle});
+        auto schema = describe_interface<T>();
+        for (const auto& required : *schema) {
+            if (required.operation == OperationKind::view) continue;
+            const auto& source = required.operation == OperationKind::method ? methods :
+                                 required.operation == OperationKind::read ? reads : writes;
+            if (!source.valid()) throw ReflectionError({DiagnosticCode::not_found, required.member});
+            auto found = std::find_if(source.schema()->begin(), source.schema()->end(), [&](const auto& operation) {
+                return operation.member == required.member && operation.operation == required.operation &&
+                       compatible_signature(required.signature, operation.signature);
+            });
+            if (found == source.schema()->end()) throw ReflectionError({DiagnosticCode::type_mismatch, required.member});
+        }
+        static constexpr auto fields = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch, std::meta::access_context::unchecked()));
+        template for (constexpr auto field : fields) {
+            using F = [:std::meta::type_of(field):];
+            auto& target = dispatch_.[:field:];
+            if constexpr (detail::is_typed_method_v<F>) target.source = methods;
+            else { target.read_source = reads; target.write_source = writes; }
+            for (const auto& operation : *schema) {
+                if (operation.name != std::meta::identifier_of(field)) continue;
+                if constexpr (detail::is_typed_method_v<F>) {
+                    if (operation.operation == OperationKind::method) target.members.push_back(operation.member);
+                } else target.member = operation.member;
+            }
+        }
+    }
+    std::map<OperationKey, CallTarget> native_targets() const {
+        std::map<OperationKey, CallTarget> result;
+        auto schema = describe_interface<T>();
+        static constexpr auto fields = std::define_static_array(
+            std::meta::nonstatic_data_members_of(^^Dispatch, std::meta::access_context::unchecked()));
+        template for (constexpr auto field : fields) {
+            using F = [:std::meta::type_of(field):];
+            const auto& target = dispatch_.[:field:];
+            [[maybe_unused]] std::size_t index = 0;
+            for (const auto& operation : *schema) {
+                if (operation.name != std::meta::identifier_of(field)) continue;
+                if constexpr (detail::is_typed_method_v<F>) {
+                    result.emplace(OperationKey{operation.member, operation.operation}, target.targets.at(index++));
+                } else {
+                    const auto& selected = operation.operation == OperationKind::read ? target.read :
+                                           operation.operation == OperationKind::write ? target.write : target.view;
+                    if (selected.valid()) result.emplace(OperationKey{operation.member, operation.operation}, selected);
+                }
+            }
+        }
+        return result;
+    }
     void bind(Object object) { *this = Proxy(std::move(object)); }
     auto* operator->() { return &dispatch_; }
     const auto* operator->() const { return &dispatch_; }
-    bool is_bound() const { return state_.object.valid(); }
+    bool is_bound() const { return state_.object.valid() || source_.valid(); }
     Class get_class() const { return Class(state_.object.class_info()); }
     const std::shared_ptr<const detail::BindingPlan>& binding_plan() const { return state_.plan; }
 
@@ -509,16 +533,19 @@ public:
     Proxy(const Proxy&) = delete;
     Proxy& operator=(const Proxy&) = delete;
     Proxy(Proxy&& other) noexcept
-        : dispatch_(std::move(other.dispatch_)), state_(std::move(other.state_)) {
+        : dispatch_(std::move(other.dispatch_)), state_(std::move(other.state_)), source_(std::move(other.source_)) {
         other.dispatch_ = {};
         other.state_ = {};
+        other.source_ = {};
     }
     Proxy& operator=(Proxy&& other) noexcept {
         if (this != &other) {
             dispatch_ = std::move(other.dispatch_);
             state_ = std::move(other.state_);
+            source_ = std::move(other.source_);
             other.dispatch_ = {};
             other.state_ = {};
+        other.source_ = {};
         }
         return *this;
     }

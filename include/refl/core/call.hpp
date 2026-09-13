@@ -110,8 +110,8 @@ public:
                     R result = std::invoke(*context, detail::call_argument<std::tuple_element_t<I, Args>>(frame.arguments[I])...);
                     return ObjectView::from(result, detail::result_anchor(options, frame, context));
                 } else if constexpr (!std::is_rvalue_reference_v<R>) {
-                    return OwnedValue::from(std::invoke(*context,
-                        detail::call_argument<std::tuple_element_t<I, Args>>(frame.arguments[I])...));
+                    return OwnedValue::from(R(std::invoke(*context,
+                        detail::call_argument<std::tuple_element_t<I, Args>>(frame.arguments[I])...)));
                 } else {
                     throw ReflectionError({DiagnosticCode::unsupported});
                 }
@@ -125,6 +125,7 @@ public:
 template<class S, class F> Result<CallTarget> make_target(F&& callable, TargetOptions options = {}) {
     return CallTarget::make<S>(std::forward<F>(callable), std::move(options));
 }
+using OperationKey = std::pair<MemberId, OperationKind>;
 struct OperationDescriptor {
     MemberId member;
     std::string name;

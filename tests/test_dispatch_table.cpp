@@ -1,6 +1,6 @@
-// Mockable<T> test: mocking, virtual properties, raw slot save/restore.
+// Dynamic replacement tests: methods, properties, and owned target lifetimes.
 // Hooks are user-side: wrap your lambda to add a hook.
-#include <refl/mockable.hpp>
+#include <refl/dyn.hpp>
 
 #include <cstdio>
 #include <stdexcept>
@@ -30,13 +30,13 @@ struct IWidget {
 
 int main() {
     // === Basic mocking ===
-    auto m = refl::Mockable<IShape>::create();
+    auto m = std::make_shared<refl::Dyn<IShape>>();
     m->implement<^^IShape::area>([](int scale) { return scale * 100; });
     int last_color = -1;
     m->implement<^^IShape::set_color>([&last_color](int c) { last_color = c; });
     m->implement<^^IShape::color>([]() { return 42; });
 
-    auto p = m->proxy();
+    auto p = m->capture_binding();
     CHECK(p->area(5) == 500, "area(5) should be 500");
     p->set_color(99);
     CHECK(last_color == 99, "set_color should store 99");
@@ -57,24 +57,24 @@ int main() {
     CHECK(hook_result == 1000, "wrapped lambda should observe result 1000");
 
     // === Raw slot save / restore ===
-    auto saved = m->slot<^^IShape::area>();
+    auto saved = m->target<^^IShape::area>();
     m->implement<^^IShape::area>([](int scale) { return scale * 999; });
     CHECK(p->area(1) == 999, "overridden area(1) should be 999");
-    m->set_slot<^^IShape::area>(saved);
+    m->replace<^^IShape::area>(saved);
     CHECK(p->area(5) == 1000, "restored area(5) should be 1000 again");
 
     // === 2-arg method ===
-    auto mc = refl::Mockable<ICalculator>::create();
+    auto mc = std::make_shared<refl::Dyn<ICalculator>>();
     mc->implement<^^ICalculator::add>([](int a, int b) { return a + b; });
-    auto pc = mc->proxy();
+    auto pc = mc->capture_binding();
     CHECK(pc->add(3, 4) == 7, "add(3,4) should be 7");
 
     // === Stored-value property (sugar) ===
-    auto mw = refl::Mockable<IWidget>::create();
+    auto mw = std::make_shared<refl::Dyn<IWidget>>();
     mw->set_property<^^IWidget::width>(42);
     mw->set_property<^^IWidget::height>(24);
     mw->implement<^^IWidget::draw>([]() {});
-    auto pw = mw->proxy();
+    auto pw = mw->capture_binding();
     CHECK(pw->width == 42, "width should be 42");
     CHECK(pw->height == 24, "height should be 24");
 
@@ -103,42 +103,39 @@ int main() {
     CHECK(pw->height == 88, "read-only property should return 88");
 
     // === Raw property slot save / restore ===
-    auto prop_saved = mw->prop_slot<^^IWidget::height>();
+    auto prop_saved = mw->target<^^IWidget::height>(refl::OperationKind::read);
     mw->implement_property<^^IWidget::height>(
         []() { return 77; }
     );
     CHECK(pw->height == 77, "overridden height should be 77");
-    mw->set_prop_slot<^^IWidget::height>(prop_saved);
+    mw->replace<^^IWidget::height>(prop_saved, refl::OperationKind::read);
     CHECK(pw->height == 88, "restored height should be 88");
 
-    // === Lifetime: Mockable destroyed, Proxy keeps it alive ===
+    // === Lifetime: facade destroyed, Proxy keeps it alive ===
     refl::Proxy<IShape> p2;
     {
-        auto m2 = refl::Mockable<IShape>::create();
+        auto m2 = std::make_shared<refl::Dyn<IShape>>();
         m2->implement<^^IShape::area>([](int s) { return s * 1000; });
-        p2 = m2->proxy();
+        p2 = m2->capture_binding();
     }
-    CHECK(p2->area(5) == 5000, "area(5) after Mockable destroyed should be 5000");
+    CHECK(p2->area(5) == 5000, "area(5) after facade destroyed should be 5000");
 
-    // === cast_safe<T> on mock fails ===
-    auto obj = m->as_object();
-    CHECK(!obj.cast_safe<IShape>().has_value(),
-          "cast_safe<IShape> on mock should fail");
+    CHECK(!m->get_class(), "interface-only state has no native storage identity");
 
     // Saved slots retain exactly the implementation they captured.
     {
-        auto retained = refl::Mockable<IShape>::create();
+        auto retained = std::make_shared<refl::Dyn<IShape>>();
         auto context = std::make_shared<int>(123);
         std::weak_ptr<int> lifetime = context;
         retained->implement<^^IShape::area>([context](int scale) {
             return *context * scale;
         });
         context.reset();
-        auto original = retained->slot<^^IShape::area>();
+        auto original = retained->target<^^IShape::area>();
         retained->implement<^^IShape::area>([](int) { return 9; });
         CHECK(!lifetime.expired(), "saved method slot should retain its context");
-        retained->set_slot<^^IShape::area>(original);
-        CHECK(retained->proxy()->area(2) == 246, "saved method should restore its context");
+        retained->replace<^^IShape::area>(original);
+        CHECK(retained->capture_binding()->area(2) == 246, "saved method should restore its context");
         original = {};
         retained->implement<^^IShape::area>([](int) { return 8; });
         CHECK(lifetime.expired(), "replaced method context should be released");
@@ -146,16 +143,16 @@ int main() {
 
     // A getter saved before replacement retains its original backing value.
     {
-        auto retained = refl::Mockable<IWidget>::create();
+        auto retained = std::make_shared<refl::Dyn<IWidget>>();
         auto context = std::make_shared<int>(321);
         std::weak_ptr<int> lifetime = context;
         retained->implement_property<^^IWidget::height>([context] { return *context; });
         context.reset();
-        auto original = retained->prop_slot<^^IWidget::height>();
+        auto original = retained->target<^^IWidget::height>(refl::OperationKind::read);
         retained->implement_property<^^IWidget::height>([] { return 8; });
         CHECK(!lifetime.expired(), "saved property slot should retain its context");
-        retained->set_prop_slot<^^IWidget::height>(original);
-        CHECK(retained->proxy()->height == 321, "saved getter should restore its context");
+        retained->replace<^^IWidget::height>(original, refl::OperationKind::read);
+        CHECK(retained->capture_binding()->height == 321, "saved getter should restore its context");
         original = {};
         retained->implement_property<^^IWidget::height>([] { return 9; });
         CHECK(lifetime.expired(), "replaced getter context should be released");
@@ -163,7 +160,7 @@ int main() {
 
     // Replacing the executing slot must not destroy its callable mid-call.
     {
-        auto changing = refl::Mockable<IShape>::create();
+        auto changing = std::make_shared<refl::Dyn<IShape>>();
         auto context = std::make_shared<int>(1);
         std::weak_ptr<int> lifetime = context;
         changing->implement<^^IShape::area>([raw = changing.get(), context](int) {
@@ -172,37 +169,23 @@ int main() {
             return during_call.expired() ? -1 : 11;
         });
         context.reset();
-        auto view = changing->proxy();
+        auto view = changing->capture_binding();
         CHECK(view->area(0) == 11, "active call should retain the replaced context");
         CHECK(lifetime.expired(), "active context should be released after return");
         CHECK(view->area(0) == 22, "next call should see the replacement");
     }
 
-    // Metadata outlives the synthetic backend without retaining its instance.
+    // Schema ownership does not require a synthetic ClassInfo or backend facade.
+    std::shared_ptr<const refl::InterfaceSchema> schema;
+    std::weak_ptr<refl::Dyn<IShape>> backend_lifetime;
     {
-        refl::Class metadata;
-        refl::Function method;
-        std::weak_ptr<const refl::ClassInfo> metadata_lifetime;
-        std::weak_ptr<refl::Mockable<IShape>> backend_lifetime;
-        {
-            auto backend = refl::Mockable<IShape>::create();
-            backend_lifetime = backend;
-            auto object = backend->as_object();
-            metadata_lifetime = object.class_info();
-            auto view = backend->proxy();
-            metadata = view.get_class();
-            method = metadata.find_function("area").value();
-        }
-        CHECK(backend_lifetime.expired(), "metadata must not retain the backend instance");
-        CHECK(!metadata_lifetime.expired(), "class handle must retain synthetic metadata");
-        CHECK(metadata.find_function("area").has_value(), "retained class supports lookup");
-        metadata = {};
-        CHECK(!metadata_lifetime.expired(), "member alone must retain synthetic metadata");
-        CHECK(method.name() == "area", "member metadata survives backend and class destruction");
-        method = {};
-        CHECK(metadata_lifetime.expired(), "last member releases synthetic metadata");
+        auto backend = std::make_shared<refl::Dyn<IShape>>();
+        backend_lifetime = backend;
+        schema = backend->dispatch().schema();
     }
+    CHECK(backend_lifetime.expired(), "schema does not retain the facade");
+    CHECK(schema->size() == 3, "schema survives the facade");
 
-    printf("All mockable tests passed.\n");
+    printf("All dispatch table tests passed.\n");
     return 0;
 }
