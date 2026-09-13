@@ -2,6 +2,9 @@ site_name: cpp_runtime_reflection
 site_description: C++26 compile-time-reflection-based runtime reflection framework
 repo_url: https://github.com/swuerl/cpp_runtime_reflection
 docs_dir: content
+site_url: https://swuerl.github.io/cpp_runtime_reflection/
+watch:
+  - ../tests
 
 theme:
   name: material
@@ -27,6 +30,10 @@ theme:
         name: Switch to light mode
 
 markdown_extensions:
+  - pymdownx.snippets:
+      base_path: [!relative $config_dir/../tests]
+      check_paths: true
+      dedent_subsections: true
   - admonition
   - pymdownx.details
   - pymdownx.superfences:
@@ -43,18 +50,17 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Design: design.md
-  - Dyn: dyn.md
+  - Getting started:
+      - Setup: getting-started/index.md
+      - Runtime reflection: getting-started/runtime.md
+      - Typed binding: getting-started/binding.md
+      - Dynamic dispatch: getting-started/dynamic.md
+      - Retained references: getting-started/references.md
+      - Observation: getting-started/observation.md
   - Architecture:
       - Overview: architecture/index.md
-      - Implemented architecture: architecture/current-state.md
-      - Proposed API usage: architecture/usage.md
-      - Repository assessment: architecture/assessment.md
-      - "Layer 1: Core contracts": architecture/contracts.md
-      - "Layer 2: Reflection and descriptor generation": architecture/generation.md
-      - "Layer 3: Runtime registry and invocation": architecture/runtime.md
-      - "Layer 4: Typed binding": architecture/typed-binding.md
-      - "Layer 5: Dynamic dispatch": architecture/dynamic.md
-      - "Layer 6: Call observation": architecture/observation.md
-      - Migration and verification: architecture/migration.md
-  - Getting Started: getting-started.md
+      - Metadata and calls: architecture/contracts.md
+      - Typed binding: architecture/typed-binding.md
+      - Dynamic state: architecture/dynamic.md
+      - Observation: architecture/observation.md
+  - Contributing: contributing.md

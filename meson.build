@@ -36,7 +36,7 @@ endif
 
 # Extra GCC warnings beyond -Wall -Wextra that catch real bugs.
 #
-# ponytail: -Wshadow is deliberately disabled. GCC 16.2's `template for`
+# -Wshadow is deliberately disabled. GCC 16.2's `template for`
 # expansion-statement lowering creates a hidden variable that the named loop
 # variable shadows, so -Wshadow fires a false positive on EVERY template-for
 # (confirmed: it points the shadow at its own declaration). Since template-for
@@ -64,7 +64,5 @@ add_project_arguments(
   language: 'cpp',
 )
 
-# Header-only framework: subprojects/tests/samples include via their own
-# include_directories('../include').
+# Header-only library; tests include headers directly.
 subdir('tests')
-subdir('samples')

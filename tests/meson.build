@@ -1,9 +1,4 @@
-# Tests
-#
-# Each test is a standalone executable that returns non-zero on failure;
-# meson's test() propagates that. No external test framework yet — kept
-# dependency-free per the project's clang-free / minimal-deps stance.
-# Add doctest or Google Test here later if structured assertions are needed.
+# Standalone assertion-based tests; no external test framework.
 
 inc = include_directories('../include')
 
@@ -119,3 +114,7 @@ test('binding_contracts', binding_contracts)
 dynamic_state = executable('test_dynamic_state', 'test_dynamic_state.cpp',
   include_directories: inc, install: false)
 test('dynamic_state', dynamic_state)
+
+usage = executable('test_usage', 'test_usage.cpp',
+  include_directories: inc, install: false)
+test('usage', usage)
