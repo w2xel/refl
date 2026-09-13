@@ -34,13 +34,13 @@ test_dispatch_table = executable(
 )
 test('dispatch_table_api', test_dispatch_table)
 
-test_hooks = executable(
-  'test_hooks',
-  'test_hooks.cpp',
+test_observed = executable(
+  'test_observed',
+  'test_observed.cpp',
   include_directories: inc,
   install: false,
 )
-test('hooks_api', test_hooks)
+test('observed_api', test_observed)
 
 # Each extracted contract compiles by itself, without reflection extensions.
 foreach header : ['error', 'descriptor', 'type', 'value', 'call']

@@ -61,11 +61,16 @@ inline Result<CallResult> invoke_target(const CallTarget& target, CallFrame& fra
     return result;
 }
 inline Result<CallResult> invoke(const DispatchHandle& source, MemberId member,
-                                 std::span<const ArgumentView> arguments, ExportKind mode = ExportKind::erased) {
+                                 std::span<const ArgumentView> arguments, ExportKind mode = ExportKind::erased,
+                                 bool read_only_receiver = false) {
     auto call = source.resolve(member);
     if (!call) return std::unexpected(call.error());
     CallFrame frame{call->receiver, arguments};
-    return invoke_target(call->target, frame, member, mode);
+    if (read_only_receiver) frame.receiver = frame.receiver.as_const();
+    auto completion = source.prepare_completion(member, call->target.options().operation);
+    auto result = invoke_target(call->target, frame, member, mode);
+    if (result && completion) completion(frame, *result);
+    return result;
 }
 template<class Source>
 Result<void> check_result_type(const Source& source, MemberId member, TypeUse expected) {

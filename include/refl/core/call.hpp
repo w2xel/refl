@@ -139,13 +139,20 @@ struct ResolvedCall {
     LifetimeAnchor state_owner;
 };
 class DispatchHandle {
+public:
+    using Completion = std::function<void(const CallFrame&, const CallResult&)>;
+    using PrepareCompletion = std::function<Completion(MemberId, OperationKind)>;
+private:
     std::shared_ptr<const InterfaceSchema> schema_;
     std::function<Result<ResolvedCall>(MemberId)> resolve_;
+    PrepareCompletion prepare_completion_;
 public:
     DispatchHandle() = default;
     DispatchHandle(std::shared_ptr<const InterfaceSchema> schema,
-                   std::function<Result<ResolvedCall>(MemberId)> resolve)
-        : schema_(std::move(schema)), resolve_(std::move(resolve)) {}
+                   std::function<Result<ResolvedCall>(MemberId)> resolve,
+                   PrepareCompletion prepare_completion = {})
+        : schema_(std::move(schema)), resolve_(std::move(resolve)),
+          prepare_completion_(std::move(prepare_completion)) {}
     bool valid() const { return schema_ && static_cast<bool>(resolve_); }
     const std::shared_ptr<const InterfaceSchema>& schema() const { return schema_; }
     Result<ResolvedCall> resolve(MemberId member) const {
@@ -160,6 +167,26 @@ public:
         if (!compatible_signature(operation->signature, result->target.signature()) ||
             operation->operation != result->target.options().operation)
             return std::unexpected(Diagnostic{DiagnosticCode::type_mismatch, member});
+        return result;
+    }
+    Completion prepare_completion(MemberId member, OperationKind operation) const {
+        return prepare_completion_ ? prepare_completion_(member, operation) : Completion{};
+    }
+    DispatchHandle with_completion(PrepareCompletion prepare) const {
+        auto result = *this;
+        auto previous = prepare_completion_;
+        result.prepare_completion_ = [previous = std::move(previous), prepare = std::move(prepare)]
+            (MemberId member, OperationKind operation) {
+                auto first = previous ? previous(member, operation) : Completion{};
+                auto second = prepare ? prepare(member, operation) : Completion{};
+                if (!first) return second;
+                if (!second) return first;
+                return Completion([first = std::move(first), second = std::move(second)]
+                    (const CallFrame& frame, const CallResult& result) {
+                        first(frame, result);
+                        second(frame, result);
+                    });
+            };
         return result;
     }
 };

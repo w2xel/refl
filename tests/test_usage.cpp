@@ -2,7 +2,7 @@
 // Keep setup, actions, and expected results together in each section.
 // --8<-- [start:headers]
 #include <refl/dyn.hpp>
-#include <refl/extensions/observed.hpp>
+#include <refl/extensions/observed_dyn.hpp>
 #include <cassert>
 #include <memory>
 // --8<-- [end:headers]
@@ -173,29 +173,33 @@ void observation_usage() {
     // --8<-- [start:observation]
     refl::Dyn<Drawable> dynamic;
     dynamic.reset_native<Square>(4);
-    constexpr auto render = refl::member_id<^^Drawable::render>();
-    int events = 0;
+    int calls = 0;
+    int writes = 0;
     int listener_errors = 0;
-    auto observed = refl::observe(dynamic.dispatch(), [&](std::exception_ptr) noexcept {
+    auto observed = refl::observe(dynamic, [&](std::exception_ptr) noexcept {
         ++listener_errors;
     });
-    auto subscription = observed.after(render, [&](const refl::CallCompletedEvent& event) {
-        assert(event.member() == render && event.argument_count() == 1);
-        ++events;
+    auto after_render = observed.after<^^Drawable::render>([&](const refl::CallCompletedEvent& event) {
+        assert(event.operation() == refl::OperationKind::method);
+        ++calls;
+    });
+    auto after_size = observed.after_write<^^Drawable::size>([&](const refl::CallCompletedEvent& event) {
+        assert(event.operation() == refl::OperationKind::write);
+        ++writes;
     });
 
-    assert(refl::try_call<int>(observed, render, 2).value() == 32);
-    assert(events == 1);
-    assert(dynamic->render(2) == 32); // Direct calls bypass this adapter.
-    assert(events == 1);
+    assert(observed->render(2) == 32 && calls == 1);
+    observed->size = 5;
+    assert(dynamic.get<Square>().size == 5 && writes == 1);
+    assert(dynamic->render(2) == 50); // Direct calls bypass this adapter.
+    assert(calls == 1);
 
     dynamic.reset_native<Line>(6);
-    assert(refl::try_call<int>(observed, render, 2).value() == 12);
-    assert(events == 2); // Subscriptions survive reset.
+    assert(observed->render(2) == 12 && calls == 2); // Subscriptions survive reset.
 
-    subscription.unsubscribe();
-    assert(refl::try_call<int>(observed, render, 2).value() == 12);
-    assert(events == 2 && listener_errors == 0);
+    after_render.unsubscribe();
+    assert(observed->render(2) == 12);
+    assert(calls == 2 && listener_errors == 0);
     // --8<-- [end:observation]
 }
 

@@ -39,6 +39,24 @@ template<class R, class... A> R call_bound(const CallTarget& target, bool readon
         else return R(std::move(**pointer));
     }
 }
+template<class R, class... A>
+R call_dispatched(const DispatchHandle& source, MemberId member, bool readonly, A&&... args) {
+    std::array<ArgumentView, sizeof...(A)> arguments{native_argument(std::forward<A>(args))...};
+    if (source.schema()) {
+        auto operation = std::find_if(source.schema()->begin(), source.schema()->end(),
+            [member](const auto& candidate) { return candidate.member == member; });
+        if (operation != source.schema()->end()) project_legacy_arguments(arguments, operation->signature);
+    }
+    auto result = invoke(source, member, arguments,
+        std::is_reference_v<R> ? ExportKind::raw_reference : ExportKind::erased, readonly);
+    if (!result) throw ReflectionError(result.error());
+    if constexpr (!std::is_void_v<R>) {
+        auto pointer = result_view(*result).template get<std::remove_reference_t<R>>();
+        if (!pointer) throw ReflectionError(pointer.error());
+        if constexpr (std::is_reference_v<R>) return **pointer;
+        else return R(std::move(**pointer));
+    }
+}
 consteval std::meta::info make_fn_sig(std::meta::info member) {
     return std::meta::type_of(member);
 }
@@ -83,11 +101,9 @@ template<class... Sigs> struct TypedMethod {
     template<bool Const, std::size_t I, class... A> decltype(auto) call_dispatch(A&&... args) const {
         using S = std::tuple_element_t<I, std::tuple<Sigs...>>;
         if constexpr (matches_sig<S, A...>) {
-            if (source.valid()) {
-                auto call = source.resolve(members.at(I));
-                if (!call) throw ReflectionError(call.error());
-                return detail::call_bound<typename sig_traits<S>::return_type>(call->target, Const, std::forward<A>(args)...);
-            }
+            if (source.valid())
+                return detail::call_dispatched<typename sig_traits<S>::return_type>(
+                    source, members.at(I), Const, std::forward<A>(args)...);
             if (I >= targets.size()) throw ReflectionError({DiagnosticCode::null_handle});
             return detail::call_bound<typename sig_traits<S>::return_type>(targets[I], Const, std::forward<A>(args)...);
         } else if constexpr (I + 1 < sizeof...(Sigs)) {
@@ -104,15 +120,11 @@ template<class T, bool Readonly = false> struct TypedProperty {
     static constexpr bool is_readonly() { return Readonly; }
     operator T() const {
         if (!read_source.valid()) return detail::call_bound<T>(read, true);
-        auto call = read_source.resolve(member);
-        if (!call) throw ReflectionError(call.error());
-        return detail::call_bound<T>(call->target, true);
+        return detail::call_dispatched<T>(read_source, member, true);
     }
     void operator=(T value) requires (!Readonly) {
         if (!write_source.valid()) return detail::call_bound<void>(write, false, std::move(value));
-        auto call = write_source.resolve(member);
-        if (!call) throw ReflectionError(call.error());
-        detail::call_bound<void>(call->target, false, std::move(value));
+        detail::call_dispatched<void>(write_source, member, false, std::move(value));
     }
     void bind(const Object& object, const detail::MemberLocation& entry) {
         const auto& field = entry.first->fields[entry.second];
